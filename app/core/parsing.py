@@ -64,10 +64,13 @@ def parse_coordinator_response(raw: str) -> CoordinatorDecision:
 
 def parse_worker_response(raw: str) -> WorkerResult:
     data = extract_json(raw)
+    # Combine summary + details into a single result field
+    summary = data.get("summary", "")
+    details = data.get("details")
+    result = f"{summary}\n\n{details}" if details else summary
     return WorkerResult(
         queries_executed=data.get("queries_executed", []),
-        summary=data.get("summary", ""),
-        details=data.get("details"),
+        result=result,
         view_requested=data.get("view_requested"),
     )
 

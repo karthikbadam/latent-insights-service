@@ -131,7 +131,7 @@ def test_append_and_get_steps(test_db):
     assert len(steps) == 3
     assert steps[0].move == MoveType.SCOPE
     assert steps[1].instruction == "Explore dist"
-    assert steps[2].result_summary == "Proposed: bias effect"
+    assert steps[2].result == "Proposed: bias effect"
 
 
 def test_append_step_with_view(test_db):

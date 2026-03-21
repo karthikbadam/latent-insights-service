@@ -112,7 +112,8 @@ def test_parse_worker_response_full():
     }"""
     result = parse_worker_response(raw)
     assert len(result.queries_executed) == 1
-    assert result.summary == "Found 100 rows"
+    assert "Found 100 rows" in result.result
+    assert "No NULLs found" in result.result
     assert result.view_requested is not None
     assert result.view_requested["name"] == "filtered"
 
@@ -121,7 +122,7 @@ def test_parse_worker_response_minimal():
     raw = '{"queries_executed": [], "summary": "Nothing to report"}'
     result = parse_worker_response(raw)
     assert result.queries_executed == []
-    assert result.details is None
+    assert result.result == "Nothing to report"
     assert result.view_requested is None
 
 

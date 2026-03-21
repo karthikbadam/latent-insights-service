@@ -72,7 +72,7 @@ async def test_run_worker_no_tool_calls(session_db, schema_summary):
     )
 
     assert isinstance(result, WorkerResult)
-    assert result.summary == "Test summary"
+    assert result.result == "Test summary"
 
 
 @pytest.mark.asyncio
@@ -115,7 +115,7 @@ async def test_run_worker_with_tool_call(session_db, schema_summary):
         schema_summary=schema_summary, session_db=session_db,
     )
 
-    assert result.summary == "The dataset contains 103 rows."
+    assert result.result == "The dataset contains 103 rows."
     assert mock_llm.call.call_count == 2
 
     # Verify tool result was passed back
@@ -179,7 +179,7 @@ async def test_run_worker_sql_error_in_tool(session_db, schema_summary):
         schema_summary=schema_summary, session_db=session_db,
     )
 
-    assert "103" in result.summary
+    assert "103" in result.result
     assert mock_llm.call.call_count == 3
 
 

@@ -8,25 +8,25 @@ from tests.conftest import make_mock_llm
 
 
 def test_run_exploratory_queries_shape(session_db):
-    result = _run_exploratory_queries(session_db)
+    result = _run_exploratory_queries(session_db, "dataset")
     assert "103 rows" in result
     assert "19 columns" in result
 
 
 def test_run_exploratory_queries_column_overview(session_db):
-    result = _run_exploratory_queries(session_db)
+    result = _run_exploratory_queries(session_db, "dataset")
     assert "pl_name" in result
     assert "discoverymethod" in result
 
 
 def test_run_exploratory_queries_distributions(session_db):
-    result = _run_exploratory_queries(session_db)
+    result = _run_exploratory_queries(session_db, "dataset")
     # discoverymethod has <15 distinct values — should show distribution
     assert "Transit" in result
 
 
 def test_run_exploratory_queries_numeric_stats(session_db):
-    result = _run_exploratory_queries(session_db)
+    result = _run_exploratory_queries(session_db, "dataset")
     assert "min=" in result
     assert "max=" in result
 

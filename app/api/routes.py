@@ -13,6 +13,7 @@ from app.api.schemas import (
     CreateThreadRequest,
     DatasetInfo,
     PostMessageRequest,
+    SessionDetailResponse,
     SessionResponse,
     StepResponse,
     SystemStats,
@@ -126,15 +127,7 @@ async def create_session(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(content)
 
-    from app.orchestration.session import create_session_flow
-
-    # Schedule the full session flow as a background task
-    async def session_task():
-        return await create_session_flow(config, llm, db, queue, file_path)
-
-    # Run synchronously to get the session_id, then background threads
-    session_id = await create_session_flow(config, llm, db, queue, file_path)
-
+    session_id = await _schedule_session(config, llm, db, queue, file_path)
     return {"session_id": session_id, "status": "created"}
 
 
@@ -146,10 +139,29 @@ async def create_session_from_dataset(dataset_path: str):
     if not os.path.exists(dataset_path):
         raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_path}")
 
+    session_id = await _schedule_session(config, llm, db, queue, dataset_path)
+    return {"session_id": session_id, "status": "created"}
+
+
+async def _schedule_session(config, llm, db, queue, dataset_path: str) -> str:
+    """Create session record and schedule the flow as a background task."""
+    from app.db import queries
+    from app.db.connection import table_name_from_path
     from app.orchestration.session import create_session_flow
 
-    session_id = await create_session_flow(config, llm, db, queue, dataset_path)
-    return {"session_id": session_id, "status": "created"}
+    main_db = db.get_main_db()
+    table_name = table_name_from_path(dataset_path)
+    async with queue.db_write_lock:
+        session = queries.create_session(main_db, dataset_path, table_name)
+
+    queue.schedule(
+        coro=create_session_flow(config, llm, db, queue, session.id, dataset_path),
+        task_id=f"session-{session.id}",
+        session_id=session.id,
+        description=f"Session setup: {os.path.basename(dataset_path)}",
+    )
+
+    return session.id
 
 
 @router.get("/sessions/{session_id}")
@@ -212,7 +224,7 @@ async def create_thread(session_id: str, request: CreateThreadRequest):
         main_db, session_id, request.question, request.motivation or "", "",
     )
 
-    session_db = db.create_session_db(session_id, session.dataset_path)
+    session_db, _ = db.create_session_db(session_id, session.dataset_path, session.table_name)
 
     queue.schedule(
         coro=run_thread_loop(
@@ -239,7 +251,60 @@ async def create_thread(session_id: str, request: CreateThreadRequest):
     )
 
 
+@router.get("/sessions/{session_id}/detail")
+async def get_session_detail(session_id: str):
+    """Full session detail with nested threads and steps."""
+    _, _, db, _ = _get_state()
+    from app.db import queries
+
+    main_db = db.get_main_db()
+    session = queries.get_session(main_db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    threads = queries.get_threads(main_db, session_id)
+    thread_details = []
+    for t in threads:
+        steps = queries.get_steps(main_db, t.id)
+        thread_details.append(_build_thread_detail(t, steps))
+
+    return SessionDetailResponse(
+        id=session.id,
+        dataset_path=session.dataset_path,
+        schema_summary=session.schema_summary,
+        scout_output=session.scout_output,
+        threads=thread_details,
+        created_at=session.created_at.isoformat() if session.created_at else "",
+    )
+
+
 # --- Threads ---
+
+
+def _build_thread_detail(thread, steps) -> ThreadDetailResponse:
+    return ThreadDetailResponse(
+        id=thread.id,
+        session_id=thread.session_id,
+        seed_question=thread.seed_question,
+        motivation=thread.motivation,
+        entry_point=thread.entry_point,
+        status=thread.status.value,
+        summary=thread.summary,
+        error=thread.error,
+        steps=[
+            StepResponse(
+                id=s.id,
+                step_number=s.step_number,
+                move=s.move.value,
+                instruction=s.instruction,
+                result=s.result,
+                view_created=s.view_created,
+                duration_ms=s.duration_ms,
+                llm_calls=s.llm_calls,
+            )
+            for s in steps
+        ],
+    )
 
 
 @router.get("/threads/{thread_id}")
@@ -255,26 +320,7 @@ async def get_thread(thread_id: str):
 
     steps = queries.get_steps(main_db, thread_id)
 
-    return ThreadDetailResponse(
-        id=thread.id,
-        session_id=thread.session_id,
-        seed_question=thread.seed_question,
-        motivation=thread.motivation,
-        entry_point=thread.entry_point,
-        status=thread.status.value,
-        steps=[
-            StepResponse(
-                id=s.id,
-                step_number=s.step_number,
-                move=s.move.value,
-                instruction=s.instruction,
-                result_summary=s.result_summary,
-                result_details=s.result_details,
-                view_created=s.view_created,
-            )
-            for s in steps
-        ],
-    )
+    return _build_thread_detail(thread, steps)
 
 
 @router.post("/threads/{thread_id}/messages")
@@ -292,7 +338,7 @@ async def post_message(thread_id: str, request: PostMessageRequest):
         raise HTTPException(status_code=400, detail="Thread is not waiting for input")
 
     session = queries.get_session(main_db, thread.session_id)
-    session_db = db.create_session_db(thread.session_id, session.dataset_path)
+    session_db, _ = db.create_session_db(thread.session_id, session.dataset_path, session.table_name)
 
     queue.schedule(
         coro=resume_thread(
@@ -347,6 +393,7 @@ async def list_tasks(session_id: str | None = None) -> list[TaskResponse]:
             session_id=t.session_id,
             thread_id=t.thread_id,
             description=t.description,
+            elapsed_seconds=t.elapsed_seconds,
         )
         for t in tasks
     ]

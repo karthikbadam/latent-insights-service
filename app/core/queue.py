@@ -7,7 +7,8 @@ what's running, what's waiting, and what events are flowing.
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from app.models import ThreadEvent
 
@@ -22,6 +23,11 @@ class TaskInfo:
     session_id: str
     thread_id: str | None = None
     description: str = ""
+    started_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return round(time.monotonic() - self.started_at, 2)
 
 
 class Queue:
@@ -62,13 +68,14 @@ class Queue:
         return task
 
     def _on_task_done(self, task_id: str, task: asyncio.Task):
-        self._tasks.pop(task_id, None)
+        info = self._tasks.pop(task_id, None)
+        elapsed = info.elapsed_seconds if info else 0
         if task.cancelled():
-            logger.info(f"Task cancelled: {task_id}")
+            logger.info(f"Task cancelled: {task_id} ({elapsed}s)")
         elif task.exception():
-            logger.error(f"Task failed: {task_id} — {task.exception()}")
+            logger.error(f"Task failed: {task_id} ({elapsed}s) — {task.exception()}")
         else:
-            logger.info(f"Task completed: {task_id}")
+            logger.info(f"Task completed: {task_id} ({elapsed}s)")
 
     def get_active_tasks(self, session_id: str | None = None) -> list[TaskInfo]:
         """List active tasks, optionally filtered by session."""

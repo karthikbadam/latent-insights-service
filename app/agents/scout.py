@@ -61,28 +61,29 @@ Mix: 2-3 simple, 3-4 moderate, 2-3 deep.
 """
 
 
-def _run_exploratory_queries(session_db) -> str:
+def _run_exploratory_queries(session_db, table_name: str) -> str:
     """Run generic exploratory queries to give the scout real data context."""
+    tbl = f'"{table_name}"'
     explorations = []
 
     # 1. Basic shape
     try:
-        row_count = session_db.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
-        cols = session_db.execute("DESCRIBE dataset").fetchall()
+        row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+        cols = session_db.execute(f"DESCRIBE {tbl}").fetchall()
         explorations.append(f"### Shape\n{row_count} rows, {len(cols)} columns")
     except Exception as e:
         explorations.append(f"### Shape\nERROR: {e}")
+        return "\n\n".join(explorations)
 
     # 2. Per-column summary: type, null rate, distinct count
     try:
-        cols = session_db.execute("DESCRIBE dataset").fetchall()
         col_summaries = []
         for col_name, col_type, *_ in cols:
             try:
                 stats = session_db.execute(f"""
                     SELECT COUNT("{col_name}") as non_null,
                            COUNT(DISTINCT "{col_name}") as distinct_ct
-                    FROM dataset
+                    FROM {tbl}
                 """).fetchone()
                 null_ct = row_count - stats[0]
                 col_summaries.append(
@@ -96,16 +97,15 @@ def _run_exploratory_queries(session_db) -> str:
 
     # 3. Low-cardinality columns: value distributions
     try:
-        cols = session_db.execute("DESCRIBE dataset").fetchall()
         for col_name, col_type, *_ in cols:
             try:
                 distinct = session_db.execute(
-                    f'SELECT COUNT(DISTINCT "{col_name}") FROM dataset WHERE "{col_name}" IS NOT NULL'
+                    f'SELECT COUNT(DISTINCT "{col_name}") FROM {tbl} WHERE "{col_name}" IS NOT NULL'
                 ).fetchone()[0]
                 if 2 <= distinct <= 15:
                     rows = session_db.execute(f"""
                         SELECT "{col_name}", COUNT(*) as cnt
-                        FROM dataset WHERE "{col_name}" IS NOT NULL
+                        FROM {tbl} WHERE "{col_name}" IS NOT NULL
                         GROUP BY "{col_name}" ORDER BY cnt DESC
                     """).fetchall()
                     dist = "; ".join(f"{v}: {c}" for v, c in rows)
@@ -117,7 +117,6 @@ def _run_exploratory_queries(session_db) -> str:
 
     # 4. Numeric column basic stats
     try:
-        cols = session_db.execute("DESCRIBE dataset").fetchall()
         numeric_types = {"BIGINT", "INTEGER", "DOUBLE", "FLOAT", "DECIMAL", "SMALLINT", "REAL"}
         for col_name, col_type, *_ in cols:
             base_type = col_type.split("(")[0].upper().strip()
@@ -126,7 +125,7 @@ def _run_exploratory_queries(session_db) -> str:
                     stats = session_db.execute(f"""
                         SELECT MIN("{col_name}"), MAX("{col_name}"),
                                AVG("{col_name}"), MEDIAN("{col_name}")
-                        FROM dataset WHERE "{col_name}" IS NOT NULL
+                        FROM {tbl} WHERE "{col_name}" IS NOT NULL
                     """).fetchone()
                     explorations.append(
                         f"### {col_name} stats\n"
@@ -145,12 +144,13 @@ async def run_scout(
     llm: LLMClient,
     model: str,
     schema_summary: str,
+    table_name: str = "dataset",
     session_db=None,
 ) -> ScoutOutput:
     """Run scout and return discovered questions."""
     exploration_data = ""
     if session_db is not None:
-        exploration_data = _run_exploratory_queries(session_db)
+        exploration_data = _run_exploratory_queries(session_db, table_name)
 
     user_content = f"Here is the dataset schema:\n\n{schema_summary}\n\n"
     if exploration_data:

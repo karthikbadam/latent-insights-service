@@ -97,6 +97,17 @@ async def run_coordinator(
         temperature=temperature,
     )
 
+    if not response.content or not response.content.strip():
+        logger.warning("Coordinator returned empty response, retrying once")
+        response = await llm.call(
+            model=model,
+            messages=messages,
+            role="coordinator",
+            temperature=temperature,
+        )
+        if not response.content or not response.content.strip():
+            raise ValueError("Coordinator returned empty response twice")
+
     decision = parse_coordinator_response(response.content)
 
     # Validate consistency

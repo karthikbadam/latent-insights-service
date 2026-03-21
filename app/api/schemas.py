@@ -41,9 +41,10 @@ class StepResponse(BaseModel):
     step_number: int
     move: str
     instruction: str
-    result_summary: str
-    result_details: str | None = None
+    result: str | None = None
     view_created: str | None = None
+    duration_ms: int | None = None
+    llm_calls: list[dict] | None = None
 
 
 class ThreadDetailResponse(BaseModel):
@@ -53,7 +54,18 @@ class ThreadDetailResponse(BaseModel):
     motivation: str
     entry_point: str
     status: str
+    summary: str | None = None
+    error: str | None = None
     steps: list[StepResponse]
+
+
+class SessionDetailResponse(BaseModel):
+    id: str
+    dataset_path: str
+    schema_summary: str | None = None
+    scout_output: dict | None = None
+    threads: list[ThreadDetailResponse]
+    created_at: str
 
 
 class TaskResponse(BaseModel):
@@ -61,6 +73,7 @@ class TaskResponse(BaseModel):
     session_id: str
     thread_id: str | None = None
     description: str
+    elapsed_seconds: float | None = None
 
 
 class SystemStats(BaseModel):

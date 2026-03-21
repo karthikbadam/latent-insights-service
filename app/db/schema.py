@@ -12,6 +12,7 @@ def create_tables(db: duckdb.DuckDBPyConnection):
         CREATE TABLE IF NOT EXISTS sessions (
             id              VARCHAR PRIMARY KEY,
             dataset_path    VARCHAR NOT NULL,
+            table_name      VARCHAR NOT NULL DEFAULT 'dataset',
             schema_summary  VARCHAR,
             scout_output    JSON,
             created_at      TIMESTAMP DEFAULT current_timestamp
@@ -26,6 +27,8 @@ def create_tables(db: duckdb.DuckDBPyConnection):
             motivation      VARCHAR,
             entry_point     VARCHAR,
             status          VARCHAR DEFAULT 'running',
+            summary         VARCHAR,
+            error           VARCHAR,
             created_at      TIMESTAMP DEFAULT current_timestamp,
             updated_at      TIMESTAMP DEFAULT current_timestamp
         )
@@ -38,9 +41,10 @@ def create_tables(db: duckdb.DuckDBPyConnection):
             step_number     INTEGER NOT NULL,
             move            VARCHAR NOT NULL,
             instruction     VARCHAR NOT NULL,
-            result_summary  VARCHAR,
-            result_details  VARCHAR,
+            result          VARCHAR,
             view_created    VARCHAR,
+            duration_ms     INTEGER,
+            llm_calls       JSON,
             created_at      TIMESTAMP DEFAULT current_timestamp
         )
     """)

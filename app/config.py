@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 class ModelConfig:
     """LLM model selection per agent role. All OpenRouter model IDs."""
 
-    profiler: str = "anthropic/claude-3.5-haiku"
-    scout: str = "anthropic/claude-sonnet-4"
-    coordinator: str = "anthropic/claude-3.5-haiku"
-    worker: str = "anthropic/claude-3.5-haiku"
-    worker_fallback: str = "anthropic/claude-sonnet-4"
+    profiler: str = "google/gemini-2.5-flash"
+    scout: str = "google/gemini-2.5-flash"
+    coordinator: str = "openai/gpt-oss-20b"
+    worker: str = "openai/gpt-oss-20b"
+    worker_fallback: str = "openai/gpt-oss-20b"
 
     @classmethod
     def from_env(cls) -> "ModelConfig":
@@ -69,25 +69,17 @@ class AppConfig:
 
     # DuckDB
     data_dir: str = "data"
-    dataset_table_name: str = "dataset"
 
     # Threading
-    max_threads_per_session: int = 20
     default_seed_threads: int = 5
 
-    # Agents — no hard limits, you tune as you go
+    # Agents
     max_worker_retries: int = 3
-    query_timeout_seconds: int = 60
 
     # Sub-configs
     models: ModelConfig = field(default_factory=ModelConfig)
     temperatures: TemperatureConfig = field(default_factory=TemperatureConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
-
-    # Server
-    host: str = "0.0.0.0"
-    port: int = 8000
-    cors_origins: list[str] = field(default_factory=lambda: ["*"])
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -97,13 +89,8 @@ class AppConfig:
             app_name=os.getenv("APP_NAME", cls.app_name),
             app_url=os.getenv("APP_URL", cls.app_url),
             data_dir=os.getenv("DATA_DIR", cls.data_dir),
-            max_threads_per_session=int(os.getenv("MAX_THREADS", "20")),
             default_seed_threads=int(os.getenv("DEFAULT_SEED_THREADS", "5")),
             max_worker_retries=int(os.getenv("MAX_WORKER_RETRIES", "3")),
-            query_timeout_seconds=int(os.getenv("QUERY_TIMEOUT", "60")),
-            host=os.getenv("HOST", cls.host),
-            port=int(os.getenv("PORT", "8000")),
-            cors_origins=os.getenv("CORS_ORIGINS", "*").split(","),
             models=ModelConfig.from_env(),
             temperatures=TemperatureConfig.from_env(),
             cache=CacheConfig(),

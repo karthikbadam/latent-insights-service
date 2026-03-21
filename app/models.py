@@ -15,6 +15,7 @@ class ThreadStatus(str, Enum):
     RUNNING = "running"
     WAITING = "waiting"
     COMPLETE = "complete"
+    ERROR = "error"
 
 
 class MoveType(str, Enum):
@@ -38,6 +39,7 @@ class CoordinatorStatus(str, Enum):
 class Session:
     id: str
     dataset_path: str
+    table_name: str = "dataset"
     schema_summary: str | None = None
     scout_output: dict | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
@@ -51,6 +53,8 @@ class Thread:
     motivation: str
     entry_point: str
     status: ThreadStatus = ThreadStatus.RUNNING
+    summary: str | None = None
+    error: str | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -62,9 +66,10 @@ class Step:
     step_number: int
     move: MoveType
     instruction: str
-    result_summary: str
-    result_details: str | None = None
+    result: str
     view_created: str | None = None
+    duration_ms: int | None = None
+    llm_calls: list[dict] | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -100,9 +105,9 @@ class CoordinatorDecision:
 @dataclass
 class WorkerResult:
     queries_executed: list[dict]
-    summary: str
-    details: str | None = None
+    result: str
     view_requested: dict | None = None
+    llm_calls: list[dict] | None = None
 
 
 # --- Events ---

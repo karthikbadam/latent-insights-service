@@ -18,6 +18,7 @@ schema summary that other analysts will use as their reference.
 Produce a schema summary in exactly this format:
 
 ## Dataset summary
+- **Table:** <table_name>
 - **Rows:** <count>
 - **Columns:** <count>
 
@@ -49,9 +50,10 @@ def _is_numeric(col_type: str) -> bool:
     return base in NUMERIC_TYPES
 
 
-def _gather_column_stats(session_db, columns_info: list) -> str:
+def _gather_column_stats(session_db, table_name: str, columns_info: list) -> str:
     """Run SQL to gather per-column statistics. Works on any dataset."""
-    row_count = session_db.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
+    tbl = f'"{table_name}"'
+    row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
     if row_count == 0:
         return "(empty dataset)"
 
@@ -60,7 +62,7 @@ def _gather_column_stats(session_db, columns_info: list) -> str:
     for col_name, col_type, *_ in columns_info:
         try:
             non_null = session_db.execute(
-                f'SELECT COUNT("{col_name}") FROM dataset'
+                f'SELECT COUNT("{col_name}") FROM {tbl}'
             ).fetchone()[0]
             null_pct = ((row_count - non_null) / row_count) * 100
 
@@ -72,7 +74,7 @@ def _gather_column_stats(session_db, columns_info: list) -> str:
                         SELECT MIN("{col_name}"), MAX("{col_name}"),
                                AVG("{col_name}"), MEDIAN("{col_name}"),
                                STDDEV("{col_name}")
-                        FROM dataset WHERE "{col_name}" IS NOT NULL
+                        FROM {tbl} WHERE "{col_name}" IS NOT NULL
                     """).fetchone()
                     parts = []
                     parts.append(f"min={stats[0]}")
@@ -86,7 +88,7 @@ def _gather_column_stats(session_db, columns_info: list) -> str:
                     summary = ", ".join(parts)
             else:
                 unique_count = session_db.execute(
-                    f'SELECT COUNT(DISTINCT "{col_name}") FROM dataset WHERE "{col_name}" IS NOT NULL'
+                    f'SELECT COUNT(DISTINCT "{col_name}") FROM {tbl} WHERE "{col_name}" IS NOT NULL'
                 ).fetchone()[0]
 
                 if unique_count == 0:
@@ -94,14 +96,14 @@ def _gather_column_stats(session_db, columns_info: list) -> str:
                 elif unique_count <= 20:
                     value_counts = session_db.execute(f"""
                         SELECT "{col_name}", COUNT(*) as cnt
-                        FROM dataset WHERE "{col_name}" IS NOT NULL
+                        FROM {tbl} WHERE "{col_name}" IS NOT NULL
                         GROUP BY "{col_name}" ORDER BY cnt DESC
                     """).fetchall()
                     summary = "; ".join(f"{v}: {c}" for v, c in value_counts)
                 else:
                     top = session_db.execute(f"""
                         SELECT "{col_name}", COUNT(*) as cnt
-                        FROM dataset WHERE "{col_name}" IS NOT NULL
+                        FROM {tbl} WHERE "{col_name}" IS NOT NULL
                         GROUP BY "{col_name}" ORDER BY cnt DESC LIMIT 5
                     """).fetchall()
                     summary = f"{unique_count} unique. Top: " + "; ".join(
@@ -122,18 +124,20 @@ async def run_profiler(
     llm: LLMClient,
     model: str,
     session_db,
+    table_name: str = "dataset",
     cache_ttl_hours: int = 8760,
 ) -> str:
     """Run profiler and return schema summary as markdown string."""
-    info = session_db.execute("DESCRIBE dataset").fetchall()
-    row_count = session_db.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
+    tbl = f'"{table_name}"'
+    info = session_db.execute(f"DESCRIBE {tbl}").fetchall()
+    row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
     col_count = len(info)
-    column_stats = _gather_column_stats(session_db, info)
+    column_stats = _gather_column_stats(session_db, table_name, info)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": (
-            f"The dataset has {row_count} rows and {col_count} columns.\n\n"
+            f"The table is named `{table_name}` and has {row_count} rows and {col_count} columns.\n\n"
             f"Here are the detailed column statistics I've gathered:\n\n{column_stats}\n\n"
             "Using these stats, produce the schema summary in the format specified. "
             "Add your observations in the Notable Patterns section."

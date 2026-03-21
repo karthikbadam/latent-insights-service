@@ -51,8 +51,7 @@ When done querying, return your final answer as JSON (no tool call):
       "key_results": "Important numbers or patterns"
     }}
   ],
-  "summary": "2-4 sentence narrative. Lead with most interesting finding.",
-  "details": "Methodology notes, NULL caveats, secondary findings.",
+  "summary": "2-4 sentence narrative of findings. Lead with most interesting finding. Include methodology notes, NULL caveats, secondary findings.",
   "view_requested": {{"name": "...", "sql": "..."}} or null
 }}
 
@@ -137,9 +136,13 @@ async def run_worker(
 
     current_model = model
     attempts = 0
+    max_turns = 30
+    llm_calls = []
 
     while True:
         attempts += 1
+        if attempts > max_turns:
+            raise ValueError(f"Worker exceeded {max_turns} LLM turns without producing a result")
         if attempts > max_retries:
             current_model = fallback_model
 
@@ -154,14 +157,42 @@ async def run_worker(
 
         # If no tool calls, LLM returned its final answer
         if not response.tool_calls:
-            return parse_worker_response(response.content)
+            llm_calls.append({
+                "role": "final_response",
+                "model": response.model,
+                "input_tokens": response.input_tokens,
+                "output_tokens": response.output_tokens,
+                "response": response.content[:2000] if response.content else "",
+            })
+            if not response.content or not response.content.strip():
+                logger.warning("Worker returned empty response, requesting JSON output")
+                messages.append({"role": "assistant", "content": response.content or ""})
+                messages.append({
+                    "role": "user",
+                    "content": "Your response was empty. Please provide your final answer as JSON matching the output format specified in the system prompt.",
+                })
+                continue
+            try:
+                result = parse_worker_response(response.content)
+            except ValueError:
+                # LLM returned text instead of JSON — ask it to reformat
+                logger.warning("Worker returned non-JSON response, requesting reformat")
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": "Your response must be valid JSON matching the output format specified in the system prompt. Please reformat your answer as JSON.",
+                })
+                continue
+            result.llm_calls = llm_calls
+            return result
 
         # Process tool calls
         # Append the assistant message with tool calls
-        assistant_msg = {"role": "assistant", "content": response.content or ""}
+        assistant_msg = {"role": "assistant", "content": response.content or None}
         assistant_msg["tool_calls"] = response.tool_calls
         messages.append(assistant_msg)
 
+        tool_results = []
         for tool_call in response.tool_calls:
             func = tool_call["function"]
             if func["name"] == "run_sql":
@@ -174,9 +205,18 @@ async def run_worker(
                     "tool_call_id": tool_call["id"],
                     "content": result_text,
                 })
+                tool_results.append({"sql": sql, "result": result_text[:1000]})
             else:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": f"Unknown tool: {func['name']}",
                 })
+
+        llm_calls.append({
+            "role": "tool_use",
+            "model": response.model,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "tool_calls": tool_results,
+        })

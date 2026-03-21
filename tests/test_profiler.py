@@ -8,7 +8,7 @@ from tests.conftest import make_mock_llm
 
 def test_gather_column_stats_has_all_columns(session_db):
     info = session_db.execute("DESCRIBE dataset").fetchall()
-    stats = _gather_column_stats(session_db, info)
+    stats = _gather_column_stats(session_db, "dataset", info)
 
     assert "pl_name" in stats
     assert "discoverymethod" in stats
@@ -18,7 +18,7 @@ def test_gather_column_stats_has_all_columns(session_db):
 
 def test_gather_column_stats_numeric(session_db):
     info = session_db.execute("DESCRIBE dataset").fetchall()
-    stats = _gather_column_stats(session_db, info)
+    stats = _gather_column_stats(session_db, "dataset", info)
 
     # pl_orbper is numeric — should have min, max, mean
     assert "min=" in stats
@@ -28,7 +28,7 @@ def test_gather_column_stats_numeric(session_db):
 
 def test_gather_column_stats_categorical(session_db):
     info = session_db.execute("DESCRIBE dataset").fetchall()
-    stats = _gather_column_stats(session_db, info)
+    stats = _gather_column_stats(session_db, "dataset", info)
 
     # discoverymethod has <20 unique — should show value counts
     assert "Transit" in stats
@@ -36,7 +36,7 @@ def test_gather_column_stats_categorical(session_db):
 
 def test_gather_column_stats_null_rates(session_db):
     info = session_db.execute("DESCRIBE dataset").fetchall()
-    stats = _gather_column_stats(session_db, info)
+    stats = _gather_column_stats(session_db, "dataset", info)
 
     # pl_orbeccen has NULLs — should show non-100% rate
     lines = stats.split("\n")
