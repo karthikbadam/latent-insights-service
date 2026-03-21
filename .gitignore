@@ -12,3 +12,5 @@ dist/
 .claude/
 docs/STATUS.md
 CLAUDE.md
+
+.DS_Store
