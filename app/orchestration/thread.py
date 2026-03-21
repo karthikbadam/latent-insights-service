@@ -67,7 +67,7 @@ async def run_thread_loop(
 
             # Coordinator decides
             t0 = time.monotonic()
-            decision = await run_coordinator(
+            decision, coordinator_log = await run_coordinator(
                 llm=llm,
                 model=config.models.coordinator,
                 seed_question=thread.seed_question,
@@ -78,6 +78,7 @@ async def run_thread_loop(
                 temperature=config.temperatures.coordinator,
             )
             coordinator_ms = round((time.monotonic() - t0) * 1000)
+            coordinator_log["duration_ms"] = coordinator_ms
 
             logger.info(
                 f"Thread {thread.id} coordinator: {decision.status.value} "
@@ -142,14 +143,8 @@ async def run_thread_loop(
             )
 
             # Build LLM call log for this step
-            step_llm_calls = []
-            step_llm_calls.append({
-                "agent": "coordinator",
-                "duration_ms": coordinator_ms,
-            })
+            step_llm_calls = [coordinator_log]
             if worker_result.llm_calls:
-                for call in worker_result.llm_calls:
-                    call["agent"] = "worker"
                 step_llm_calls.extend(worker_result.llm_calls)
 
             # Persist step

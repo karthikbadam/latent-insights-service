@@ -54,7 +54,6 @@ def test_execute_sql_groupby(session_db):
 async def test_run_worker_no_tool_calls(session_db, schema_summary):
     """Worker that returns final answer without tool calls."""
     final_response = json.dumps({
-        "queries_executed": [{"purpose": "test", "sql": "SELECT 1", "key_results": "1"}],
         "summary": "Test summary",
         "details": None,
         "view_requested": None,
@@ -96,9 +95,6 @@ async def test_run_worker_with_tool_call(session_db, schema_summary):
     # Second call: LLM returns final answer
     final_response = LLMResponse(
         content=json.dumps({
-            "queries_executed": [
-                {"purpose": "Count rows", "sql": "SELECT COUNT(*) FROM dataset", "key_results": "103 rows"}
-            ],
             "summary": "The dataset contains 103 rows.",
             "details": None,
             "view_requested": None,
@@ -160,9 +156,6 @@ async def test_run_worker_sql_error_in_tool(session_db, schema_summary):
     # Third call: LLM returns final answer
     final_response = LLMResponse(
         content=json.dumps({
-            "queries_executed": [
-                {"purpose": "Count", "sql": "SELECT COUNT(*) FROM dataset", "key_results": "103"}
-            ],
             "summary": "Found 103 rows after correcting query.",
             "details": None,
             "view_requested": None,
@@ -189,7 +182,6 @@ async def test_run_worker_with_view_request(session_db, schema_summary):
     mock_llm = AsyncMock()
     mock_llm.call.return_value = LLMResponse(
         content=json.dumps({
-            "queries_executed": [],
             "summary": "Created filtered view",
             "details": None,
             "view_requested": {

@@ -13,7 +13,7 @@ from tests.conftest import make_mock_llm
 @pytest.mark.asyncio
 async def test_run_coordinator_continue(schema_summary):
     mock = make_mock_llm("coordinator_response.json")
-    result = await run_coordinator(
+    result, _ = await run_coordinator(
         llm=mock, model="test",
         seed_question="Why gaps?",
         motivation="Detection bias",
@@ -31,7 +31,7 @@ async def test_run_coordinator_continue(schema_summary):
 @pytest.mark.asyncio
 async def test_run_coordinator_stuck(schema_summary):
     mock = make_mock_llm("coordinator_stuck_response.json")
-    result = await run_coordinator(
+    result, _ = await run_coordinator(
         llm=mock, model="test",
         seed_question="Why eccentric?",
         motivation="Dynamics",
@@ -48,7 +48,7 @@ async def test_run_coordinator_stuck(schema_summary):
 @pytest.mark.asyncio
 async def test_run_coordinator_done(schema_summary):
     mock = make_mock_llm("coordinator_done_response.json")
-    result = await run_coordinator(
+    result, _ = await run_coordinator(
         llm=mock, model="test",
         seed_question="Test",
         motivation="Test",
@@ -78,7 +78,7 @@ async def test_coordinator_validates_done_requires_synthesize(schema_summary):
         model="test",
     )
 
-    result = await run_coordinator(
+    result, _ = await run_coordinator(
         llm=mock, model="test",
         seed_question="Test", motivation="", entry_point="",
         schema_summary=schema_summary,
@@ -105,7 +105,7 @@ async def test_coordinator_validates_stuck_has_question(schema_summary):
         model="test",
     )
 
-    result = await run_coordinator(
+    result, _ = await run_coordinator(
         llm=mock, model="test",
         seed_question="Test", motivation="", entry_point="",
         schema_summary=schema_summary,

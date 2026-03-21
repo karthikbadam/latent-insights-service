@@ -69,7 +69,6 @@ def parse_worker_response(raw: str) -> WorkerResult:
     details = data.get("details")
     result = f"{summary}\n\n{details}" if details else summary
     return WorkerResult(
-        queries_executed=data.get("queries_executed", []),
         result=result,
         view_requested=data.get("view_requested"),
     )

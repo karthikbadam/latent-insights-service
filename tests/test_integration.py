@@ -56,7 +56,6 @@ def _make_coordinator_response(status, move, instruction=None, question=None, co
 def _make_worker_response(summary, sql="SELECT 1"):
     """Helper to build worker mock responses."""
     return json.dumps({
-        "queries_executed": [{"purpose": "test", "sql": sql, "key_results": "test"}],
         "summary": summary,
         "details": None,
         "view_requested": None,

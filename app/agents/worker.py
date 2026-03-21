@@ -7,6 +7,7 @@ Works with any dataset — no domain-specific assumptions.
 
 import json
 import logging
+import time
 
 from app.core.llm import LLMClient
 from app.core.parsing import parse_worker_response
@@ -44,13 +45,6 @@ and execute it against a DuckDB database using SQL.
 When done querying, return your final answer as JSON (no tool call):
 
 {{
-  "queries_executed": [
-    {{
-      "purpose": "What this query checks",
-      "sql": "The SQL",
-      "key_results": "Important numbers or patterns"
-    }}
-  ],
   "summary": "2-4 sentence narrative of findings. Lead with most interesting finding. Include methodology notes, NULL caveats, secondary findings.",
   "view_requested": {{"name": "...", "sql": "..."}} or null
 }}
@@ -136,7 +130,7 @@ async def run_worker(
 
     current_model = model
     attempts = 0
-    max_turns = 30
+    max_turns = 50
     llm_calls = []
 
     while True:
@@ -146,23 +140,27 @@ async def run_worker(
         if attempts > max_retries:
             current_model = fallback_model
 
+        t0 = time.monotonic()
         response = await llm.call(
             model=current_model,
             messages=messages,
             role="worker",
             temperature=0.0,
             tools=[RUN_SQL_TOOL],
-            cache_ttl_hours=0,  # don't cache tool-use conversations
+            cache_ttl_hours=cache_ttl_hours
         )
+        call_ms = round((time.monotonic() - t0) * 1000)
 
         # If no tool calls, LLM returned its final answer
         if not response.tool_calls:
             llm_calls.append({
-                "role": "final_response",
+                "agent": "worker",
+                "type": "response",
+                "duration_ms": call_ms,
                 "model": response.model,
                 "input_tokens": response.input_tokens,
                 "output_tokens": response.output_tokens,
-                "response": response.content[:2000] if response.content else "",
+                "response": response.content[:500] if response.content else "",
             })
             if not response.content or not response.content.strip():
                 logger.warning("Worker returned empty response, requesting JSON output")
@@ -213,10 +211,14 @@ async def run_worker(
                     "content": f"Unknown tool: {func['name']}",
                 })
 
-        llm_calls.append({
-            "role": "tool_use",
-            "model": response.model,
-            "input_tokens": response.input_tokens,
-            "output_tokens": response.output_tokens,
-            "tool_calls": tool_results,
-        })
+        for tr in tool_results:
+            llm_calls.append({
+                "agent": "worker",
+                "type": "tool_call",
+                "duration_ms": call_ms,
+                "model": response.model,
+                "input_tokens": response.input_tokens,
+                "output_tokens": response.output_tokens,
+                "sql": tr["sql"],
+                "tool_result": tr["result"],
+            })

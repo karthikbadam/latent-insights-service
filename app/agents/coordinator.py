@@ -75,8 +75,8 @@ async def run_coordinator(
     schema_summary: str,
     thread_history: str,
     temperature: float = 0.3,
-) -> CoordinatorDecision:
-    """Run one coordinator step and return the decision."""
+) -> tuple[CoordinatorDecision, dict]:
+    """Run one coordinator step and return (decision, llm_call_log)."""
     prompt = SYSTEM_PROMPT.format(
         seed_question=seed_question,
         motivation=motivation,
@@ -119,4 +119,12 @@ async def run_coordinator(
         logger.warning("Coordinator returned STUCK without question — adding default")
         decision.question_for_human = "I need guidance on how to proceed with this analysis."
 
-    return decision
+    llm_log = {
+        "agent": "coordinator",
+        "model": response.model,
+        "input_tokens": response.input_tokens,
+        "output_tokens": response.output_tokens,
+        "response": response.content[:500] if response.content else "",
+    }
+
+    return decision, llm_log

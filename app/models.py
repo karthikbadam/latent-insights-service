@@ -104,7 +104,6 @@ class CoordinatorDecision:
 
 @dataclass
 class WorkerResult:
-    queries_executed: list[dict]
     result: str
     view_requested: dict | None = None
     llm_calls: list[dict] | None = None
