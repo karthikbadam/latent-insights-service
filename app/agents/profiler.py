@@ -125,7 +125,6 @@ async def run_profiler(
     model: str,
     session_db,
     table_name: str = "dataset",
-    cache_ttl_hours: int = 8760,
 ) -> str:
     """Run profiler and return schema summary as markdown string."""
     tbl = f'"{table_name}"'
@@ -149,7 +148,6 @@ async def run_profiler(
         messages=messages,
         role="profiler",
         temperature=0.0,
-        cache_ttl_hours=cache_ttl_hours,
     )
 
     return response.content

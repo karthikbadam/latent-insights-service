@@ -4,9 +4,27 @@ Parallel-agent sensemaking tool for collaborative data analysis. Upload any data
 
 ## Quick start
 
+### OpenRouter (default)
+
 ```bash
 uv sync --extra dev
-export OPENROUTER_API_KEY="your-key"
+export LLM_API_KEY=<your-key>
+uv run uvicorn app.main:app --reload
+```
+
+### Ollama (local, free)
+
+```bash
+ollama pull gpt-oss:20b
+export LLM_PROVIDER=ollama
+uv run uvicorn app.main:app --reload
+```
+
+Override individual models if needed:
+
+```bash
+export LLM_PROVIDER=ollama
+export MODEL_WORKER=gemma3:4b
 uv run uvicorn app.main:app --reload
 ```
 

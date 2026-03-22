@@ -13,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import AppConfig
 from app.core.llm import LLMClient
 from app.core.queue import Queue
+from app.core.state import StateStore
+from app.core.tracing import TraceStore
 from app.db.connection import Database
 from app.api import routes, sse
 
@@ -24,40 +26,39 @@ config: AppConfig | None = None
 llm: LLMClient | None = None
 db: Database | None = None
 queue_instance: Queue | None = None
+state_store: StateStore | None = None
+trace_store: TraceStore | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, llm, db, queue_instance
+    global config, llm, db, queue_instance, state_store, trace_store
 
     config = AppConfig.from_env()
     logger.info(f"Starting {config.app_name}")
+    logger.info(f"LLM provider: {config.llm_provider}, base: {config.llm_base_url}")
     logger.info(f"Models: {config.models}")
 
-    # Init LLM client
     llm = LLMClient(
-        api_key=config.openrouter_api_key,
-        base_url=config.openrouter_base_url,
+        api_key=config.llm_api_key,
+        base_url=config.llm_base_url,
         app_name=config.app_name,
         app_url=config.app_url,
     )
 
-    # Init database
     db = Database(data_dir=config.data_dir)
-    main_db = db.get_main_db()
 
-    # Attach cache to LLM client
-    llm.set_cache_db(main_db)
-
-    # Init queue
     queue_instance = Queue()
+    state_store = StateStore(data_dir=config.data_dir)
+    trace_store = TraceStore(data_dir=config.data_dir)
     sse.queue = queue_instance
 
     logger.info("Ready")
     yield
 
-    # Cleanup
-    await queue_instance.cancel_session("*")  # cancel all
+    # Cleanup — dump all state to disk
+    state_store.dump_all()
+    await queue_instance.cancel_session("*")
     db.close()
     logger.info("Shutdown complete")
 

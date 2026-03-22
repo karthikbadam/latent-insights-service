@@ -8,17 +8,15 @@ import duckdb
 import pytest
 
 from app.core.llm import LLMClient, LLMResponse
-from app.db.schema import create_tables
+from app.core.state import StateStore
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 
 
 @pytest.fixture
-def test_db():
-    """In-memory DuckDB with main schema tables (sessions, threads, steps, llm_cache)."""
-    db = duckdb.connect(":memory:")
-    create_tables(db)
-    return db
+def state_store(tmp_path):
+    """In-memory StateStore backed by tmp_path for persistence tests."""
+    return StateStore(data_dir=str(tmp_path))
 
 
 @pytest.fixture

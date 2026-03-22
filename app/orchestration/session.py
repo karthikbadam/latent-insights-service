@@ -11,9 +11,10 @@ from app.agents.scout import run_scout
 from app.config import AppConfig
 from app.core.llm import LLMClient
 from app.core.queue import Queue
-from app.db import queries
+from app.core.state import StateStore
+from app.core.tracing import TraceStore
 from app.db.connection import Database
-from app.models import ThreadEvent
+from app.models import StreamEvent
 from app.orchestration.thread import run_thread_loop
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,8 @@ async def create_session_flow(
     llm: LLMClient,
     db: Database,
     queue: Queue,
+    state: StateStore,
+    trace_store: TraceStore,
     session_id: str,
     dataset_path: str,
 ):
@@ -33,46 +36,34 @@ async def create_session_flow(
     2. Run profiler -> store schema_summary
     3. Run scout -> store scout_output
     4. Spawn threads for top N scout questions
-
-    Session record must already exist in main DB.
     """
     session_start = time.monotonic()
-    main_db = db.get_main_db()
 
     logger.info(f"Session {session_id} flow starting for {dataset_path}")
 
-    # 2. Create session DB with dataset (run in thread to avoid blocking event loop)
+    # Create session DB with dataset (run in thread to avoid blocking event loop)
     loop = asyncio.get_running_loop()
     session_db, table_name = await loop.run_in_executor(
         None, partial(db.create_session_db, session_id, dataset_path)
     )
 
-    # Store the resolved table name
-    async with queue.db_write_lock:
-        queries.update_session_table_name(main_db, session_id, table_name)
+    state.update_session_table_name(session_id, table_name)
 
-    # MCP server disabled — workers use direct SQL via run_sql tool loop.
-    # mcp_server_start('stdio') blocks on stdin, causing the process to hang.
-    # await loop.run_in_executor(None, setup_mcp_server, session_db)
-    # await loop.run_in_executor(None, publish_table, session_db, table_name)
-
-    # 3. Run profiler
+    # Run profiler
     t0 = time.monotonic()
     schema_summary = await run_profiler(
         llm=llm,
         model=config.models.profiler,
         session_db=session_db,
         table_name=table_name,
-        cache_ttl_hours=config.cache.profiler,
     )
     profiler_ms = round((time.monotonic() - t0) * 1000)
 
-    async with queue.db_write_lock:
-        queries.update_session_schema(main_db, session_id, schema_summary)
+    state.update_session_schema(session_id, schema_summary)
 
     logger.info(f"Session {session_id} profiled ({profiler_ms}ms)")
 
-    # 4. Run scout
+    # Run scout
     t0 = time.monotonic()
     scout_output = await run_scout(
         llm=llm,
@@ -83,14 +74,14 @@ async def create_session_flow(
     )
     scout_ms = round((time.monotonic() - t0) * 1000)
 
-    async with queue.db_write_lock:
-        queries.update_session_scout(main_db, session_id, asdict(scout_output))
+    state.update_session_scout(session_id, asdict(scout_output))
 
-    await queue.emit(ThreadEvent(
+    await queue.emit(StreamEvent(
         session_id=session_id,
         thread_id="",
         event_type="scout_done",
-        payload={"question_count": len(scout_output.questions)},
+        message=f"Scout found {len(scout_output.questions)} questions",
+        data={"question_count": len(scout_output.questions)},
     ))
 
     setup_elapsed = round(time.monotonic() - session_start, 2)
@@ -99,22 +90,27 @@ async def create_session_flow(
         f"(profiler={profiler_ms}ms scout={scout_ms}ms setup={setup_elapsed}s)"
     )
 
-    # 5. Spawn threads for top N questions
+    # Close the initial session_db — each thread gets its own connection
+    session_db.close()
+
+    # Spawn threads for top N questions
     num_threads = min(config.default_seed_threads, len(scout_output.questions))
     for i in range(num_threads):
         q = scout_output.questions[i]
-        async with queue.db_write_lock:
-            thread = queries.create_thread(
-                main_db, session_id, q.question, q.motivation, q.entry_point,
-            )
+        thread = state.create_thread(
+            session_id, q.question, q.motivation, q.entry_point,
+        )
+
+        thread_db = db.open_session_connection(session_id)
 
         queue.schedule(
             coro=run_thread_loop(
                 config=config,
                 llm=llm,
-                main_db=main_db,
-                session_db=session_db,
+                session_db=thread_db,
                 queue=queue,
+                state=state,
+                trace_store=trace_store,
                 thread=thread,
                 schema_summary=schema_summary,
             ),
@@ -124,4 +120,5 @@ async def create_session_flow(
             description=f"Thread: {q.question[:60]}",
         )
 
+    state.dump_session(session_id)
     return session_id

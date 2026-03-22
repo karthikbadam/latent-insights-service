@@ -7,24 +7,51 @@ import os
 from dataclasses import dataclass, field
 
 
+PROVIDER_DEFAULTS = {
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "",
+        "models": {
+            "profiler": "google/gemini-2.5-flash",
+            "scout": "google/gemini-2.5-flash",
+            "coordinator": "openai/gpt-oss-20b",
+            "worker": "openai/gpt-oss-20b",
+            "worker_fallback": "openai/gpt-oss-20b",
+        },
+    },
+    "ollama": {
+        "base_url": "http://localhost:11434/v1",
+        "api_key": "ollama",
+        "models": {
+            "profiler": "gpt-oss:20b",
+            "scout": "gpt-oss:20b",
+            "coordinator": "gpt-oss:20b",
+            "worker": "gpt-oss:20b",
+            "worker_fallback": "gpt-oss:20b",
+        },
+    },
+}
+
+
 @dataclass
 class ModelConfig:
-    """LLM model selection per agent role. All OpenRouter model IDs."""
+    """LLM model selection per agent role."""
 
-    profiler: str = "google/gemini-2.5-flash"
-    scout: str = "google/gemini-2.5-flash"
-    coordinator: str = "openai/gpt-oss-20b"
-    worker: str = "openai/gpt-oss-20b"
-    worker_fallback: str = "openai/gpt-oss-20b"
+    profiler: str = ""
+    scout: str = ""
+    coordinator: str = ""
+    worker: str = ""
+    worker_fallback: str = ""
 
     @classmethod
-    def from_env(cls) -> "ModelConfig":
+    def from_env(cls, provider: str = "openrouter") -> "ModelConfig":
+        defaults = PROVIDER_DEFAULTS[provider]["models"]
         return cls(
-            profiler=os.getenv("MODEL_PROFILER", cls.profiler),
-            scout=os.getenv("MODEL_SCOUT", cls.scout),
-            coordinator=os.getenv("MODEL_COORDINATOR", cls.coordinator),
-            worker=os.getenv("MODEL_WORKER", cls.worker),
-            worker_fallback=os.getenv("MODEL_WORKER_FALLBACK", cls.worker_fallback),
+            profiler=os.getenv("MODEL_PROFILER", defaults["profiler"]),
+            scout=os.getenv("MODEL_SCOUT", defaults["scout"]),
+            coordinator=os.getenv("MODEL_COORDINATOR", defaults["coordinator"]),
+            worker=os.getenv("MODEL_WORKER", defaults["worker"]),
+            worker_fallback=os.getenv("MODEL_WORKER_FALLBACK", defaults["worker_fallback"]),
         )
 
 
@@ -48,22 +75,13 @@ class TemperatureConfig:
 
 
 @dataclass
-class CacheConfig:
-    """Cache TTL per role in hours. Set to 0 to disable caching for a role."""
-
-    profiler: int = 8760  # 1 year — same dataset = same profile
-    worker: int = 24      # same instruction + schema = same SQL
-    scout: int = 0        # no cache — want creative variation
-    coordinator: int = 0  # no cache — depends on evolving history
-
-
-@dataclass
 class AppConfig:
     """Top-level application config."""
 
-    # OpenRouter
-    openrouter_api_key: str = ""
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # LLM provider
+    llm_provider: str = "openrouter"
+    llm_api_key: str = ""
+    llm_base_url: str = "https://openrouter.ai/api/v1"
     app_name: str = "Latent Insights"
     app_url: str = "https://yoursite.github.io"
 
@@ -79,19 +97,24 @@ class AppConfig:
     # Sub-configs
     models: ModelConfig = field(default_factory=ModelConfig)
     temperatures: TemperatureConfig = field(default_factory=TemperatureConfig)
-    cache: CacheConfig = field(default_factory=CacheConfig)
 
     @classmethod
     def from_env(cls) -> "AppConfig":
+        provider = os.getenv("LLM_PROVIDER", "openrouter")
+        defaults = PROVIDER_DEFAULTS[provider]
+
+        api_key = os.getenv("LLM_API_KEY") or defaults["api_key"]
+        base_url = os.getenv("LLM_BASE_URL") or defaults["base_url"]
+
         return cls(
-            openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
-            openrouter_base_url=os.getenv("OPENROUTER_BASE_URL", cls.openrouter_base_url),
+            llm_provider=provider,
+            llm_api_key=api_key,
+            llm_base_url=base_url,
             app_name=os.getenv("APP_NAME", cls.app_name),
             app_url=os.getenv("APP_URL", cls.app_url),
             data_dir=os.getenv("DATA_DIR", cls.data_dir),
             default_seed_threads=int(os.getenv("DEFAULT_SEED_THREADS", "5")),
             max_worker_retries=int(os.getenv("MAX_WORKER_RETRIES", "3")),
-            models=ModelConfig.from_env(),
+            models=ModelConfig.from_env(provider),
             temperatures=TemperatureConfig.from_env(),
-            cache=CacheConfig(),
         )

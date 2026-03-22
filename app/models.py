@@ -3,6 +3,7 @@ Data models — dataclasses for the computation engine.
 Pydantic is only used at API boundaries (see api/schemas.py).
 """
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -55,6 +56,7 @@ class Thread:
     status: ThreadStatus = ThreadStatus.RUNNING
     summary: str | None = None
     error: str | None = None
+    running_summary: str | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -113,8 +115,10 @@ class WorkerResult:
 
 
 @dataclass
-class ThreadEvent:
+class StreamEvent:
     session_id: str
     thread_id: str
-    event_type: str  # step_completed, thread_waiting, thread_complete, scout_done
-    payload: dict = field(default_factory=dict)
+    event_type: str  # step, thinking, waiting, complete, error, scout_done
+    message: str  # Human-readable, e.g. "[abc123] FORAGE: Analyzing orbital periods..."
+    data: dict = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)

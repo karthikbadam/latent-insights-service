@@ -19,12 +19,14 @@ queue: Queue | None = None
 @router.get("/sessions/{session_id}/events")
 async def session_events(session_id: str):
     """
-    SSE endpoint — streams thread events to the frontend.
+    SSE endpoint — streams thread events as human-readable messages.
 
     Events:
-    - step_completed: a thread completed an analytical step
-    - thread_waiting: a thread is stuck and needs human input
-    - thread_complete: a thread finished with a finding
+    - step: analytical step progress/completion
+    - thinking: coordinator is reasoning
+    - waiting: thread needs human input
+    - complete: thread finished with a finding
+    - error: thread encountered an error
     - scout_done: scout finished, questions available
     """
 
@@ -37,7 +39,9 @@ async def session_events(session_id: str):
                     "event": event.event_type,
                     "data": json.dumps({
                         "thread_id": event.thread_id,
-                        **event.payload,
+                        "message": event.message,
+                        "timestamp": event.timestamp,
+                        **event.data,
                     }),
                 }
         except asyncio.CancelledError:

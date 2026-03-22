@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.agents.worker import _execute_sql, _format_results, run_worker
+from app.agents.worker import _execute_sql_sync, _format_results, run_worker
 from app.core.llm import LLMResponse
 from app.models import WorkerResult
 
@@ -29,18 +29,18 @@ def test_format_results_empty():
 
 
 def test_execute_sql_success(session_db):
-    result = _execute_sql(session_db, "SELECT COUNT(*) as cnt FROM dataset")
+    result = _execute_sql_sync(session_db, "SELECT COUNT(*) as cnt FROM dataset")
     assert "cnt" in result
     assert "103" in result
 
 
 def test_execute_sql_error(session_db):
-    result = _execute_sql(session_db, "SELECT * FROM nonexistent_table")
+    result = _execute_sql_sync(session_db, "SELECT * FROM nonexistent_table")
     assert "SQL ERROR" in result
 
 
 def test_execute_sql_groupby(session_db):
-    result = _execute_sql(
+    result = _execute_sql_sync(
         session_db,
         "SELECT discoverymethod, COUNT(*) as cnt FROM dataset GROUP BY 1 ORDER BY 2 DESC",
     )

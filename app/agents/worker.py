@@ -5,6 +5,7 @@ Stateless. Receives instruction, generates and executes SQL via tool use, summar
 Works with any dataset — no domain-specific assumptions.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -38,7 +39,7 @@ and execute it against a DuckDB database using SQL.
    PERCENTILE_CONT, QUALIFY, HISTOGRAM(), APPROX_QUANTILE, etc.
 3. You may call run_sql multiple times to explore, refine, and validate.
 4. If asked to create a filtered subset, include view definition in your final response.
-5. Summarize for a non-technical reader. Lead with finding, not method.
+5. Summarize for a technical reader. Lead with findings and method.
 
 ## Output format
 
@@ -88,7 +89,7 @@ def _format_results(col_names: list[str], rows: list) -> str:
     return "\n".join(lines)
 
 
-def _execute_sql(session_db, sql: str) -> str:
+def _execute_sql_sync(session_db, sql: str) -> str:
     """Execute SQL against session DB and return formatted results."""
     try:
         result = session_db.execute(sql)
@@ -100,6 +101,12 @@ def _execute_sql(session_db, sql: str) -> str:
         return f"SQL ERROR: {e}"
 
 
+async def _execute_sql(session_db, sql: str) -> str:
+    """Execute SQL in executor to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _execute_sql_sync, session_db, sql)
+
+
 async def run_worker(
     llm: LLMClient,
     model: str,
@@ -108,7 +115,6 @@ async def run_worker(
     schema_summary: str,
     session_db,
     thread_views: str = "(none)",
-    cache_ttl_hours: int = 24,
     max_retries: int = 3,
 ) -> WorkerResult:
     """
@@ -147,7 +153,6 @@ async def run_worker(
             role="worker",
             temperature=0.0,
             tools=[RUN_SQL_TOOL],
-            cache_ttl_hours=cache_ttl_hours
         )
         call_ms = round((time.monotonic() - t0) * 1000)
 
@@ -197,7 +202,7 @@ async def run_worker(
                 args = json.loads(func["arguments"])
                 sql = args.get("sql", "")
                 logger.info(f"Worker executing SQL: {sql[:200]}")
-                result_text = _execute_sql(session_db, sql)
+                result_text = await _execute_sql(session_db, sql)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],

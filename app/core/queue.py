@@ -10,7 +10,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from app.models import ThreadEvent
+from app.models import StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +37,11 @@ class Queue:
     Responsibilities:
     - Schedule and track async tasks (thread runs, scout, profiler)
     - Dispatch events to SSE listeners
-    - Serialize DuckDB writes via asyncio.Lock
     """
 
     def __init__(self):
         self._tasks: dict[str, TaskInfo] = {}
         self._event_queues: dict[str, list[asyncio.Queue]] = {}
-        self._db_write_lock = asyncio.Lock()
 
     # --- Task management ---
 
@@ -109,7 +107,7 @@ class Queue:
                 existing for existing in self._event_queues[session_id] if existing is not q
             ]
 
-    async def emit(self, event: ThreadEvent):
+    async def emit(self, event: StreamEvent):
         """Dispatch an event to all subscribers for the session."""
         queues = self._event_queues.get(event.session_id, [])
         for q in queues:
@@ -118,10 +116,3 @@ class Queue:
             f"Event emitted: {event.event_type} thread={event.thread_id} "
             f"→ {len(queues)} subscribers"
         )
-
-    # --- DB write serialization ---
-
-    @property
-    def db_write_lock(self) -> asyncio.Lock:
-        """Use this lock for all DuckDB write operations."""
-        return self._db_write_lock
