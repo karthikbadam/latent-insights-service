@@ -92,10 +92,12 @@ class AppConfig:
     data_dir: str = "data"
 
     # Threading
-    default_seed_threads: int = 5
+    default_seed_threads: int = 3
 
     # Agents
     max_worker_retries: int = 3
+    max_consecutive_errors: int = 5
+    llm_timeout: float = 120.0
 
     # Sub-configs
     models: ModelConfig = field(default_factory=ModelConfig)
@@ -121,6 +123,8 @@ class AppConfig:
             data_dir=os.getenv("DATA_DIR", cls.data_dir),
             default_seed_threads=int(os.getenv("DEFAULT_SEED_THREADS", "5")),
             max_worker_retries=int(os.getenv("MAX_WORKER_RETRIES", "3")),
+            max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", "5")),
+            llm_timeout=float(os.getenv("LLM_TIMEOUT", "120.0")),
             models=ModelConfig.from_env(provider),
             temperatures=TemperatureConfig.from_env(),
         )

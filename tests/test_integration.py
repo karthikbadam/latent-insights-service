@@ -274,7 +274,7 @@ async def test_thread_loop_three_steps_done(integration_setup):
 
     coordinator_calls = [0]
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096):
+    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             coordinator_calls[0] += 1
             if coordinator_calls[0] < 3:
@@ -322,7 +322,7 @@ async def test_thread_loop_stuck_then_resume(integration_setup):
     phase = {"value": "initial"}
     coordinator_calls = [0]
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096):
+    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             coordinator_calls[0] += 1
             if phase["value"] == "initial":
@@ -412,7 +412,7 @@ async def test_thread_emits_events(integration_setup):
 
     event_queue = queue.subscribe(session.id)
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096):
+    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             return LLMResponse(
                 content=_make_coordinator_response("DONE", "SYNTHESIZE", "wrap up"),

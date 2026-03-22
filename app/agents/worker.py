@@ -55,6 +55,10 @@ When done querying, return your final answer as JSON (no tool call):
 - Check NULL rates before computing stats.
 - Comparing groups: absolute numbers AND effect size.
 - Log scale thinking for values spanning orders of magnitude.
+- If a SQL query errors because a function does not exist, do NOT search for alternative \
+function names. Instead, rewrite your analysis using basic SQL math (arithmetic, CASE, \
+aggregates like AVG/STDDEV_POP/CORR). DuckDB is a SQL engine, not a statistics package — \
+anything not built into standard SQL must be computed manually.
 """
 
 RUN_SQL_TOOL = {
@@ -117,6 +121,8 @@ async def run_worker(
     session_db,
     thread_views: str = "(none)",
     max_retries: int = 3,
+    max_consecutive_errors: int = 5,
+    timeout: float = 120.0,
     queue: Queue | None = None,
     session_id: str = "",
     thread_id: str = "",
@@ -140,6 +146,7 @@ async def run_worker(
 
     current_model = model
     attempts = 0
+    consecutive_errors = 0
     max_turns = 50
     llm_calls = []
 
@@ -147,17 +154,37 @@ async def run_worker(
         attempts += 1
         if attempts > max_turns:
             raise ValueError(f"Worker exceeded {max_turns} LLM turns without producing a result")
-        if attempts > max_retries:
+        if consecutive_errors >= max_retries:
             current_model = fallback_model
 
+        if queue:
+            label = " (fallback model)" if current_model != model else ""
+            await queue.emit(StreamEvent(
+                session_id=session_id, thread_id=thread_id,
+                event_type="thinking",
+                message=f"Worker generating{label}...",
+                data={"model": current_model},
+            ))
+
         t0 = time.monotonic()
-        response = await llm.call(
-            model=current_model,
-            messages=messages,
-            role="worker",
-            temperature=0.0,
-            tools=[RUN_SQL_TOOL],
-        )
+        try:
+            response = await llm.call(
+                model=current_model,
+                messages=messages,
+                role="worker",
+                temperature=0.0,
+                tools=[RUN_SQL_TOOL],
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            call_ms = round((time.monotonic() - t0) * 1000)
+            logger.warning(f"Worker LLM call timed out after {call_ms}ms")
+            consecutive_errors += 1
+            messages.append({
+                "role": "user",
+                "content": "Your previous response timed out. Simplify your approach and respond more concisely.",
+            })
+            continue
         call_ms = round((time.monotonic() - t0) * 1000)
 
         if queue:
@@ -235,6 +262,10 @@ async def run_worker(
                     "content": result_text,
                 })
                 tool_results.append({"sql": sql, "result": result_text[:1000]})
+                if result_text.startswith("SQL ERROR:"):
+                    consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
             else:
                 messages.append({
                     "role": "tool",
@@ -252,4 +283,26 @@ async def run_worker(
                 "output_tokens": response.output_tokens,
                 "sql": tr["sql"],
                 "tool_result": tr["result"],
+            })
+
+        # Inject guidance when the worker keeps hitting SQL errors
+        if consecutive_errors >= max_consecutive_errors:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"You have hit {consecutive_errors} consecutive SQL errors. "
+                    "Stop trying SQL and return your final JSON answer NOW "
+                    "with whatever findings you have so far. If you have no findings, "
+                    "state that the analysis could not be completed and explain why."
+                ),
+            })
+        elif consecutive_errors >= 2:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"You have hit {consecutive_errors} consecutive SQL errors. "
+                    "The function you are trying likely does not exist in DuckDB. "
+                    "STOP retrying the same approach. Rewrite your analysis using "
+                    "only basic SQL math and aggregates (AVG, STDDEV_POP, CORR, etc)."
+                ),
             })

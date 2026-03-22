@@ -4,6 +4,7 @@ LLM client — OpenAI-compatible API integration (OpenRouter, Ollama, etc).
 All agent calls go through here.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -55,6 +56,7 @@ class LLMClient:
         temperature: float = 0.0,
         tools: list[dict] | None = None,
         max_tokens: int = 4096,
+        timeout: float = 120.0,
     ) -> LLMResponse:
         """
         Make an LLM call through OpenRouter.
@@ -84,7 +86,10 @@ class LLMClient:
             kwargs["extra_body"] = {"think": False}
 
         logger.info(f"LLM call: model={model} role={role} temp={temperature}")
-        completion = await self._client.chat.completions.create(**kwargs)
+        completion = await asyncio.wait_for(
+            self._client.chat.completions.create(**kwargs),
+            timeout=timeout,
+        )
 
         choice = completion.choices[0]
         content = choice.message.content or ""

@@ -93,32 +93,50 @@ async def create_session_flow(
     # Close the initial session_db — each thread gets its own connection
     await loop.run_in_executor(None, session_db.close)
 
-    # Spawn threads for top N questions
-    num_threads = min(config.default_seed_threads, len(scout_output.questions))
-    for i in range(num_threads):
-        q = scout_output.questions[i]
-        thread = state.create_thread(
-            session_id, q.question, q.motivation, q.entry_point,
+    # Spawn threads in batches — process all questions, batch_size at a time
+    batch_size = config.default_seed_threads
+    questions = scout_output.questions
+
+    for batch_start in range(0, len(questions), batch_size):
+        batch = questions[batch_start:batch_start + batch_size]
+        batch_num = batch_start // batch_size + 1
+        total_batches = (len(questions) + batch_size - 1) // batch_size
+        logger.info(
+            f"Session {session_id} spawning batch {batch_num}/{total_batches} "
+            f"({len(batch)} threads)"
         )
 
-        thread_db = await loop.run_in_executor(None, partial(db.open_session_connection, session_id))
+        batch_tasks = []
+        for q in batch:
+            thread = state.create_thread(
+                session_id, q.question, q.motivation, q.entry_point,
+            )
 
-        queue.schedule(
-            coro=run_thread_loop(
-                config=config,
-                llm=llm,
-                session_db=thread_db,
-                queue=queue,
-                state=state,
-                trace_store=trace_store,
-                thread=thread,
-                schema_summary=schema_summary,
-            ),
-            task_id=f"thread-{thread.id}",
-            session_id=session_id,
-            thread_id=thread.id,
-            description=f"Thread: {q.question[:60]}",
-        )
+            thread_db = await loop.run_in_executor(
+                None, partial(db.open_session_connection, session_id)
+            )
+
+            task = queue.schedule(
+                coro=run_thread_loop(
+                    config=config,
+                    llm=llm,
+                    session_db=thread_db,
+                    queue=queue,
+                    state=state,
+                    trace_store=trace_store,
+                    thread=thread,
+                    schema_summary=schema_summary,
+                ),
+                task_id=f"thread-{thread.id}",
+                session_id=session_id,
+                thread_id=thread.id,
+                description=f"Thread: {q.question[:60]}",
+            )
+            batch_tasks.append(task)
+
+        # Wait for this batch to complete before starting the next
+        if batch_tasks:
+            await asyncio.gather(*batch_tasks, return_exceptions=True)
 
     await loop.run_in_executor(None, partial(state.dump_session, session_id))
     return session_id

@@ -65,8 +65,10 @@ def parse_coordinator_response(raw: str) -> CoordinatorDecision:
 def parse_worker_response(raw: str) -> WorkerResult:
     data = extract_json(raw)
     # Combine summary + details into a single result field
-    summary = data.get("summary", "")
-    details = data.get("details")
+    raw_summary = data.get("summary", "")
+    summary = json.dumps(raw_summary) if not isinstance(raw_summary, str) else raw_summary
+    raw_details = data.get("details")
+    details = json.dumps(raw_details) if raw_details and not isinstance(raw_details, str) else raw_details
     result = f"{summary}\n\n{details}" if details else summary
     return WorkerResult(
         result=result,

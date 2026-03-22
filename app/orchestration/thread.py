@@ -158,6 +158,8 @@ async def run_thread_loop(
                 session_db=session_db,
                 thread_views=thread_views,
                 max_retries=config.max_worker_retries,
+                max_consecutive_errors=config.max_consecutive_errors,
+                timeout=config.llm_timeout,
                 queue=queue,
                 session_id=thread.session_id,
                 thread_id=thread.id,
