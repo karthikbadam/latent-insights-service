@@ -12,7 +12,8 @@ import time
 
 from app.core.llm import LLMClient
 from app.core.parsing import parse_worker_response
-from app.models import WorkerResult
+from app.core.queue import Queue
+from app.models import StreamEvent, WorkerResult
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,9 @@ async def run_worker(
     session_db,
     thread_views: str = "(none)",
     max_retries: int = 3,
+    queue: Queue | None = None,
+    session_id: str = "",
+    thread_id: str = "",
 ) -> WorkerResult:
     """
     Run one worker step using tool-use loop.
@@ -155,6 +159,18 @@ async def run_worker(
             tools=[RUN_SQL_TOOL],
         )
         call_ms = round((time.monotonic() - t0) * 1000)
+
+        if queue:
+            has_tools = bool(response.tool_calls)
+            await queue.emit(StreamEvent(
+                session_id=session_id, thread_id=thread_id,
+                event_type="llm_call",
+                message=f"Worker {'calling tool' if has_tools else 'responding'} ({call_ms}ms)",
+                data={"role": "worker", "model": current_model,
+                      "input_tokens": response.input_tokens,
+                      "output_tokens": response.output_tokens,
+                      "duration_ms": call_ms, "has_tool_calls": has_tools},
+            ))
 
         # If no tool calls, LLM returned its final answer
         if not response.tool_calls:
@@ -202,7 +218,17 @@ async def run_worker(
                 args = json.loads(func["arguments"])
                 sql = args.get("sql", "")
                 logger.info(f"Worker executing SQL: {sql[:200]}")
+                t_sql = time.monotonic()
                 result_text = await _execute_sql(session_db, sql)
+                sql_ms = round((time.monotonic() - t_sql) * 1000)
+
+                if queue:
+                    await queue.emit(StreamEvent(
+                        session_id=session_id, thread_id=thread_id,
+                        event_type="tool_call",
+                        message=result_text[:200],
+                        data={"sql": sql[:500], "duration_ms": sql_ms},
+                    ))
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],

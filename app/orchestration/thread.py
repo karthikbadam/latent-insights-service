@@ -83,13 +83,6 @@ async def run_thread_loop(
             thread_views = await _get_thread_views(session_db, thread.id)
 
             # Coordinator decides
-            await queue.emit(StreamEvent(
-                session_id=thread.session_id,
-                thread_id=thread.id,
-                event_type="thinking",
-                message=f"[{tid}] Step {step_number}: coordinator thinking...",
-            ))
-
             t0 = time.monotonic()
             decision, coordinator_log = await run_coordinator(
                 llm=llm,
@@ -100,6 +93,9 @@ async def run_thread_loop(
                 schema_summary=schema_summary,
                 thread_history=thread_history,
                 temperature=config.temperatures.coordinator,
+                queue=queue,
+                session_id=thread.session_id,
+                thread_id=thread.id,
             )
             coordinator_ms = round((time.monotonic() - t0) * 1000)
             coordinator_log["duration_ms"] = coordinator_ms
@@ -162,6 +158,9 @@ async def run_thread_loop(
                 session_db=session_db,
                 thread_views=thread_views,
                 max_retries=config.max_worker_retries,
+                queue=queue,
+                session_id=thread.session_id,
+                thread_id=thread.id,
             )
             worker_ms = round((time.monotonic() - t0) * 1000)
 

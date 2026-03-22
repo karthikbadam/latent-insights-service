@@ -6,10 +6,12 @@ Works with any dataset — no domain-specific assumptions.
 """
 
 import logging
+import time
 
 from app.core.llm import LLMClient
 from app.core.parsing import parse_coordinator_response
-from app.models import CoordinatorDecision, CoordinatorStatus, MoveType
+from app.core.queue import Queue
+from app.models import CoordinatorDecision, CoordinatorStatus, MoveType, StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,9 @@ async def run_coordinator(
     schema_summary: str,
     thread_history: str,
     temperature: float = 0.3,
+    queue: Queue | None = None,
+    session_id: str = "",
+    thread_id: str = "",
 ) -> tuple[CoordinatorDecision, dict]:
     """Run one coordinator step and return (decision, llm_call_log)."""
     prompt = SYSTEM_PROMPT.format(
@@ -90,12 +95,25 @@ async def run_coordinator(
         {"role": "user", "content": "Based on the thread history, decide your next move."},
     ]
 
+    t0 = time.monotonic()
     response = await llm.call(
         model=model,
         messages=messages,
         role="coordinator",
         temperature=temperature,
     )
+    call_ms = round((time.monotonic() - t0) * 1000)
+
+    if queue:
+        await queue.emit(StreamEvent(
+            session_id=session_id, thread_id=thread_id,
+            event_type="llm_call",
+            message=f"Coordinator thinking ({call_ms}ms)",
+            data={"role": "coordinator", "model": model,
+                  "input_tokens": response.input_tokens,
+                  "output_tokens": response.output_tokens,
+                  "duration_ms": call_ms},
+        ))
 
     if not response.content or not response.content.strip():
         logger.warning("Coordinator returned empty response, retrying once")

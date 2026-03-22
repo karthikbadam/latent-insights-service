@@ -7,7 +7,7 @@ import logging
 import os
 from functools import partial
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
 
 from app.api.schemas import (
     CreateThreadRequest,
@@ -22,6 +22,10 @@ from app.api.schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _base_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
 
 
 def _get_state():
@@ -67,6 +71,7 @@ async def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
 
 @router.post("/sessions")
 async def create_session(
+    request: Request,
     file: UploadFile | None = File(None),
     dataset_path: str | None = Query(None),
 ):
@@ -110,19 +115,20 @@ async def create_session(
         description=f"Session setup: {os.path.basename(resolved_path)}",
     )
 
+    base = _base_url(request)
     return {
         "session_id": session.id,
         "status": "created",
         "urls": {
-            "self": f"/api/sessions/{session.id}",
-            "events": f"/api/sessions/{session.id}/events",
-            "threads": f"/api/sessions/{session.id}/threads",
+            "self": f"{base}/api/sessions/{session.id}",
+            "events": f"{base}/api/sessions/{session.id}/events",
+            "threads": f"{base}/api/sessions/{session.id}/threads",
         },
     }
 
 
 @router.get("/sessions/{session_id}")
-async def get_session(session_id: str):
+async def get_session(session_id: str, request: Request):
     """Get full session state with threads and steps."""
     _, _, _, _, state, trace_store = _get_state()
 
@@ -154,9 +160,9 @@ async def get_session(session_id: str):
         scout_questions=session.scout_output.get("questions") if session.scout_output else None,
         threads=thread_responses,
         urls=SessionUrls(
-            self=f"/api/sessions/{session_id}",
-            events=f"/api/sessions/{session_id}/events",
-            threads=f"/api/sessions/{session_id}/threads",
+            self=f"{_base_url(request)}/api/sessions/{session_id}",
+            events=f"{_base_url(request)}/api/sessions/{session_id}/events",
+            threads=f"{_base_url(request)}/api/sessions/{session_id}/threads",
         ),
         created_at=session.created_at.isoformat() if session.created_at else "",
     )
