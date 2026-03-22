@@ -524,7 +524,12 @@ def _finalize_error(ctx: ThreadContext, error: Exception):
     )
     try:
         if ctx.step_span:
-            ctx.step_span.attributes["error"] = error_msg
+            ctx.step_span.attributes.update({
+                "move": ctx.decision.next_move.value if ctx.decision else "ERROR",
+                "instruction": (ctx.decision.worker_instruction or "") if ctx.decision else "",
+                "result": f"Error: {error_msg}",
+                "error": error_msg,
+            })
             ctx.trace_store.end_span(ctx.step_span, status="error")
         ctx.trace_store.flush_to_file(ctx.thread.id, ctx.thread.session_id)
         ctx.trace_store.clear_trace(ctx.thread.id)

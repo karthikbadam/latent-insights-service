@@ -86,7 +86,7 @@ class AppConfig:
     llm_base_url: str = "https://openrouter.ai/api/v1"
     llm_think: bool = True
     app_name: str = "Latent Insights"
-    app_url: str = "https://yoursite.github.io"
+    app_url: str = "https://karthikbadam.github.io"
 
     # DuckDB
     data_dir: str = "data"
@@ -122,11 +122,11 @@ class AppConfig:
             app_name=os.getenv("APP_NAME", cls.app_name),
             app_url=os.getenv("APP_URL", cls.app_url),
             data_dir=os.getenv("DATA_DIR", cls.data_dir),
-            default_seed_threads=int(os.getenv("DEFAULT_SEED_THREADS", "5")),
-            max_worker_retries=int(os.getenv("MAX_WORKER_RETRIES", "3")),
-            max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", "5")),
-            max_repeated_moves=int(os.getenv("MAX_REPEATED_MOVES", "3")),
-            llm_timeout=float(os.getenv("LLM_TIMEOUT", "120.0")),
+            default_seed_threads=int(os.getenv("DEFAULT_SEED_THREADS", cls.default_seed_threads)),
+            max_worker_retries=int(os.getenv("MAX_WORKER_RETRIES", cls.max_worker_retries)),
+            max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", cls.max_consecutive_errors)),
+            max_repeated_moves=int(os.getenv("MAX_REPEATED_MOVES", cls.max_repeated_moves)),
+            llm_timeout=float(os.getenv("LLM_TIMEOUT", cls.llm_timeout)),
             models=ModelConfig.from_env(provider),
             temperatures=TemperatureConfig.from_env(),
         )
