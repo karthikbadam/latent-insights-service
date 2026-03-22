@@ -1,14 +1,12 @@
 """Tests for app.core.llm — LLMClient call and retry behavior."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
-import pytest
 
 from app.core.llm import LLMClient, LLMResponse
 
 
-@pytest.mark.asyncio
-async def test_call_returns_response():
+def test_call_returns_response():
     client = LLMClient(api_key="test", base_url="http://test")
 
     mock_completion = MagicMock()
@@ -17,10 +15,10 @@ async def test_call_returns_response():
     mock_completion.choices[0].message.tool_calls = None
     mock_completion.usage = MagicMock(prompt_tokens=10, completion_tokens=20)
 
-    client._client = AsyncMock()
-    client._client.chat.completions.create = AsyncMock(return_value=mock_completion)
+    client._client = MagicMock()
+    client._client.chat.completions.create = MagicMock(return_value=mock_completion)
 
-    result = await client.call(
+    result = client.call(
         model="m", messages=[{"role": "user", "content": "hi"}],
         role="test", temperature=0.5,
     )
@@ -30,8 +28,7 @@ async def test_call_returns_response():
     assert result.output_tokens == 20
 
 
-@pytest.mark.asyncio
-async def test_call_captures_tool_calls():
+def test_call_captures_tool_calls():
     client = LLMClient(api_key="test", base_url="http://test")
 
     mock_tc = MagicMock()
@@ -45,10 +42,10 @@ async def test_call_captures_tool_calls():
     mock_completion.choices[0].message.tool_calls = [mock_tc]
     mock_completion.usage = MagicMock(prompt_tokens=10, completion_tokens=20)
 
-    client._client = AsyncMock()
-    client._client.chat.completions.create = AsyncMock(return_value=mock_completion)
+    client._client = MagicMock()
+    client._client.chat.completions.create = MagicMock(return_value=mock_completion)
 
-    result = await client.call(
+    result = client.call(
         model="m", messages=[{"role": "user", "content": "hi"}],
         role="test",
     )
@@ -58,14 +55,13 @@ async def test_call_captures_tool_calls():
     assert result.tool_calls[0]["function"]["name"] == "run_sql"
 
 
-@pytest.mark.asyncio
-async def test_call_with_retry_uses_fallback():
+def test_call_with_retry_uses_fallback():
     client = LLMClient(api_key="test", base_url="http://test")
 
     call_count = 0
     models_used = []
 
-    async def mock_call(model, messages, role, temperature, tools=None, max_tokens=4096):
+    def mock_call(model, messages, role, temperature, tools=None, max_tokens=4096):
         nonlocal call_count
         call_count += 1
         models_used.append(model)
@@ -75,7 +71,7 @@ async def test_call_with_retry_uses_fallback():
 
     client.call = mock_call
 
-    result = await client.call_with_retry(
+    result = client.call_with_retry(
         model="primary", fallback_model="fallback",
         messages=[{"role": "user", "content": "test"}],
         role="test", max_retries=3,

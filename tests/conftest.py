@@ -2,7 +2,7 @@
 
 import json
 import os
-from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import duckdb
 import pytest
@@ -36,7 +36,7 @@ def schema_summary():
         return json.load(f)["content"]
 
 
-def make_mock_llm(fixture_name: str) -> AsyncMock:
+def make_mock_llm(fixture_name: str) -> MagicMock:
     """Create a mock LLMClient that returns a canned response from a fixture file."""
     fixture_path = os.path.join(FIXTURES_DIR, fixture_name)
     with open(fixture_path) as f:
@@ -50,7 +50,7 @@ def make_mock_llm(fixture_name: str) -> AsyncMock:
         cached=False,
     )
 
-    mock = AsyncMock(spec=LLMClient)
+    mock = MagicMock(spec=LLMClient)
     mock.call.return_value = response
     mock.call_with_retry.return_value = response
     return mock

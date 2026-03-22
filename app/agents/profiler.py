@@ -5,9 +5,7 @@ Runs once per session. Output is injected into every other agent's prompt.
 Works with any dataset — no domain-specific assumptions.
 """
 
-import asyncio
 import logging
-from functools import partial
 
 from app.core.llm import LLMClient
 
@@ -123,7 +121,7 @@ def _gather_column_stats(session_db, table_name: str, columns_info: list) -> str
 
 
 def _gather_schema_info(session_db, table_name: str) -> tuple[list, int, str]:
-    """Sync helper: gather all DB stats in one executor call."""
+    """Gather all DB stats."""
     tbl = f'"{table_name}"'
     info = session_db.execute(f"DESCRIBE {tbl}").fetchall()
     row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
@@ -131,17 +129,14 @@ def _gather_schema_info(session_db, table_name: str) -> tuple[list, int, str]:
     return info, row_count, column_stats
 
 
-async def run_profiler(
+def run_profiler(
     llm: LLMClient,
     model: str,
     session_db,
     table_name: str = "dataset",
 ) -> str:
     """Run profiler and return schema summary as markdown string."""
-    loop = asyncio.get_running_loop()
-    info, row_count, column_stats = await loop.run_in_executor(
-        None, partial(_gather_schema_info, session_db, table_name),
-    )
+    info, row_count, column_stats = _gather_schema_info(session_db, table_name)
     col_count = len(info)
 
     messages = [
@@ -154,7 +149,7 @@ async def run_profiler(
         )},
     ]
 
-    response = await llm.call(
+    response = llm.call(
         model=model,
         messages=messages,
         role="profiler",

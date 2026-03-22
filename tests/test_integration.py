@@ -1,7 +1,7 @@
 """Integration tests — state management, tracing, and thread flows with mock LLM."""
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import duckdb
 import pytest
@@ -12,7 +12,8 @@ from app.core.queue import Queue
 from app.core.state import StateStore, generate_id
 from app.core.tracing import TraceStore
 from app.models import ThreadStatus
-from app.orchestration.thread import run_thread_loop
+from app.orchestration.context import ThreadContext
+from app.orchestration.thread import start_thread, resume_thread
 
 
 # --- StateStore unit tests ---
@@ -214,7 +215,7 @@ def test_trace_flush_and_load(tmp_path):
     assert loaded[0].attributes["move"] == "SCOPE"
 
 
-# --- Thread loop integration tests ---
+# --- Thread state machine integration tests ---
 
 
 @pytest.fixture
@@ -262,19 +263,32 @@ def _make_worker_response(summary):
     })
 
 
-@pytest.mark.asyncio
-async def test_thread_loop_three_steps_done(integration_setup):
+def _build_ctx(setup, thread, session_db=None, human_messages=None):
+    """Build a ThreadContext for testing."""
+    return ThreadContext(
+        config=setup["config"],
+        llm=MagicMock(),
+        session_db=session_db or setup["session_db"],
+        queue=setup["queue"],
+        state=setup["state"],
+        trace_store=setup["trace_store"],
+        thread=thread,
+        schema_summary="test schema",
+        human_messages=human_messages or [],
+    )
+
+
+def test_thread_loop_three_steps_done(integration_setup):
     """Thread runs 3 steps then completes."""
     setup = integration_setup
     state = setup["state"]
-    trace_store = setup["trace_store"]
 
     session = state.create_session("test.csv")
     thread = state.create_thread(session.id, "Test question?", "Motivation", "Entry")
 
     coordinator_calls = [0]
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             coordinator_calls[0] += 1
             if coordinator_calls[0] < 3:
@@ -289,32 +303,21 @@ async def test_thread_loop_three_steps_done(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    mock_llm = AsyncMock()
-    mock_llm.call = mock_call
+    ctx = _build_ctx(setup, thread)
+    ctx.llm.call = mock_call
 
-    await run_thread_loop(
-        config=setup["config"],
-        llm=mock_llm,
-        session_db=setup["session_db"],
-        queue=setup["queue"],
-        state=state,
-        trace_store=trace_store,
-        thread=thread,
-        schema_summary="test schema",
-    )
+    start_thread(ctx)
+    ctx.done_event.wait(timeout=10)
 
-    # Verify thread is COMPLETE via state
     final_thread = state.get_thread(thread.id)
     assert final_thread.status == ThreadStatus.COMPLETE
     assert final_thread.summary is not None
 
 
-@pytest.mark.asyncio
-async def test_thread_loop_stuck_then_resume(integration_setup):
+def test_thread_loop_stuck_then_resume(integration_setup):
     """Thread gets stuck, human replies, thread resumes and completes."""
     setup = integration_setup
     state = setup["state"]
-    trace_store = setup["trace_store"]
 
     session = state.create_session("test.csv")
     thread = state.create_thread(session.id, "Hard question?", "Complex", "Start here")
@@ -322,7 +325,7 @@ async def test_thread_loop_stuck_then_resume(integration_setup):
     phase = {"value": "initial"}
     coordinator_calls = [0]
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             coordinator_calls[0] += 1
             if phase["value"] == "initial":
@@ -358,61 +361,46 @@ async def test_thread_loop_stuck_then_resume(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    mock_llm = AsyncMock()
-    mock_llm.call = mock_call
-
     # Run until stuck
-    await run_thread_loop(
-        config=setup["config"],
-        llm=mock_llm,
-        session_db=setup["session_db"],
-        queue=setup["queue"],
-        state=state,
-        trace_store=trace_store,
-        thread=thread,
-        schema_summary="test schema",
-    )
+    ctx = _build_ctx(setup, thread)
+    ctx.llm.call = mock_call
+
+    start_thread(ctx)
+    ctx.done_event.wait(timeout=10)
 
     t = state.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
 
-    # Resume
+    # Resume with human message
     phase["value"] = "resumed"
 
-    # Reload trace (simulates what resume_thread does)
-    trace_store.load_trace(thread.id, thread.session_id)
-
-    state.update_thread_status(thread.id, ThreadStatus.RUNNING)
-    await run_thread_loop(
-        config=setup["config"],
-        llm=mock_llm,
-        session_db=setup["session_db"],
-        queue=setup["queue"],
-        state=state,
-        trace_store=trace_store,
-        thread=thread,
-        schema_summary="test schema",
-        human_messages=["Yes, this is a known effect"],
+    session_db2 = duckdb.connect(":memory:")
+    session_db2.execute(
+        "CREATE TABLE dataset AS SELECT * FROM read_csv_auto('tests/fixtures/sample_dataset.csv')"
     )
+
+    ctx2 = _build_ctx(setup, thread, session_db=session_db2, human_messages=["Yes, this is a known effect"])
+    ctx2.llm.call = mock_call
+
+    resume_thread(ctx2)
+    ctx2.done_event.wait(timeout=10)
 
     t = state.get_thread(thread.id)
     assert t.status == ThreadStatus.COMPLETE
 
 
-@pytest.mark.asyncio
-async def test_thread_emits_events(integration_setup):
+def test_thread_emits_events(integration_setup):
     """Verify SSE events are emitted during thread execution."""
     setup = integration_setup
     state = setup["state"]
     queue = setup["queue"]
-    trace_store = setup["trace_store"]
 
     session = state.create_session("test.csv")
     thread = state.create_thread(session.id, "Event test?", "", "")
 
     event_queue = queue.subscribe(session.id)
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             return LLMResponse(
                 content=_make_coordinator_response("DONE", "SYNTHESIZE", "wrap up"),
@@ -425,24 +413,75 @@ async def test_thread_emits_events(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    mock_llm = AsyncMock()
-    mock_llm.call = mock_call
+    ctx = _build_ctx(setup, thread)
+    ctx.llm.call = mock_call
 
-    await run_thread_loop(
-        config=setup["config"],
-        llm=mock_llm,
-        session_db=setup["session_db"],
-        queue=queue,
-        state=state,
-        trace_store=trace_store,
-        thread=thread,
-        schema_summary="test schema",
-    )
+    start_thread(ctx)
+    ctx.done_event.wait(timeout=10)
 
     events = []
     while not event_queue.empty():
-        events.append(await event_queue.get())
+        events.append(event_queue.get_nowait())
 
     event_types = [e.event_type for e in events]
-    assert "step" in event_types
-    assert "complete" in event_types
+    assert "thread_start" in event_types
+    assert "step_start" in event_types
+    assert "step_complete" in event_types
+    assert "thread_complete" in event_types
+
+
+def test_thread_move_repetition_guard(integration_setup):
+    """Thread that repeats the same move N times gets forced to STUCK/WAITING."""
+    setup = integration_setup
+    state = setup["state"]
+
+    session = state.create_session("test.csv")
+    thread = state.create_thread(session.id, "Repetitive?", "Test", "Start")
+
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+        if role == "coordinator":
+            return LLMResponse(
+                content=_make_coordinator_response("CONTINUE", "FORAGE", "Keep exploring"),
+                model=model,
+            )
+        elif role == "worker":
+            return LLMResponse(
+                content=_make_worker_response("Same old result"),
+                model=model, tool_calls=None,
+            )
+        return LLMResponse(content="{}", model=model)
+
+    ctx = _build_ctx(setup, thread)
+    ctx.llm.call = mock_call
+
+    start_thread(ctx)
+    ctx.done_event.wait(timeout=10)
+
+    t = state.get_thread(thread.id)
+    assert t.status == ThreadStatus.WAITING
+
+
+def test_thread_error_becomes_waiting(integration_setup):
+    """Thread errors become WAITING (not ERROR) so human can help."""
+    setup = integration_setup
+    state = setup["state"]
+
+    session = state.create_session("test.csv")
+    thread = state.create_thread(session.id, "Will error?", "Test", "Start")
+
+    call_count = [0]
+
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+        call_count[0] += 1
+        if role == "coordinator":
+            raise RuntimeError("Simulated LLM failure")
+        return LLMResponse(content="{}", model=model)
+
+    ctx = _build_ctx(setup, thread)
+    ctx.llm.call = mock_call
+
+    start_thread(ctx)
+    ctx.done_event.wait(timeout=10)
+
+    t = state.get_thread(thread.id)
+    assert t.status == ThreadStatus.WAITING

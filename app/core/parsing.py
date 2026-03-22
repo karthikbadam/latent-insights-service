@@ -18,6 +18,22 @@ from app.models import (
 )
 
 
+def detect_degeneration(text: str, max_repeats: int = 20) -> bool:
+    """Detect LLM token loop degeneration (e.g., 'pull pull pull...')."""
+    words = text.split()
+    if len(words) < max_repeats:
+        return False
+    count = 1
+    for i in range(1, len(words)):
+        if words[i] == words[i - 1]:
+            count += 1
+            if count >= max_repeats:
+                return True
+        else:
+            count = 1
+    return False
+
+
 def extract_json(raw: str) -> dict:
     """
     Extract JSON from an LLM response that might be wrapped in

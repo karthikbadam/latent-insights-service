@@ -136,7 +136,7 @@ class TraceStore:
 
         return "\n\n".join(parts)
 
-    async def summarize_history(
+    def summarize_history(
         self,
         trace_id: str,
         llm,
@@ -173,7 +173,7 @@ class TraceStore:
             )},
         ]
 
-        response = await llm.call(
+        response = llm.call(
             model=model,
             messages=messages,
             role="summarizer",

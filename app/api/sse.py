@@ -4,6 +4,7 @@ SSE — Server-Sent Events for real-time thread updates.
 
 import asyncio
 import json
+import queue as stdlib_queue
 
 from fastapi import APIRouter
 from sse_starlette.sse import EventSourceResponse
@@ -33,8 +34,17 @@ async def session_events(session_id: str):
     async def event_generator():
         q = queue.subscribe(session_id)
         try:
+            loop = asyncio.get_running_loop()
             while True:
-                event = await q.get()
+                # Bridge sync Queue to async: poll with timeout in executor
+                try:
+                    event = await loop.run_in_executor(
+                        None, q.get, True, 30.0,
+                    )
+                except stdlib_queue.Empty:
+                    # Send keepalive comment to detect disconnected clients
+                    yield {"comment": "keepalive"}
+                    continue
                 yield {
                     "event": event.event_type,
                     "data": json.dumps({

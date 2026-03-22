@@ -5,10 +5,11 @@ Stateless. Receives instruction, generates and executes SQL via tool use, summar
 Works with any dataset — no domain-specific assumptions.
 """
 
-import asyncio
 import json
 import logging
 import time
+
+from openai import APITimeoutError
 
 from app.core.llm import LLMClient
 from app.core.parsing import parse_worker_response
@@ -59,6 +60,8 @@ When done querying, return your final answer as JSON (no tool call):
 function names. Instead, rewrite your analysis using basic SQL math (arithmetic, CASE, \
 aggregates like AVG/STDDEV_POP/CORR). DuckDB is a SQL engine, not a statistics package — \
 anything not built into standard SQL must be computed manually.
+- Do NOT use DuckDB extensions like ml, spatial, or stats (e.g. linear_regression, kmeans, \
+ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expressions.
 """
 
 RUN_SQL_TOOL = {
@@ -94,7 +97,7 @@ def _format_results(col_names: list[str], rows: list) -> str:
     return "\n".join(lines)
 
 
-def _execute_sql_sync(session_db, sql: str) -> str:
+def _execute_sql(session_db, sql: str) -> str:
     """Execute SQL against session DB and return formatted results."""
     try:
         result = session_db.execute(sql)
@@ -106,13 +109,7 @@ def _execute_sql_sync(session_db, sql: str) -> str:
         return f"SQL ERROR: {e}"
 
 
-async def _execute_sql(session_db, sql: str) -> str:
-    """Execute SQL in executor to avoid blocking the event loop."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _execute_sql_sync, session_db, sql)
-
-
-async def run_worker(
+def run_worker(
     llm: LLMClient,
     model: str,
     fallback_model: str,
@@ -157,18 +154,9 @@ async def run_worker(
         if consecutive_errors >= max_retries:
             current_model = fallback_model
 
-        if queue:
-            label = " (fallback model)" if current_model != model else ""
-            await queue.emit(StreamEvent(
-                session_id=session_id, thread_id=thread_id,
-                event_type="thinking",
-                message=f"Worker generating{label}...",
-                data={"model": current_model},
-            ))
-
         t0 = time.monotonic()
         try:
-            response = await llm.call(
+            response = llm.call(
                 model=current_model,
                 messages=messages,
                 role="worker",
@@ -176,7 +164,7 @@ async def run_worker(
                 tools=[RUN_SQL_TOOL],
                 timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except APITimeoutError:
             call_ms = round((time.monotonic() - t0) * 1000)
             logger.warning(f"Worker LLM call timed out after {call_ms}ms")
             consecutive_errors += 1
@@ -189,10 +177,10 @@ async def run_worker(
 
         if queue:
             has_tools = bool(response.tool_calls)
-            await queue.emit(StreamEvent(
+            queue.emit(StreamEvent(
                 session_id=session_id, thread_id=thread_id,
                 event_type="llm_call",
-                message=f"Worker {'calling tool' if has_tools else 'responding'} ({call_ms}ms)",
+                message=f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)",
                 data={"role": "worker", "model": current_model,
                       "input_tokens": response.input_tokens,
                       "output_tokens": response.output_tokens,
@@ -246,15 +234,15 @@ async def run_worker(
                 sql = args.get("sql", "")
                 logger.info(f"Worker executing SQL: {sql[:200]}")
                 t_sql = time.monotonic()
-                result_text = await _execute_sql(session_db, sql)
+                result_text = _execute_sql(session_db, sql)
                 sql_ms = round((time.monotonic() - t_sql) * 1000)
 
                 if queue:
-                    await queue.emit(StreamEvent(
+                    queue.emit(StreamEvent(
                         session_id=session_id, thread_id=thread_id,
                         event_type="tool_call",
-                        message=result_text[:200],
-                        data={"sql": sql[:500], "duration_ms": sql_ms},
+                        message=sql,
+                        data={"sql": sql, "result": result_text, "duration_ms": sql_ms},
                     ))
                 messages.append({
                     "role": "tool",

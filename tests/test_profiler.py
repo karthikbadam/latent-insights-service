@@ -1,6 +1,5 @@
 """Tests for app.agents.profiler — dataset profiling agent."""
 
-import pytest
 
 from app.agents.profiler import _gather_column_stats, run_profiler
 from tests.conftest import make_mock_llm
@@ -44,10 +43,9 @@ def test_gather_column_stats_null_rates(session_db):
     assert "/103" in eccen_line  # not all 103 are non-null
 
 
-@pytest.mark.asyncio
-async def test_run_profiler(session_db):
+def test_run_profiler(session_db):
     mock = make_mock_llm("profiler_response.json")
-    result = await run_profiler(
+    result = run_profiler(
         llm=mock, model="test-model", session_db=session_db,
     )
 
@@ -64,10 +62,9 @@ async def test_run_profiler(session_db):
     assert "min=" in user_msg
 
 
-@pytest.mark.asyncio
-async def test_run_profiler_output_contains_fixture_content(session_db):
+def test_run_profiler_output_contains_fixture_content(session_db):
     mock = make_mock_llm("profiler_response.json")
-    result = await run_profiler(llm=mock, model="test-model", session_db=session_db)
+    result = run_profiler(llm=mock, model="test-model", session_db=session_db)
 
     # Output should be the fixture content
     assert "Dataset summary" in result
