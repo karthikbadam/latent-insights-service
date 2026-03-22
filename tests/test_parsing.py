@@ -3,12 +3,41 @@
 import pytest
 
 from app.core.parsing import (
+    detect_degeneration,
     extract_json,
     parse_coordinator_response,
     parse_scout_response,
     parse_worker_response,
 )
 from app.models import CoordinatorStatus, MoveType
+
+
+# --- detect_degeneration ---
+
+
+def test_detect_degeneration_clean():
+    assert detect_degeneration("This is a normal response with varied words.") is False
+
+
+def test_detect_degeneration_short():
+    assert detect_degeneration("pull pull pull") is False
+
+
+def test_detect_degeneration_token_loop():
+    text = "Gears pull a weaker " + "pull " * 25
+    assert detect_degeneration(text) is True
+
+
+def test_detect_degeneration_threshold():
+    text = "word " * 19  # 19 consecutive repeats, below default 20
+    assert detect_degeneration(text) is False
+    text = "word " * 20  # exactly 20
+    assert detect_degeneration(text) is True
+
+
+def test_detect_degeneration_mixed():
+    text = "a " * 10 + "b " * 10 + "c " * 10  # no single word repeats 20 times
+    assert detect_degeneration(text) is False
 
 
 # --- extract_json ---

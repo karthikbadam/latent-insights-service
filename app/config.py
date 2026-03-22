@@ -97,6 +97,7 @@ class AppConfig:
     # Agents
     max_worker_retries: int = 3
     max_consecutive_errors: int = 5
+    max_repeated_moves: int = 10
     llm_timeout: float = 120.0
 
     # Sub-configs
@@ -124,6 +125,7 @@ class AppConfig:
             default_seed_threads=int(os.getenv("DEFAULT_SEED_THREADS", "5")),
             max_worker_retries=int(os.getenv("MAX_WORKER_RETRIES", "3")),
             max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", "5")),
+            max_repeated_moves=int(os.getenv("MAX_REPEATED_MOVES", "3")),
             llm_timeout=float(os.getenv("LLM_TIMEOUT", "120.0")),
             models=ModelConfig.from_env(provider),
             temperatures=TemperatureConfig.from_env(),

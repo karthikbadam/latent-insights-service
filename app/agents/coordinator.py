@@ -109,7 +109,7 @@ def run_coordinator(
         queue.emit(StreamEvent(
             session_id=session_id, thread_id=thread_id,
             event_type="llm_call",
-            message=f"Coordinator: {seed_question[:120]} ({call_ms}ms)",
+            message=f"Coordinator deciding next move ({call_ms}ms)",
             data={"role": "coordinator", "model": model,
                   "input_tokens": response.input_tokens,
                   "output_tokens": response.output_tokens,

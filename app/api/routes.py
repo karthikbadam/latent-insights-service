@@ -161,7 +161,8 @@ def get_session(session_id: str, request: Request):
 def create_thread(session_id: str, request: CreateThreadRequest):
     """Create a user-initiated thread with a custom question."""
     config, llm, db, queue, state, trace_store = _get_state()
-    from app.orchestration.thread import run_thread_loop
+    from app.orchestration.context import ThreadContext
+    from app.orchestration.thread import start_thread
 
     session = state.get_session(session_id)
     if session is None:
@@ -175,17 +176,17 @@ def create_thread(session_id: str, request: CreateThreadRequest):
 
     thread_db = db.open_session_connection(session_id)
 
-    queue.schedule(
-        fn=run_thread_loop,
-        args=(
-            config, llm, thread_db, queue, state,
-            trace_store, thread, session.schema_summary,
-        ),
-        task_id=f"thread-{thread.id}",
-        session_id=session_id,
-        thread_id=thread.id,
-        description=f"Thread: {request.question[:60]}",
+    ctx = ThreadContext(
+        config=config,
+        llm=llm,
+        session_db=thread_db,
+        queue=queue,
+        state=state,
+        trace_store=trace_store,
+        thread=thread,
+        schema_summary=session.schema_summary,
     )
+    start_thread(ctx)
 
     return ThreadResponse(
         id=thread.id,
@@ -196,33 +197,64 @@ def create_thread(session_id: str, request: CreateThreadRequest):
     )
 
 
+@router.post("/sessions/{session_id}/continue")
+def continue_session(session_id: str):
+    """Continue a session: resume stuck threads + scout new questions."""
+    config, llm, db, queue, state, trace_store = _get_state()
+    from app.orchestration.session import continue_session_flow
+
+    session = state.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.schema_summary is None:
+        raise HTTPException(status_code=400, detail="Session profiling not complete yet")
+
+    queue.schedule(
+        fn=continue_session_flow,
+        args=(config, llm, db, queue, state, trace_store, session_id),
+        task_id=f"continue-{session_id}",
+        session_id=session_id,
+        description=f"Continue session {session_id}",
+    )
+
+    threads = state.get_threads(session_id)
+    resumable = [t for t in threads if t.status.value in ("waiting", "complete")]
+
+    return {
+        "status": "continuing",
+        "session_id": session_id,
+        "threads_resumed": len(resumable),
+    }
+
+
 @router.post("/threads/{thread_id}/messages")
 def post_message(thread_id: str, request: PostMessageRequest):
     """Post a human message to a stuck thread, resuming it."""
     config, llm, db, queue, state, trace_store = _get_state()
+    from app.orchestration.context import ThreadContext
     from app.orchestration.thread import resume_thread
 
     thread = state.get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.status.value != "waiting":
-        raise HTTPException(status_code=400, detail="Thread is not waiting for input")
+    if thread.status.value not in ("waiting", "complete"):
+        raise HTTPException(status_code=400, detail="Thread is not waiting or complete")
 
     session = state.get_session(thread.session_id)
     thread_db = db.open_session_connection(thread.session_id)
 
-    queue.schedule(
-        fn=resume_thread,
-        args=(
-            config, llm, thread_db, queue, state,
-            trace_store, thread_id, request.content,
-            session.schema_summary or "",
-        ),
-        task_id=f"resume-{thread_id}",
-        session_id=thread.session_id,
-        thread_id=thread_id,
-        description=f"Resume: {thread.seed_question[:40]}",
+    ctx = ThreadContext(
+        config=config,
+        llm=llm,
+        session_db=thread_db,
+        queue=queue,
+        state=state,
+        trace_store=trace_store,
+        thread=thread,
+        schema_summary=session.schema_summary or "",
+        human_messages=[request.content],
     )
+    resume_thread(ctx)
 
     return {"status": "resumed", "thread_id": thread_id}
 

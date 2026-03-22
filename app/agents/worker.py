@@ -154,15 +154,6 @@ def run_worker(
         if consecutive_errors >= max_retries:
             current_model = fallback_model
 
-        if queue:
-            label = " (fallback model)" if current_model != model else ""
-            queue.emit(StreamEvent(
-                session_id=session_id, thread_id=thread_id,
-                event_type="thinking",
-                message=f"Worker: {worker_instruction[:120]}{label}",
-                data={"model": current_model},
-            ))
-
         t0 = time.monotonic()
         try:
             response = llm.call(
@@ -189,7 +180,7 @@ def run_worker(
             queue.emit(StreamEvent(
                 session_id=session_id, thread_id=thread_id,
                 event_type="llm_call",
-                message=f"Worker {'executing SQL' if has_tools else 'summarizing'}: {worker_instruction[:80]} ({call_ms}ms)",
+                message=f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)",
                 data={"role": "worker", "model": current_model,
                       "input_tokens": response.input_tokens,
                       "output_tokens": response.output_tokens,
@@ -250,8 +241,8 @@ def run_worker(
                     queue.emit(StreamEvent(
                         session_id=session_id, thread_id=thread_id,
                         event_type="tool_call",
-                        message=result_text[:200],
-                        data={"sql": sql[:500], "duration_ms": sql_ms},
+                        message=sql,
+                        data={"sql": sql, "result": result_text, "duration_ms": sql_ms},
                     ))
                 messages.append({
                     "role": "tool",

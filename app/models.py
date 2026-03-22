@@ -118,7 +118,7 @@ class WorkerResult:
 class StreamEvent:
     session_id: str
     thread_id: str
-    event_type: str  # step, thinking, waiting, complete, error, scout_done
+    event_type: str  # scout_done, thread_start, step_start, llm_call, tool_call, step_complete, thread_complete, thread_waiting
     message: str  # Human-readable, e.g. "[abc123] FORAGE: Analyzing orbital periods..."
     data: dict = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)

@@ -11,6 +11,7 @@ The agent is designed to follow steps from a sensemaking process such as foragin
 
 ```bash
 uv sync --extra dev
+export LLM_PROVIDER=openrouter
 export LLM_API_KEY=<your-key>
 uv run uvicorn app.main:app --reload
 ```
