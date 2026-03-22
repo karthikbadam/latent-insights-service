@@ -91,7 +91,7 @@ async def create_session_flow(
     )
 
     # Close the initial session_db — each thread gets its own connection
-    session_db.close()
+    await loop.run_in_executor(None, session_db.close)
 
     # Spawn threads for top N questions
     num_threads = min(config.default_seed_threads, len(scout_output.questions))
@@ -101,7 +101,7 @@ async def create_session_flow(
             session_id, q.question, q.motivation, q.entry_point,
         )
 
-        thread_db = db.open_session_connection(session_id)
+        thread_db = await loop.run_in_executor(None, partial(db.open_session_connection, session_id))
 
         queue.schedule(
             coro=run_thread_loop(
@@ -120,5 +120,5 @@ async def create_session_flow(
             description=f"Thread: {q.question[:60]}",
         )
 
-    state.dump_session(session_id)
+    await loop.run_in_executor(None, partial(state.dump_session, session_id))
     return session_id

@@ -4,6 +4,8 @@ import asyncio
 import logging
 import time
 
+from functools import partial
+
 from app.agents.coordinator import run_coordinator
 from app.agents.worker import run_worker
 from app.config import AppConfig
@@ -11,7 +13,6 @@ from app.core.llm import LLMClient
 from app.core.queue import Queue
 from app.core.state import StateStore
 from app.core.tracing import TraceStore
-from app.db.mcp import create_thread_view
 from app.models import (
     CoordinatorStatus,
     StreamEvent,
@@ -126,9 +127,9 @@ async def run_thread_loop(
                 })
                 trace_store.end_span(step_span, status="stuck")
 
-                _flush_trace(trace_store, thread)
+                await _flush_trace(trace_store, thread)
                 state.update_thread_status(thread.id, ThreadStatus.WAITING)
-                state.dump_session(thread.session_id)
+                await _run_sync(state.dump_session, thread.session_id)
 
                 await queue.emit(StreamEvent(
                     session_id=thread.session_id,
@@ -164,19 +165,6 @@ async def run_thread_loop(
             )
             worker_ms = round((time.monotonic() - t0) * 1000)
 
-            # Handle view creation
-            view_name = None
-            if worker_result.view_requested:
-                try:
-                    view_name = create_thread_view(
-                        session_db,
-                        thread.id,
-                        worker_result.view_requested["name"],
-                        worker_result.view_requested["sql"],
-                    )
-                except Exception as e:
-                    logger.warning(f"View creation failed: {e}")
-
             step_ms = round((time.monotonic() - step_start) * 1000)
 
             trace_store.add_event(step_span, "worker", {
@@ -192,7 +180,6 @@ async def run_thread_loop(
                 "move": decision.next_move.value,
                 "instruction": decision.worker_instruction,
                 "result": worker_result.result,
-                "view_created": view_name,
                 "coordinator_ms": coordinator_ms,
                 "worker_ms": worker_ms,
             })
@@ -210,20 +197,7 @@ async def run_thread_loop(
                 session_id=thread.session_id,
                 thread_id=thread.id,
                 event_type="step",
-                message=(
-                    f"[{tid}] {decision.next_move.value} complete ({step_ms}ms): "
-                    f"{worker_result.result[:120]}"
-                ),
-                data={
-                    "step_number": step_number,
-                    "move": decision.next_move.value,
-                    "result": worker_result.result,
-                    "timing": {
-                        "coordinator_ms": coordinator_ms,
-                        "worker_ms": worker_ms,
-                        "step_ms": step_ms,
-                    },
-                },
+                message=worker_result.result,
             ))
 
             # Summarize history periodically to keep context manageable
@@ -240,12 +214,12 @@ async def run_thread_loop(
                     f"{step_number} steps in {thread_elapsed}s"
                 )
 
-                _flush_trace(trace_store, thread)
+                await _flush_trace(trace_store, thread)
                 state.update_thread_status(
                     thread.id, ThreadStatus.COMPLETE,
                     summary=worker_result.result,
                 )
-                state.dump_session(thread.session_id)
+                await _run_sync(state.dump_session, thread.session_id)
 
                 await queue.emit(StreamEvent(
                     session_id=thread.session_id,
@@ -274,12 +248,12 @@ async def run_thread_loop(
             exc_info=True,
         )
         try:
-            _flush_trace(trace_store, thread)
+            await _flush_trace(trace_store, thread)
             state.update_thread_status(
                 thread.id, ThreadStatus.ERROR,
                 error=error_msg,
             )
-            state.dump_session(thread.session_id)
+            await _run_sync(state.dump_session, thread.session_id)
             await queue.emit(StreamEvent(
                 session_id=thread.session_id,
                 thread_id=thread.id,
@@ -292,14 +266,20 @@ async def run_thread_loop(
     finally:
         # Close per-thread connection
         try:
-            session_db.close()
+            await _run_sync(session_db.close)
         except Exception:
             pass
 
 
-def _flush_trace(trace_store: TraceStore, thread: Thread):
+async def _run_sync(fn, *args):
+    """Run a blocking function in the thread pool executor."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(fn, *args))
+
+
+async def _flush_trace(trace_store: TraceStore, thread: Thread):
     """Flush JSONL trace file and clear in-memory spans."""
-    trace_store.flush_to_file(thread.id, thread.session_id)
+    await _run_sync(trace_store.flush_to_file, thread.id, thread.session_id)
     trace_store.clear_trace(thread.id)
 
 
@@ -344,7 +324,7 @@ async def resume_thread(
 
     # Reload trace from JSONL if not in memory
     if not trace_store.get_spans(thread_id):
-        trace_store.load_trace(thread_id, thread.session_id)
+        await _run_sync(trace_store.load_trace, thread_id, thread.session_id)
 
     state.update_thread_status(thread_id, ThreadStatus.RUNNING)
 

@@ -2,8 +2,10 @@
 API routes — thin HTTP layer over orchestration.
 """
 
+import asyncio
 import logging
 import os
+from functools import partial
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query
 
@@ -11,6 +13,8 @@ from app.api.schemas import (
     CreateThreadRequest,
     PostMessageRequest,
     SessionResponse,
+    SessionUrls,
+    StepResponse,
     SystemStats,
     ThreadResponse,
 )
@@ -26,6 +30,36 @@ def _get_state():
     if not main.config or not main.llm or not main.db or not main.queue_instance or not main.state_store:
         raise HTTPException(status_code=503, detail="Service not initialized")
     return main.config, main.llm, main.db, main.queue_instance, main.state_store, main.trace_store
+
+
+async def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
+    """Convert TraceStore spans to StepResponse list for API."""
+    spans = trace_store.get_step_spans(thread.id)
+    if not spans:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, partial(trace_store.load_trace, thread.id, thread.session_id),
+        )
+        spans = trace_store.get_step_spans(thread.id)
+
+    # Only include completed steps (in-progress spans have no attributes yet)
+    spans = [s for s in spans if s.end_time is not None]
+
+    steps = []
+    for i, span in enumerate(spans, 1):
+        attrs = span.attributes
+        duration_ms = None
+        if span.end_time and span.start_time:
+            duration_ms = round((span.end_time - span.start_time) * 1000)
+        steps.append(StepResponse(
+            step_number=i,
+            move=attrs.get("move", ""),
+            instruction=attrs.get("instruction", ""),
+            result=attrs.get("result", ""),
+            view_created=attrs.get("view_created"),
+            duration_ms=duration_ms,
+        ))
+    return steps
 
 
 # --- Sessions ---
@@ -44,12 +78,16 @@ async def create_session(
             raise HTTPException(status_code=400, detail="Only CSV files are supported")
 
         upload_dir = os.path.join(config.data_dir, "uploads")
-        os.makedirs(upload_dir, exist_ok=True)
-
         resolved_path = os.path.join(upload_dir, file.filename)
         content = await file.read()
-        with open(resolved_path, "wb") as f:
-            f.write(content)
+
+        def _write_upload():
+            os.makedirs(upload_dir, exist_ok=True)
+            with open(resolved_path, "wb") as f:
+                f.write(content)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_upload)
     elif dataset_path:
         if not os.path.exists(dataset_path):
             raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_path}")
@@ -72,13 +110,21 @@ async def create_session(
         description=f"Session setup: {os.path.basename(resolved_path)}",
     )
 
-    return {"session_id": session.id, "status": "created"}
+    return {
+        "session_id": session.id,
+        "status": "created",
+        "urls": {
+            "self": f"/api/sessions/{session.id}",
+            "events": f"/api/sessions/{session.id}/events",
+            "threads": f"/api/sessions/{session.id}/threads",
+        },
+    }
 
 
 @router.get("/sessions/{session_id}")
 async def get_session(session_id: str):
-    """Get full session state with threads."""
-    _, _, _, _, state, _ = _get_state()
+    """Get full session state with threads and steps."""
+    _, _, _, _, state, trace_store = _get_state()
 
     session = state.get_session(session_id)
     if session is None:
@@ -86,22 +132,32 @@ async def get_session(session_id: str):
 
     threads = state.get_threads(session_id)
 
+    thread_responses = []
+    for t in threads:
+        steps = await _steps_from_trace(trace_store, t)
+        thread_responses.append(ThreadResponse(
+            id=t.id,
+            seed_question=t.seed_question,
+            motivation=t.motivation,
+            status=t.status.value,
+            summary=t.summary,
+            running_summary=t.running_summary,
+            error=t.error,
+            steps=steps,
+            updated_at=t.updated_at.isoformat() if t.updated_at else "",
+        ))
+
     return SessionResponse(
         id=session.id,
         dataset_path=session.dataset_path,
         schema_summary=session.schema_summary,
         scout_questions=session.scout_output.get("questions") if session.scout_output else None,
-        threads=[
-            ThreadResponse(
-                id=t.id,
-                seed_question=t.seed_question,
-                status=t.status.value,
-                summary=t.summary,
-                error=t.error,
-                updated_at=t.updated_at.isoformat() if t.updated_at else "",
-            )
-            for t in threads
-        ],
+        threads=thread_responses,
+        urls=SessionUrls(
+            self=f"/api/sessions/{session_id}",
+            events=f"/api/sessions/{session_id}/events",
+            threads=f"/api/sessions/{session_id}/threads",
+        ),
         created_at=session.created_at.isoformat() if session.created_at else "",
     )
 
@@ -122,7 +178,8 @@ async def create_thread(session_id: str, request: CreateThreadRequest):
         session_id, request.question, request.motivation or "", "",
     )
 
-    thread_db = db.open_session_connection(session_id)
+    loop = asyncio.get_running_loop()
+    thread_db = await loop.run_in_executor(None, partial(db.open_session_connection, session_id))
 
     queue.schedule(
         coro=run_thread_loop(
@@ -144,6 +201,7 @@ async def create_thread(session_id: str, request: CreateThreadRequest):
     return ThreadResponse(
         id=thread.id,
         seed_question=thread.seed_question,
+        motivation=thread.motivation,
         status=thread.status.value,
         updated_at=thread.updated_at.isoformat() if thread.updated_at else "",
     )
@@ -162,7 +220,8 @@ async def post_message(thread_id: str, request: PostMessageRequest):
         raise HTTPException(status_code=400, detail="Thread is not waiting for input")
 
     session = state.get_session(thread.session_id)
-    thread_db = db.open_session_connection(thread.session_id)
+    loop = asyncio.get_running_loop()
+    thread_db = await loop.run_in_executor(None, partial(db.open_session_connection, thread.session_id))
 
     queue.schedule(
         coro=resume_thread(

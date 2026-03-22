@@ -5,7 +5,9 @@ Runs once per session after profiler. Output seeds the analytical threads.
 Works with any dataset — no domain-specific assumptions.
 """
 
+import asyncio
 import logging
+from functools import partial
 
 from app.core.llm import LLMClient
 from app.core.parsing import parse_scout_response
@@ -150,7 +152,10 @@ async def run_scout(
     """Run scout and return discovered questions."""
     exploration_data = ""
     if session_db is not None:
-        exploration_data = _run_exploratory_queries(session_db, table_name)
+        loop = asyncio.get_running_loop()
+        exploration_data = await loop.run_in_executor(
+            None, partial(_run_exploratory_queries, session_db, table_name),
+        )
 
     user_content = f"Here is the dataset schema:\n\n{schema_summary}\n\n"
     if exploration_data:

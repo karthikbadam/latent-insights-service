@@ -44,6 +44,7 @@ async def lifespan(app: FastAPI):
         base_url=config.llm_base_url,
         app_name=config.app_name,
         app_url=config.app_url,
+        think=config.llm_think,
     )
 
     db = Database(data_dir=config.data_dir)

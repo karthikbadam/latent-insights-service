@@ -5,7 +5,9 @@ Runs once per session. Output is injected into every other agent's prompt.
 Works with any dataset — no domain-specific assumptions.
 """
 
+import asyncio
 import logging
+from functools import partial
 
 from app.core.llm import LLMClient
 
@@ -120,6 +122,15 @@ def _gather_column_stats(session_db, table_name: str, columns_info: list) -> str
     return "\n".join(stats_parts)
 
 
+def _gather_schema_info(session_db, table_name: str) -> tuple[list, int, str]:
+    """Sync helper: gather all DB stats in one executor call."""
+    tbl = f'"{table_name}"'
+    info = session_db.execute(f"DESCRIBE {tbl}").fetchall()
+    row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+    column_stats = _gather_column_stats(session_db, table_name, info)
+    return info, row_count, column_stats
+
+
 async def run_profiler(
     llm: LLMClient,
     model: str,
@@ -127,11 +138,11 @@ async def run_profiler(
     table_name: str = "dataset",
 ) -> str:
     """Run profiler and return schema summary as markdown string."""
-    tbl = f'"{table_name}"'
-    info = session_db.execute(f"DESCRIBE {tbl}").fetchall()
-    row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+    loop = asyncio.get_running_loop()
+    info, row_count, column_stats = await loop.run_in_executor(
+        None, partial(_gather_schema_info, session_db, table_name),
+    )
     col_count = len(info)
-    column_stats = _gather_column_stats(session_db, table_name, info)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -150,4 +161,15 @@ async def run_profiler(
         temperature=0.0,
     )
 
-    return response.content
+    if response.content.strip():
+        return response.content
+
+    # LLM returned empty — fall back to raw stats
+    logger.warning("Profiler LLM returned empty content, using raw column stats")
+    return (
+        f"## Dataset summary\n"
+        f"- **Table:** {table_name}\n"
+        f"- **Rows:** {row_count}\n"
+        f"- **Columns:** {col_count}\n\n"
+        f"## Column profiles\n{column_stats}"
+    )

@@ -38,13 +38,14 @@ class LLMClient:
         )
     """
 
-    def __init__(self, api_key: str, base_url: str, app_name: str = "", app_url: str = ""):
+    def __init__(self, api_key: str, base_url: str, app_name: str = "", app_url: str = "", think: bool = True):
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
         )
         self._app_name = app_name
         self._app_url = app_url
+        self._think = think
 
     async def call(
         self,
@@ -79,6 +80,8 @@ class LLMClient:
             kwargs["extra_headers"]["X-Title"] = self._app_name
         if tools:
             kwargs["tools"] = tools
+        if not self._think:
+            kwargs["extra_body"] = {"think": False}
 
         logger.info(f"LLM call: model={model} role={role} temp={temperature}")
         completion = await self._client.chat.completions.create(**kwargs)

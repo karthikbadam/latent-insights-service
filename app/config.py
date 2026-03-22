@@ -11,6 +11,7 @@ PROVIDER_DEFAULTS = {
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "api_key": "",
+        "think": True,
         "models": {
             "profiler": "google/gemini-2.5-flash",
             "scout": "google/gemini-2.5-flash",
@@ -22,6 +23,7 @@ PROVIDER_DEFAULTS = {
     "ollama": {
         "base_url": "http://localhost:11434/v1",
         "api_key": "ollama",
+        "think": False,
         "models": {
             "profiler": "gpt-oss:20b",
             "scout": "gpt-oss:20b",
@@ -82,6 +84,7 @@ class AppConfig:
     llm_provider: str = "openrouter"
     llm_api_key: str = ""
     llm_base_url: str = "https://openrouter.ai/api/v1"
+    llm_think: bool = True
     app_name: str = "Latent Insights"
     app_url: str = "https://yoursite.github.io"
 
@@ -105,11 +108,14 @@ class AppConfig:
 
         api_key = os.getenv("LLM_API_KEY") or defaults["api_key"]
         base_url = os.getenv("LLM_BASE_URL") or defaults["base_url"]
+        think_env = os.getenv("LLM_THINK")
+        think = think_env.lower() in ("1", "true") if think_env else defaults["think"]
 
         return cls(
             llm_provider=provider,
             llm_api_key=api_key,
             llm_base_url=base_url,
+            llm_think=think,
             app_name=os.getenv("APP_NAME", cls.app_name),
             app_url=os.getenv("APP_URL", cls.app_url),
             data_dir=os.getenv("DATA_DIR", cls.data_dir),
