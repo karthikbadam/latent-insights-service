@@ -1,8 +1,8 @@
 """Tests for app.agents.coordinator — thread coordination agent."""
 
 import json
+from unittest.mock import MagicMock
 
-import pytest
 
 from app.agents.coordinator import run_coordinator
 from app.core.llm import LLMResponse
@@ -10,10 +10,9 @@ from app.models import CoordinatorStatus, MoveType
 from tests.conftest import make_mock_llm
 
 
-@pytest.mark.asyncio
-async def test_run_coordinator_continue(schema_summary):
+def test_run_coordinator_continue(schema_summary):
     mock = make_mock_llm("coordinator_response.json")
-    result, _ = await run_coordinator(
+    result, _ = run_coordinator(
         llm=mock, model="test",
         seed_question="Why gaps?",
         motivation="Detection bias",
@@ -28,10 +27,9 @@ async def test_run_coordinator_continue(schema_summary):
     assert len(result.assessment) > 0
 
 
-@pytest.mark.asyncio
-async def test_run_coordinator_stuck(schema_summary):
+def test_run_coordinator_stuck(schema_summary):
     mock = make_mock_llm("coordinator_stuck_response.json")
-    result, _ = await run_coordinator(
+    result, _ = run_coordinator(
         llm=mock, model="test",
         seed_question="Why eccentric?",
         motivation="Dynamics",
@@ -45,10 +43,9 @@ async def test_run_coordinator_stuck(schema_summary):
     assert result.context is not None
 
 
-@pytest.mark.asyncio
-async def test_run_coordinator_done(schema_summary):
+def test_run_coordinator_done(schema_summary):
     mock = make_mock_llm("coordinator_done_response.json")
-    result, _ = await run_coordinator(
+    result, _ = run_coordinator(
         llm=mock, model="test",
         seed_question="Test",
         motivation="Test",
@@ -62,11 +59,9 @@ async def test_run_coordinator_done(schema_summary):
     assert result.worker_instruction is not None
 
 
-@pytest.mark.asyncio
-async def test_coordinator_validates_done_requires_synthesize(schema_summary):
+def test_coordinator_validates_done_requires_synthesize(schema_summary):
     """If LLM returns DONE but wrong move, coordinator corrects to SYNTHESIZE."""
-    from unittest.mock import AsyncMock
-    mock = AsyncMock()
+    mock = MagicMock()
     mock.call.return_value = LLMResponse(
         content=json.dumps({
             "assessment": "Done investigating",
@@ -78,7 +73,7 @@ async def test_coordinator_validates_done_requires_synthesize(schema_summary):
         model="test",
     )
 
-    result, _ = await run_coordinator(
+    result, _ = run_coordinator(
         llm=mock, model="test",
         seed_question="Test", motivation="", entry_point="",
         schema_summary=schema_summary,
@@ -89,11 +84,9 @@ async def test_coordinator_validates_done_requires_synthesize(schema_summary):
     assert result.next_move == MoveType.SYNTHESIZE  # corrected
 
 
-@pytest.mark.asyncio
-async def test_coordinator_validates_stuck_has_question(schema_summary):
+def test_coordinator_validates_stuck_has_question(schema_summary):
     """If LLM returns STUCK without question, coordinator adds default."""
-    from unittest.mock import AsyncMock
-    mock = AsyncMock()
+    mock = MagicMock()
     mock.call.return_value = LLMResponse(
         content=json.dumps({
             "assessment": "stuck",
@@ -105,7 +98,7 @@ async def test_coordinator_validates_stuck_has_question(schema_summary):
         model="test",
     )
 
-    result, _ = await run_coordinator(
+    result, _ = run_coordinator(
         llm=mock, model="test",
         seed_question="Test", motivation="", entry_point="",
         schema_summary=schema_summary,
@@ -116,11 +109,10 @@ async def test_coordinator_validates_stuck_has_question(schema_summary):
     assert result.question_for_human is not None
 
 
-@pytest.mark.asyncio
-async def test_coordinator_prompt_contains_context(schema_summary):
+def test_coordinator_prompt_contains_context(schema_summary):
     """Verify prompt includes seed question, schema, and history."""
     mock = make_mock_llm("coordinator_response.json")
-    await run_coordinator(
+    run_coordinator(
         llm=mock, model="test",
         seed_question="Are planets missing?",
         motivation="Bias analysis",

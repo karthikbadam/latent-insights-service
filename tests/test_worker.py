@@ -1,11 +1,10 @@
 """Tests for app.agents.worker — SQL execution worker agent."""
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
-import pytest
 
-from app.agents.worker import _execute_sql_sync, _format_results, run_worker
+from app.agents.worker import _execute_sql, _format_results, run_worker
 from app.core.llm import LLMResponse
 from app.models import WorkerResult
 
@@ -29,18 +28,18 @@ def test_format_results_empty():
 
 
 def test_execute_sql_success(session_db):
-    result = _execute_sql_sync(session_db, "SELECT COUNT(*) as cnt FROM dataset")
+    result = _execute_sql(session_db, "SELECT COUNT(*) as cnt FROM dataset")
     assert "cnt" in result
     assert "103" in result
 
 
 def test_execute_sql_error(session_db):
-    result = _execute_sql_sync(session_db, "SELECT * FROM nonexistent_table")
+    result = _execute_sql(session_db, "SELECT * FROM nonexistent_table")
     assert "SQL ERROR" in result
 
 
 def test_execute_sql_groupby(session_db):
-    result = _execute_sql_sync(
+    result = _execute_sql(
         session_db,
         "SELECT discoverymethod, COUNT(*) as cnt FROM dataset GROUP BY 1 ORDER BY 2 DESC",
     )
@@ -50,8 +49,7 @@ def test_execute_sql_groupby(session_db):
 # --- run_worker tool-use loop ---
 
 
-@pytest.mark.asyncio
-async def test_run_worker_no_tool_calls(session_db, schema_summary):
+def test_run_worker_no_tool_calls(session_db, schema_summary):
     """Worker that returns final answer without tool calls."""
     final_response = json.dumps({
         "summary": "Test summary",
@@ -59,12 +57,12 @@ async def test_run_worker_no_tool_calls(session_db, schema_summary):
         "view_requested": None,
     })
 
-    mock_llm = AsyncMock()
+    mock_llm = MagicMock()
     mock_llm.call.return_value = LLMResponse(
         content=final_response, model="test", tool_calls=None,
     )
 
-    result = await run_worker(
+    result = run_worker(
         llm=mock_llm, model="m", fallback_model="fb",
         worker_instruction="Count rows",
         schema_summary=schema_summary, session_db=session_db,
@@ -74,10 +72,9 @@ async def test_run_worker_no_tool_calls(session_db, schema_summary):
     assert result.result == "Test summary"
 
 
-@pytest.mark.asyncio
-async def test_run_worker_with_tool_call(session_db, schema_summary):
+def test_run_worker_with_tool_call(session_db, schema_summary):
     """Worker that calls run_sql tool, then returns final answer."""
-    mock_llm = AsyncMock()
+    mock_llm = MagicMock()
 
     # First call: LLM wants to run SQL
     tool_call_response = LLMResponse(
@@ -105,7 +102,7 @@ async def test_run_worker_with_tool_call(session_db, schema_summary):
 
     mock_llm.call.side_effect = [tool_call_response, final_response]
 
-    result = await run_worker(
+    result = run_worker(
         llm=mock_llm, model="m", fallback_model="fb",
         worker_instruction="Count the rows",
         schema_summary=schema_summary, session_db=session_db,
@@ -122,10 +119,9 @@ async def test_run_worker_with_tool_call(session_db, schema_summary):
     assert "103" in tool_msgs[0]["content"]
 
 
-@pytest.mark.asyncio
-async def test_run_worker_sql_error_in_tool(session_db, schema_summary):
+def test_run_worker_sql_error_in_tool(session_db, schema_summary):
     """Worker gets SQL error, LLM sees it and self-corrects."""
-    mock_llm = AsyncMock()
+    mock_llm = MagicMock()
 
     # First call: LLM tries bad SQL
     bad_sql_response = LLMResponse(
@@ -166,7 +162,7 @@ async def test_run_worker_sql_error_in_tool(session_db, schema_summary):
 
     mock_llm.call.side_effect = [bad_sql_response, good_sql_response, final_response]
 
-    result = await run_worker(
+    result = run_worker(
         llm=mock_llm, model="m", fallback_model="fb",
         worker_instruction="Count rows",
         schema_summary=schema_summary, session_db=session_db,
@@ -176,10 +172,9 @@ async def test_run_worker_sql_error_in_tool(session_db, schema_summary):
     assert mock_llm.call.call_count == 3
 
 
-@pytest.mark.asyncio
-async def test_run_worker_with_view_request(session_db, schema_summary):
+def test_run_worker_with_view_request(session_db, schema_summary):
     """Worker requests a view creation."""
-    mock_llm = AsyncMock()
+    mock_llm = MagicMock()
     mock_llm.call.return_value = LLMResponse(
         content=json.dumps({
             "summary": "Created filtered view",
@@ -193,7 +188,7 @@ async def test_run_worker_with_view_request(session_db, schema_summary):
         tool_calls=None,
     )
 
-    result = await run_worker(
+    result = run_worker(
         llm=mock_llm, model="m", fallback_model="fb",
         worker_instruction="Filter data",
         schema_summary=schema_summary, session_db=session_db,

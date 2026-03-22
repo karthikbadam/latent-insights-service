@@ -1,10 +1,9 @@
 """Session lifecycle — upload, profile, scout, spawn threads."""
 
-import asyncio
 import logging
 import time
+from concurrent.futures import Future, as_completed
 from dataclasses import asdict
-from functools import partial
 
 from app.agents.profiler import run_profiler
 from app.agents.scout import run_scout
@@ -20,7 +19,7 @@ from app.orchestration.thread import run_thread_loop
 logger = logging.getLogger(__name__)
 
 
-async def create_session_flow(
+def create_session_flow(
     config: AppConfig,
     llm: LLMClient,
     db: Database,
@@ -41,17 +40,14 @@ async def create_session_flow(
 
     logger.info(f"Session {session_id} flow starting for {dataset_path}")
 
-    # Create session DB with dataset (run in thread to avoid blocking event loop)
-    loop = asyncio.get_running_loop()
-    session_db, table_name = await loop.run_in_executor(
-        None, partial(db.create_session_db, session_id, dataset_path)
-    )
+    # Create session DB with dataset
+    session_db, table_name = db.create_session_db(session_id, dataset_path)
 
     state.update_session_table_name(session_id, table_name)
 
     # Run profiler
     t0 = time.monotonic()
-    schema_summary = await run_profiler(
+    schema_summary = run_profiler(
         llm=llm,
         model=config.models.profiler,
         session_db=session_db,
@@ -65,7 +61,7 @@ async def create_session_flow(
 
     # Run scout
     t0 = time.monotonic()
-    scout_output = await run_scout(
+    scout_output = run_scout(
         llm=llm,
         model=config.models.scout,
         schema_summary=schema_summary,
@@ -76,7 +72,7 @@ async def create_session_flow(
 
     state.update_session_scout(session_id, asdict(scout_output))
 
-    await queue.emit(StreamEvent(
+    queue.emit(StreamEvent(
         session_id=session_id,
         thread_id="",
         event_type="scout_done",
@@ -91,7 +87,7 @@ async def create_session_flow(
     )
 
     # Close the initial session_db — each thread gets its own connection
-    await loop.run_in_executor(None, session_db.close)
+    session_db.close()
 
     # Spawn threads in batches — process all questions, batch_size at a time
     batch_size = config.default_seed_threads
@@ -106,37 +102,33 @@ async def create_session_flow(
             f"({len(batch)} threads)"
         )
 
-        batch_tasks = []
+        batch_futures: list[Future] = []
         for q in batch:
             thread = state.create_thread(
                 session_id, q.question, q.motivation, q.entry_point,
             )
 
-            thread_db = await loop.run_in_executor(
-                None, partial(db.open_session_connection, session_id)
-            )
+            thread_db = db.open_session_connection(session_id)
 
-            task = queue.schedule(
-                coro=run_thread_loop(
-                    config=config,
-                    llm=llm,
-                    session_db=thread_db,
-                    queue=queue,
-                    state=state,
-                    trace_store=trace_store,
-                    thread=thread,
-                    schema_summary=schema_summary,
+            future = queue.schedule(
+                fn=run_thread_loop,
+                args=(
+                    config, llm, thread_db, queue, state,
+                    trace_store, thread, schema_summary,
                 ),
                 task_id=f"thread-{thread.id}",
                 session_id=session_id,
                 thread_id=thread.id,
                 description=f"Thread: {q.question[:60]}",
             )
-            batch_tasks.append(task)
+            batch_futures.append(future)
 
         # Wait for this batch to complete before starting the next
-        if batch_tasks:
-            await asyncio.gather(*batch_tasks, return_exceptions=True)
+        for future in as_completed(batch_futures):
+            try:
+                future.result()
+            except Exception:
+                pass  # Errors are logged by the done callback
 
-    await loop.run_in_executor(None, partial(state.dump_session, session_id))
+    state.dump_session(session_id)
     return session_id

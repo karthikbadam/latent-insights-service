@@ -5,9 +5,7 @@ Runs once per session after profiler. Output seeds the analytical threads.
 Works with any dataset — no domain-specific assumptions.
 """
 
-import asyncio
 import logging
-from functools import partial
 
 from app.core.llm import LLMClient
 from app.core.parsing import parse_scout_response
@@ -47,7 +45,6 @@ a pattern has an explanation worth finding, or two unrelated things connect.
 Return JSON:
 
 {
-  "exploration_notes": "Narrative of what you found (2-3 paragraphs)",
   "questions": [
     {
       "question": "Complete sentence question",
@@ -142,7 +139,7 @@ def _run_exploratory_queries(session_db, table_name: str) -> str:
     return "\n\n".join(explorations)
 
 
-async def run_scout(
+def run_scout(
     llm: LLMClient,
     model: str,
     schema_summary: str,
@@ -152,10 +149,7 @@ async def run_scout(
     """Run scout and return discovered questions."""
     exploration_data = ""
     if session_db is not None:
-        loop = asyncio.get_running_loop()
-        exploration_data = await loop.run_in_executor(
-            None, partial(_run_exploratory_queries, session_db, table_name),
-        )
+        exploration_data = _run_exploratory_queries(session_db, table_name)
 
     user_content = f"Here is the dataset schema:\n\n{schema_summary}\n\n"
     if exploration_data:
@@ -172,7 +166,7 @@ async def run_scout(
         {"role": "user", "content": user_content},
     ]
 
-    response = await llm.call(
+    response = llm.call(
         model=model,
         messages=messages,
         role="scout",

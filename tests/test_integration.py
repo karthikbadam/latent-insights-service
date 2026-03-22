@@ -1,7 +1,7 @@
 """Integration tests — state management, tracing, and thread flows with mock LLM."""
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import MagicMock
 
 import duckdb
 import pytest
@@ -262,8 +262,7 @@ def _make_worker_response(summary):
     })
 
 
-@pytest.mark.asyncio
-async def test_thread_loop_three_steps_done(integration_setup):
+def test_thread_loop_three_steps_done(integration_setup):
     """Thread runs 3 steps then completes."""
     setup = integration_setup
     state = setup["state"]
@@ -274,7 +273,7 @@ async def test_thread_loop_three_steps_done(integration_setup):
 
     coordinator_calls = [0]
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             coordinator_calls[0] += 1
             if coordinator_calls[0] < 3:
@@ -289,10 +288,10 @@ async def test_thread_loop_three_steps_done(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    mock_llm = AsyncMock()
+    mock_llm = MagicMock()
     mock_llm.call = mock_call
 
-    await run_thread_loop(
+    run_thread_loop(
         config=setup["config"],
         llm=mock_llm,
         session_db=setup["session_db"],
@@ -309,8 +308,7 @@ async def test_thread_loop_three_steps_done(integration_setup):
     assert final_thread.summary is not None
 
 
-@pytest.mark.asyncio
-async def test_thread_loop_stuck_then_resume(integration_setup):
+def test_thread_loop_stuck_then_resume(integration_setup):
     """Thread gets stuck, human replies, thread resumes and completes."""
     setup = integration_setup
     state = setup["state"]
@@ -322,7 +320,7 @@ async def test_thread_loop_stuck_then_resume(integration_setup):
     phase = {"value": "initial"}
     coordinator_calls = [0]
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             coordinator_calls[0] += 1
             if phase["value"] == "initial":
@@ -358,11 +356,11 @@ async def test_thread_loop_stuck_then_resume(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    mock_llm = AsyncMock()
+    mock_llm = MagicMock()
     mock_llm.call = mock_call
 
     # Run until stuck
-    await run_thread_loop(
+    run_thread_loop(
         config=setup["config"],
         llm=mock_llm,
         session_db=setup["session_db"],
@@ -383,10 +381,17 @@ async def test_thread_loop_stuck_then_resume(integration_setup):
     trace_store.load_trace(thread.id, thread.session_id)
 
     state.update_thread_status(thread.id, ThreadStatus.RUNNING)
-    await run_thread_loop(
+
+    # Need a fresh DB connection since thread.py closes it in finally block
+    session_db2 = duckdb.connect(":memory:")
+    session_db2.execute(
+        "CREATE TABLE dataset AS SELECT * FROM read_csv_auto('tests/fixtures/sample_dataset.csv')"
+    )
+
+    run_thread_loop(
         config=setup["config"],
         llm=mock_llm,
-        session_db=setup["session_db"],
+        session_db=session_db2,
         queue=setup["queue"],
         state=state,
         trace_store=trace_store,
@@ -399,8 +404,7 @@ async def test_thread_loop_stuck_then_resume(integration_setup):
     assert t.status == ThreadStatus.COMPLETE
 
 
-@pytest.mark.asyncio
-async def test_thread_emits_events(integration_setup):
+def test_thread_emits_events(integration_setup):
     """Verify SSE events are emitted during thread execution."""
     setup = integration_setup
     state = setup["state"]
@@ -412,7 +416,7 @@ async def test_thread_emits_events(integration_setup):
 
     event_queue = queue.subscribe(session.id)
 
-    async def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
             return LLMResponse(
                 content=_make_coordinator_response("DONE", "SYNTHESIZE", "wrap up"),
@@ -425,10 +429,10 @@ async def test_thread_emits_events(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    mock_llm = AsyncMock()
+    mock_llm = MagicMock()
     mock_llm.call = mock_call
 
-    await run_thread_loop(
+    run_thread_loop(
         config=setup["config"],
         llm=mock_llm,
         session_db=setup["session_db"],
@@ -441,7 +445,7 @@ async def test_thread_emits_events(integration_setup):
 
     events = []
     while not event_queue.empty():
-        events.append(await event_queue.get())
+        events.append(event_queue.get_nowait())
 
     event_types = [e.event_type for e in events]
     assert "step" in event_types

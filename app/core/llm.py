@@ -4,11 +4,10 @@ LLM client — OpenAI-compatible API integration (OpenRouter, Ollama, etc).
 All agent calls go through here.
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 
-from openai import AsyncOpenAI
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +39,7 @@ class LLMClient:
     """
 
     def __init__(self, api_key: str, base_url: str, app_name: str = "", app_url: str = "", think: bool = True):
-        self._client = AsyncOpenAI(
+        self._client = OpenAI(
             base_url=base_url,
             api_key=api_key,
         )
@@ -48,7 +47,7 @@ class LLMClient:
         self._app_url = app_url
         self._think = think
 
-    async def call(
+    def call(
         self,
         model: str,
         messages: list[dict],
@@ -75,6 +74,7 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "extra_headers": {},
+            "timeout": timeout,
         }
         if self._app_url:
             kwargs["extra_headers"]["HTTP-Referer"] = self._app_url
@@ -86,10 +86,7 @@ class LLMClient:
             kwargs["extra_body"] = {"think": False}
 
         logger.info(f"LLM call: model={model} role={role} temp={temperature}")
-        completion = await asyncio.wait_for(
-            self._client.chat.completions.create(**kwargs),
-            timeout=timeout,
-        )
+        completion = self._client.chat.completions.create(**kwargs)
 
         choice = completion.choices[0]
         content = choice.message.content or ""
@@ -124,7 +121,7 @@ class LLMClient:
         )
         return response
 
-    async def call_with_retry(
+    def call_with_retry(
         self,
         model: str,
         fallback_model: str,
@@ -140,7 +137,7 @@ class LLMClient:
         for attempt in range(max_retries):
             try:
                 current_model = model if attempt < max_retries - 1 else fallback_model
-                return await self.call(
+                return self.call(
                     model=current_model,
                     messages=messages,
                     role=role,

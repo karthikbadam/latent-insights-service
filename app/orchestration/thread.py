@@ -1,10 +1,7 @@
 """Thread loop — coordinator-worker cycle until completion."""
 
-import asyncio
 import logging
 import time
-
-from functools import partial
 
 from app.agents.coordinator import run_coordinator
 from app.agents.worker import run_worker
@@ -23,13 +20,8 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 
-async def _get_thread_views(session_db, thread_id: str) -> str:
-    """List existing views for this thread (run in executor to avoid blocking)."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _get_thread_views_sync, session_db, thread_id)
-
-
-def _get_thread_views_sync(session_db, thread_id: str) -> str:
+def _get_thread_views(session_db, thread_id: str) -> str:
+    """List existing views for this thread."""
     try:
         rows = session_db.execute("""
             SELECT table_name FROM information_schema.tables
@@ -42,7 +34,7 @@ def _get_thread_views_sync(session_db, thread_id: str) -> str:
     return "(none)"
 
 
-async def run_thread_loop(
+def run_thread_loop(
     config: AppConfig,
     llm: LLMClient,
     session_db,
@@ -80,11 +72,11 @@ async def run_thread_loop(
             thread_history = trace_store.format_thread_history(
                 thread.id, human_messages, running_summary=thread.running_summary,
             )
-            thread_views = await _get_thread_views(session_db, thread.id)
+            thread_views = _get_thread_views(session_db, thread.id)
 
             # Coordinator decides
             t0 = time.monotonic()
-            decision, coordinator_log = await run_coordinator(
+            decision, coordinator_log = run_coordinator(
                 llm=llm,
                 model=config.models.coordinator,
                 seed_question=thread.seed_question,
@@ -123,11 +115,12 @@ async def run_thread_loop(
                 })
                 trace_store.end_span(step_span, status="stuck")
 
-                await _flush_trace(trace_store, thread)
+                trace_store.flush_to_file(thread.id, thread.session_id)
+                trace_store.clear_trace(thread.id)
                 state.update_thread_status(thread.id, ThreadStatus.WAITING)
-                await _run_sync(state.dump_session, thread.session_id)
+                state.dump_session(thread.session_id)
 
-                await queue.emit(StreamEvent(
+                queue.emit(StreamEvent(
                     session_id=thread.session_id,
                     thread_id=thread.id,
                     event_type="waiting",
@@ -140,7 +133,7 @@ async def run_thread_loop(
                 return
 
             # Worker executes
-            await queue.emit(StreamEvent(
+            queue.emit(StreamEvent(
                 session_id=thread.session_id,
                 thread_id=thread.id,
                 event_type="step",
@@ -149,7 +142,7 @@ async def run_thread_loop(
             ))
 
             t0 = time.monotonic()
-            worker_result = await run_worker(
+            worker_result = run_worker(
                 llm=llm,
                 model=config.models.worker,
                 fallback_model=config.models.worker_fallback,
@@ -194,7 +187,7 @@ async def run_thread_loop(
             )
 
             # Emit step completion
-            await queue.emit(StreamEvent(
+            queue.emit(StreamEvent(
                 session_id=thread.session_id,
                 thread_id=thread.id,
                 event_type="step",
@@ -203,7 +196,7 @@ async def run_thread_loop(
 
             # Summarize history periodically to keep context manageable
             if step_number > 1 and step_number % 5 == 0:
-                await _maybe_summarize(
+                _maybe_summarize(
                     trace_store, state, thread, llm, config,
                 )
 
@@ -215,14 +208,15 @@ async def run_thread_loop(
                     f"{step_number} steps in {thread_elapsed}s"
                 )
 
-                await _flush_trace(trace_store, thread)
+                trace_store.flush_to_file(thread.id, thread.session_id)
+                trace_store.clear_trace(thread.id)
                 state.update_thread_status(
                     thread.id, ThreadStatus.COMPLETE,
                     summary=worker_result.result,
                 )
-                await _run_sync(state.dump_session, thread.session_id)
+                state.dump_session(thread.session_id)
 
-                await queue.emit(StreamEvent(
+                queue.emit(StreamEvent(
                     session_id=thread.session_id,
                     thread_id=thread.id,
                     event_type="complete",
@@ -249,13 +243,14 @@ async def run_thread_loop(
             exc_info=True,
         )
         try:
-            await _flush_trace(trace_store, thread)
+            trace_store.flush_to_file(thread.id, thread.session_id)
+            trace_store.clear_trace(thread.id)
             state.update_thread_status(
                 thread.id, ThreadStatus.ERROR,
                 error=error_msg,
             )
-            await _run_sync(state.dump_session, thread.session_id)
-            await queue.emit(StreamEvent(
+            state.dump_session(thread.session_id)
+            queue.emit(StreamEvent(
                 session_id=thread.session_id,
                 thread_id=thread.id,
                 event_type="error",
@@ -267,24 +262,12 @@ async def run_thread_loop(
     finally:
         # Close per-thread connection
         try:
-            await _run_sync(session_db.close)
+            session_db.close()
         except Exception:
             pass
 
 
-async def _run_sync(fn, *args):
-    """Run a blocking function in the thread pool executor."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, partial(fn, *args))
-
-
-async def _flush_trace(trace_store: TraceStore, thread: Thread):
-    """Flush JSONL trace file and clear in-memory spans."""
-    await _run_sync(trace_store.flush_to_file, thread.id, thread.session_id)
-    trace_store.clear_trace(thread.id)
-
-
-async def _maybe_summarize(
+def _maybe_summarize(
     trace_store: TraceStore,
     state: StateStore,
     thread: Thread,
@@ -293,7 +276,7 @@ async def _maybe_summarize(
 ):
     """Summarize thread history if it's getting long."""
     try:
-        summary = await trace_store.summarize_history(
+        summary = trace_store.summarize_history(
             trace_id=thread.id,
             llm=llm,
             model=config.models.coordinator,
@@ -307,7 +290,7 @@ async def _maybe_summarize(
         logger.warning(f"History summarization failed: {e}")
 
 
-async def resume_thread(
+def resume_thread(
     config: AppConfig,
     llm: LLMClient,
     session_db,
@@ -325,11 +308,11 @@ async def resume_thread(
 
     # Reload trace from JSONL if not in memory
     if not trace_store.get_spans(thread_id):
-        await _run_sync(trace_store.load_trace, thread_id, thread.session_id)
+        trace_store.load_trace(thread_id, thread.session_id)
 
     state.update_thread_status(thread_id, ThreadStatus.RUNNING)
 
-    await run_thread_loop(
+    run_thread_loop(
         config=config,
         llm=llm,
         session_db=session_db,

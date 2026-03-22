@@ -65,10 +65,11 @@ When DONE, worker_instruction should be a SYNTHESIZE producing the final summary
 - Never report stats without context. Push toward "so what?"
 - Make hypotheses falsifiable.
 - If something surprises you, say so.
+- Do not ask the worker to run ML models, regressions, or clustering. DuckDB is a SQL engine — instruct the worker to use aggregates, grouping, correlations, and arithmetic.
 """
 
 
-async def run_coordinator(
+def run_coordinator(
     llm: LLMClient,
     model: str,
     seed_question: str,
@@ -96,7 +97,7 @@ async def run_coordinator(
     ]
 
     t0 = time.monotonic()
-    response = await llm.call(
+    response = llm.call(
         model=model,
         messages=messages,
         role="coordinator",
@@ -105,10 +106,10 @@ async def run_coordinator(
     call_ms = round((time.monotonic() - t0) * 1000)
 
     if queue:
-        await queue.emit(StreamEvent(
+        queue.emit(StreamEvent(
             session_id=session_id, thread_id=thread_id,
             event_type="llm_call",
-            message=f"Coordinator thinking ({call_ms}ms)",
+            message=f"Coordinator: {seed_question[:120]} ({call_ms}ms)",
             data={"role": "coordinator", "model": model,
                   "input_tokens": response.input_tokens,
                   "output_tokens": response.output_tokens,
@@ -117,7 +118,7 @@ async def run_coordinator(
 
     if not response.content or not response.content.strip():
         logger.warning("Coordinator returned empty response, retrying once")
-        response = await llm.call(
+        response = llm.call(
             model=model,
             messages=messages,
             role="coordinator",

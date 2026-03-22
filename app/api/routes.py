@@ -2,10 +2,8 @@
 API routes — thin HTTP layer over orchestration.
 """
 
-import asyncio
 import logging
 import os
-from functools import partial
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
 
@@ -36,14 +34,11 @@ def _get_state():
     return main.config, main.llm, main.db, main.queue_instance, main.state_store, main.trace_store
 
 
-async def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
+def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
     """Convert TraceStore spans to StepResponse list for API."""
     spans = trace_store.get_step_spans(thread.id)
     if not spans:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, partial(trace_store.load_trace, thread.id, thread.session_id),
-        )
+        trace_store.load_trace(thread.id, thread.session_id)
         spans = trace_store.get_step_spans(thread.id)
 
     # Only include completed steps (in-progress spans have no attributes yet)
@@ -70,7 +65,7 @@ async def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
 
 
 @router.post("/sessions")
-async def create_session(
+def create_session(
     request: Request,
     file: UploadFile | None = File(None),
     dataset_path: str | None = Query(None),
@@ -83,16 +78,11 @@ async def create_session(
             raise HTTPException(status_code=400, detail="Only CSV files are supported")
 
         upload_dir = os.path.join(config.data_dir, "uploads")
+        os.makedirs(upload_dir, exist_ok=True)
         resolved_path = os.path.join(upload_dir, file.filename)
-        content = await file.read()
-
-        def _write_upload():
-            os.makedirs(upload_dir, exist_ok=True)
-            with open(resolved_path, "wb") as f:
-                f.write(content)
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _write_upload)
+        content = file.file.read()
+        with open(resolved_path, "wb") as f:
+            f.write(content)
     elif dataset_path:
         if not os.path.exists(dataset_path):
             raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset_path}")
@@ -107,9 +97,8 @@ async def create_session(
     session = state.create_session(resolved_path, table_name)
 
     queue.schedule(
-        coro=create_session_flow(
-            config, llm, db, queue, state, trace_store, session.id, resolved_path,
-        ),
+        fn=create_session_flow,
+        args=(config, llm, db, queue, state, trace_store, session.id, resolved_path),
         task_id=f"session-{session.id}",
         session_id=session.id,
         description=f"Session setup: {os.path.basename(resolved_path)}",
@@ -128,7 +117,7 @@ async def create_session(
 
 
 @router.get("/sessions/{session_id}")
-async def get_session(session_id: str, request: Request):
+def get_session(session_id: str, request: Request):
     """Get full session state with threads and steps."""
     _, _, _, _, state, trace_store = _get_state()
 
@@ -140,7 +129,7 @@ async def get_session(session_id: str, request: Request):
 
     thread_responses = []
     for t in threads:
-        steps = await _steps_from_trace(trace_store, t)
+        steps = _steps_from_trace(trace_store, t)
         thread_responses.append(ThreadResponse(
             id=t.id,
             seed_question=t.seed_question,
@@ -169,7 +158,7 @@ async def get_session(session_id: str, request: Request):
 
 
 @router.post("/sessions/{session_id}/threads")
-async def create_thread(session_id: str, request: CreateThreadRequest):
+def create_thread(session_id: str, request: CreateThreadRequest):
     """Create a user-initiated thread with a custom question."""
     config, llm, db, queue, state, trace_store = _get_state()
     from app.orchestration.thread import run_thread_loop
@@ -184,19 +173,13 @@ async def create_thread(session_id: str, request: CreateThreadRequest):
         session_id, request.question, request.motivation or "", "",
     )
 
-    loop = asyncio.get_running_loop()
-    thread_db = await loop.run_in_executor(None, partial(db.open_session_connection, session_id))
+    thread_db = db.open_session_connection(session_id)
 
     queue.schedule(
-        coro=run_thread_loop(
-            config=config,
-            llm=llm,
-            session_db=thread_db,
-            queue=queue,
-            state=state,
-            trace_store=trace_store,
-            thread=thread,
-            schema_summary=session.schema_summary,
+        fn=run_thread_loop,
+        args=(
+            config, llm, thread_db, queue, state,
+            trace_store, thread, session.schema_summary,
         ),
         task_id=f"thread-{thread.id}",
         session_id=session_id,
@@ -214,7 +197,7 @@ async def create_thread(session_id: str, request: CreateThreadRequest):
 
 
 @router.post("/threads/{thread_id}/messages")
-async def post_message(thread_id: str, request: PostMessageRequest):
+def post_message(thread_id: str, request: PostMessageRequest):
     """Post a human message to a stuck thread, resuming it."""
     config, llm, db, queue, state, trace_store = _get_state()
     from app.orchestration.thread import resume_thread
@@ -226,20 +209,14 @@ async def post_message(thread_id: str, request: PostMessageRequest):
         raise HTTPException(status_code=400, detail="Thread is not waiting for input")
 
     session = state.get_session(thread.session_id)
-    loop = asyncio.get_running_loop()
-    thread_db = await loop.run_in_executor(None, partial(db.open_session_connection, thread.session_id))
+    thread_db = db.open_session_connection(thread.session_id)
 
     queue.schedule(
-        coro=resume_thread(
-            config=config,
-            llm=llm,
-            session_db=thread_db,
-            queue=queue,
-            state=state,
-            trace_store=trace_store,
-            thread_id=thread_id,
-            human_message=request.content,
-            schema_summary=session.schema_summary or "",
+        fn=resume_thread,
+        args=(
+            config, llm, thread_db, queue, state,
+            trace_store, thread_id, request.content,
+            session.schema_summary or "",
         ),
         task_id=f"resume-{thread_id}",
         session_id=thread.session_id,
@@ -254,7 +231,7 @@ async def post_message(thread_id: str, request: PostMessageRequest):
 
 
 @router.get("/system/stats")
-async def system_stats() -> SystemStats:
+def system_stats() -> SystemStats:
     """Session and thread counts."""
     _, _, _, _, state, _ = _get_state()
 

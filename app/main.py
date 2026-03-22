@@ -59,7 +59,8 @@ async def lifespan(app: FastAPI):
 
     # Cleanup — dump all state to disk
     state_store.dump_all()
-    await queue_instance.cancel_session("*")
+    queue_instance.cancel_session("*")
+    queue_instance.shutdown(wait=False)
     db.close()
     logger.info("Shutdown complete")
 
