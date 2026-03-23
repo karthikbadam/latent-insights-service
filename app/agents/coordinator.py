@@ -165,6 +165,9 @@ When DONE, worker_instruction should be a SYNTHESIZE producing the final summary
             decision = parse_coordinator_response(response.content)
 
         # Validate consistency
+        if decision.status == CoordinatorStatus.STUCK:
+            decision.next_move = MoveType.STUCK
+
         if decision.status == CoordinatorStatus.DONE and decision.next_move != MoveType.SYNTHESIZE:
             logger.warning("Coordinator returned DONE without SYNTHESIZE — correcting")
             decision.next_move = MoveType.SYNTHESIZE
@@ -178,7 +181,7 @@ When DONE, worker_instruction should be a SYNTHESIZE producing the final summary
             "model": response.model,
             "input_tokens": response.input_tokens,
             "output_tokens": response.output_tokens,
-            "response": response.content[:500] if response.content else "",
+            "response": response.content if response.content else "",
         }
 
         return decision, llm_log

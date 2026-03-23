@@ -55,6 +55,7 @@ class StepEvent(BaseModel):
     output_tokens: int | None = None
     sql: str | None = None
     tool_result: str | None = None
+    response: str | None = None
 
 
 class StepResponse(BaseModel):

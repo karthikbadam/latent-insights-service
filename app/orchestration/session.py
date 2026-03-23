@@ -12,7 +12,7 @@ from app.core.queue import Queue
 from app.core.state import StateStore
 from app.core.tracing import TraceStore
 from app.db.connection import Database
-from app.models import StreamEvent, ThreadStatus
+from app.models import ScoutQuestion, StreamEvent, ThreadStatus
 from app.orchestration.thread import ThreadRunner
 
 logger = logging.getLogger(__name__)
@@ -62,25 +62,47 @@ class SessionFlow:
         self.state.update_session_schema(session_id, schema_summary)
         logger.info(f"Session {session_id} profiled ({profiler_ms}ms)")
 
-        # Run scout
+        # Close read-write connection — all further access is read-only
+        session_db.close()
+
+        # Spawn initial_questions threads immediately (before scout)
+        initial_questions = self.config.initial_questions
+        if initial_questions:
+            initial_q_objects = [
+                ScoutQuestion(question=q, motivation="", entry_point="", difficulty="moderate")
+                for q in initial_questions
+            ]
+            self._spawn_threads(session_id, initial_q_objects, schema_summary)
+            logger.info(f"Session {session_id} spawned {len(initial_questions)} initial question threads")
+
+        # Run scout with a read-only connection
+        scout_db = self.db.open_session_connection(session_id)
         t0 = time.monotonic()
         scout_output = self.scout.call(
             schema_summary=schema_summary,
             table_name=table_name,
-            session_db=session_db,
+            session_db=scout_db,
             num_questions=self.config.num_scout_seed_questions,
         )
         scout_ms = round((time.monotonic() - t0) * 1000)
+        scout_db.close()
 
         self.state.update_session_scout(session_id, asdict(scout_output))
+
+        # Apply max_threads budget to scout questions
+        scout_questions = scout_output.questions
+        max_threads = self.config.max_threads
+        if max_threads is not None:
+            remaining = max(0, max_threads - len(initial_questions))
+            scout_questions = scout_questions[:remaining]
 
         self.queue.emit(StreamEvent(
             session_id=session_id,
             thread_id="",
             event_type="scout_done",
-            message=f"Scout found {len(scout_output.questions)} questions",
+            message=f"Scout found {len(scout_output.questions)} questions, spawning {len(scout_questions)}",
             data={
-                "question_count": len(scout_output.questions),
+                "question_count": len(scout_questions),
                 "questions": [
                     {
                         "question": q.question,
@@ -88,20 +110,19 @@ class SessionFlow:
                         "entry_point": q.entry_point,
                         "difficulty": q.difficulty,
                     }
-                    for q in scout_output.questions
+                    for q in scout_questions
                 ],
             },
         ))
 
         setup_elapsed = round(time.monotonic() - session_start, 2)
         logger.info(
-            f"Session {session_id} scouted: {len(scout_output.questions)} questions "
+            f"Session {session_id} scouted: {len(scout_output.questions)} questions, "
+            f"spawning {len(scout_questions)} "
             f"(profiler={profiler_ms}ms scout={scout_ms}ms setup={setup_elapsed}s)"
         )
 
-        session_db.close()
-
-        self._spawn_threads(session_id, scout_output.questions, schema_summary)
+        self._spawn_threads(session_id, scout_questions, schema_summary)
 
         self.state.dump_session(session_id)
         return session_id

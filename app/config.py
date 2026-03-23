@@ -96,6 +96,8 @@ class AppConfig:
     # Threading
     default_seed_threads: int = 3
     num_scout_seed_questions: int = 8
+    max_threads: int | None = None
+    initial_questions: list[str] = field(default_factory=list)
 
     # Agents
     max_worker_retries: int = 3
@@ -130,7 +132,9 @@ class AppConfig:
             if overrides.get(key) is not None:
                 setattr(cfg.temperatures, attr, overrides[key])
 
-        for key in ["max_worker_retries", "max_consecutive_errors", "max_repeated_moves", "llm_timeout", "num_scout_seed_questions"]:
+        for key in ["max_worker_retries", "max_consecutive_errors", "max_repeated_moves",
+                    "llm_timeout", "num_scout_seed_questions", "max_threads",
+                    "initial_questions"]:
             if overrides.get(key) is not None:
                 setattr(cfg, key, overrides[key])
 

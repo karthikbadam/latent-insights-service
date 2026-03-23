@@ -5,12 +5,16 @@ API routes — thin HTTP layer over orchestration.
 import logging
 import os
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
+import json as json_mod
+
+from fastapi import APIRouter, Form, HTTPException, Request, UploadFile, File, Query
 
 from app.api.schemas import (
     CreateThreadRequest,
     PostMessageRequest,
+    SessionConfig,
     SessionResponse,
+    SessionSummary,
     SessionUrls,
     StepEvent,
     StepResponse,
@@ -66,6 +70,7 @@ def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
                 output_tokens=event_attrs.get("output_tokens"),
                 sql=event_attrs.get("sql"),
                 tool_result=event_attrs.get("tool_result"),
+                response=event_attrs.get("response"),
             ))
         step_events.sort(key=lambda e: e.timestamp)
 
@@ -89,15 +94,26 @@ def create_session(
     request: Request,
     file: UploadFile | None = File(None),
     dataset_path: str | None = Query(None),
+    config_json: str | None = Form(None, alias="config"),
 ):
     """Create a new analysis session from file upload or existing dataset path."""
     config, llm, db, queue, state, trace_store = _get_state()
+
+    # Parse per-session config overrides
+    session_config = config
+    if config_json:
+        try:
+            raw = json_mod.loads(config_json)
+        except json_mod.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in config field")
+        parsed = SessionConfig(**raw)
+        session_config = config.with_overrides(parsed.model_dump())
 
     if file and file.filename:
         if not file.filename.endswith(".csv"):
             raise HTTPException(status_code=400, detail="Only CSV files are supported")
 
-        upload_dir = os.path.join(config.data_dir, "uploads")
+        upload_dir = os.path.join(session_config.data_dir, "uploads")
         os.makedirs(upload_dir, exist_ok=True)
         resolved_path = os.path.join(upload_dir, file.filename)
         content = file.file.read()
@@ -116,7 +132,7 @@ def create_session(
     table_name = table_name_from_path(resolved_path)
     session = state.create_session(resolved_path, table_name)
 
-    flow = SessionFlow(config, llm, db, queue, state, trace_store)
+    flow = SessionFlow(session_config, llm, db, queue, state, trace_store)
     queue.schedule(
         fn=flow.create,
         args=(session.id, resolved_path),
@@ -276,6 +292,53 @@ def post_message(thread_id: str, request: PostMessageRequest):
     runner.resume(human_messages=[request.content])
 
     return {"status": "resumed", "thread_id": thread_id}
+
+
+@router.get("/sessions")
+def list_sessions():
+    """List all sessions with metadata."""
+    _, _, _, _, state, _ = _get_state()
+
+    sessions = state.get_all_sessions()
+    summaries = []
+    for s in sessions:
+        threads = state.get_threads(s.id)
+        status_counts: dict[str, int] = {}
+        for t in threads:
+            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
+        summaries.append(SessionSummary(
+            id=s.id,
+            dataset_path=s.dataset_path,
+            table_name=s.table_name,
+            thread_count=len(threads),
+            status_counts=status_counts,
+            created_at=s.created_at.isoformat() if s.created_at else "",
+        ))
+
+    return summaries
+
+
+@router.get("/threads/{thread_id}")
+def get_thread(thread_id: str):
+    """Get a single thread with its steps."""
+    _, _, _, _, state, trace_store = _get_state()
+
+    thread = state.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    steps = _steps_from_trace(trace_store, thread)
+    return ThreadResponse(
+        id=thread.id,
+        seed_question=thread.seed_question,
+        motivation=thread.motivation,
+        status=thread.status.value,
+        summary=thread.summary,
+        running_summary=thread.running_summary,
+        error=thread.error,
+        steps=steps,
+        updated_at=thread.updated_at.isoformat() if thread.updated_at else "",
+    )
 
 
 # --- System ---

@@ -67,11 +67,14 @@ def extract_json(raw: str) -> dict:
 
 def parse_coordinator_response(raw: str) -> CoordinatorDecision:
     data = extract_json(raw)
+    status = CoordinatorStatus(data.get("status", "CONTINUE"))
+    next_move = MoveType(data.get("next_move", "FORAGE"))
+
     return CoordinatorDecision(
         assessment=data.get("assessment", ""),
-        next_move=MoveType(data.get("next_move", "FORAGE")),
+        next_move=next_move,
         rationale=data.get("rationale", ""),
-        status=CoordinatorStatus(data.get("status", "CONTINUE")),
+        status=status,
         worker_instruction=data.get("worker_instruction"),
         question_for_human=data.get("question_for_human"),
         context=data.get("context"),

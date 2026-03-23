@@ -23,6 +23,7 @@ from app.core.tracing import Span, TraceStore
 from app.models import (
     CoordinatorDecision,
     CoordinatorStatus,
+    MoveType,
     StreamEvent,
     Thread,
     ThreadStatus,
@@ -65,6 +66,9 @@ class ThreadRunner:
         self.coordinator_ms: int = 0
         self.move_history: list[str] = []
         self.thread_start: float = time.monotonic()
+
+        # Error tracking
+        self.error_count: int = 0
 
         # Completion signaling
         self.done_event: Event = Event()
@@ -167,18 +171,18 @@ class ThreadRunner:
 
     def _on_coordinator_done(self, future):
         """Process coordinator result and schedule worker or finalize."""
-        decision, _, coordinator_ms, thread_views = future.result()
+        decision, coord_log, coordinator_ms, thread_views = future.result()
 
         self.decision = decision
         self.coordinator_ms = coordinator_ms
 
-        self.trace_store.add_event(self.step_span, "coordinator", {
-            "model": self.config.models.coordinator,
+        self.trace_store.add_event(self.step_span, "llm_call", {
+            "agent": "coordinator",
+            "model": coord_log["model"],
             "duration_ms": coordinator_ms,
-            "status": decision.status.value,
-            "next_move": decision.next_move.value,
-            "assessment": decision.assessment,
-            "rationale": decision.rationale,
+            "input_tokens": coord_log.get("input_tokens"),
+            "output_tokens": coord_log.get("output_tokens"),
+            "response": coord_log.get("response"),
         })
 
         logger.info(
@@ -187,8 +191,18 @@ class ThreadRunner:
         )
 
         if decision.status == CoordinatorStatus.STUCK:
-            self._finalize("stuck")
-            return
+            if self.step_number <= 2:
+                logger.warning(
+                    f"Thread {self.tid} STUCK on step {self.step_number} — overriding to FORAGE"
+                )
+                decision.status = CoordinatorStatus.CONTINUE
+                decision.next_move = MoveType.FORAGE
+                decision.worker_instruction = (
+                    f"Try a different exploratory approach to answer: {self.thread.seed_question}"
+                )
+            else:
+                self._finalize("stuck")
+                return
 
         # Initialize worker for this step
         self.worker.start(
@@ -243,11 +257,6 @@ class ThreadRunner:
         step_ms = round((time.monotonic() - self.step_start) * 1000)
         worker_ms = step_ms - self.coordinator_ms
 
-        self.trace_store.add_event(self.step_span, "worker", {
-            "model": self.config.models.worker,
-            "duration_ms": worker_ms,
-            "result_preview": worker_result.result[:200],
-        })
         if worker_result.llm_calls:
             for call in worker_result.llm_calls:
                 self.trace_store.add_event(self.step_span, "llm_call", call)
@@ -412,12 +421,29 @@ class ThreadRunner:
         try:
             handler(future)
         except Exception as e:
-            logger.error(f"Thread {self.thread.id} callback error: {e}", exc_info=True)
-            try:
-                self._finalize("error", error=e)
-            except Exception:
-                logger.error(f"Thread {self.thread.id} failed to finalize after error", exc_info=True)
-                self.done_event.set()
+            self.error_count += 1
+            if self.error_count < 3:
+                logger.warning(
+                    f"Thread {self.tid} error (attempt {self.error_count}), retrying step: {e}"
+                )
+                try:
+                    if self.step_span:
+                        self.step_span.attributes.update({
+                            "move": "ERROR",
+                            "result": f"Error: {e}",
+                        })
+                        self.trace_store.end_span(self.step_span, status="error")
+                    self._run_step()
+                except Exception:
+                    logger.error(f"Thread {self.tid} failed to retry after error", exc_info=True)
+                    self._finalize("error", error=e)
+            else:
+                logger.error(f"Thread {self.thread.id} callback error: {e}", exc_info=True)
+                try:
+                    self._finalize("error", error=e)
+                except Exception:
+                    logger.error(f"Thread {self.thread.id} failed to finalize after error", exc_info=True)
+                    self.done_event.set()
 
     def _maybe_summarize(self):
         """Summarize thread history if it's getting long."""

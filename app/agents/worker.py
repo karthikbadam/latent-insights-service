@@ -273,7 +273,7 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
                     "tool_call_id": tool_call["id"],
                     "content": result_text,
                 })
-                tool_results.append({"sql": sql, "result": result_text[:1000]})
+                tool_results.append({"sql": sql, "result": result_text})
                 if result_text.startswith("SQL ERROR:"):
                     self.consecutive_errors += 1
                 else:
