@@ -175,14 +175,14 @@ def test_worker_handle_response_empty_retries(session_db):
     assert "empty" in last_msg["content"].lower()
 
 
-def test_worker_handle_response_non_json_retries(session_db):
-    """Non-JSON text response returns None and asks for JSON."""
+def test_worker_handle_response_intermediate_reasoning(session_db):
+    """Plain text reasoning (no JSON) continues loop without nudge."""
     mock_llm = MagicMock()
     worker = _make_worker(mock_llm, session_db)
     worker.start("Count rows")
 
     response = LLMResponse(
-        content="The dataset has 103 rows.",
+        content="Let me think about this. I should check the NULL rates first before computing stats.",
         model="test",
         tool_calls=None,
     )
@@ -190,8 +190,31 @@ def test_worker_handle_response_non_json_retries(session_db):
     result = worker.handle_response(response, call_ms=100)
 
     assert result is None
+    # Last message should be the assistant's reasoning, no "reformat" nudge
     last_msg = worker.messages[-1]
-    assert "JSON" in last_msg["content"]
+    assert last_msg["role"] == "assistant"
+    assert "Let me think" in last_msg["content"]
+
+
+def test_worker_handle_response_malformed_json_retries(session_db):
+    """Text with malformed JSON block returns None and asks to reformat."""
+    mock_llm = MagicMock()
+    worker = _make_worker(mock_llm, session_db)
+    worker.start("Count rows")
+
+    response = LLMResponse(
+        content='Here is my answer: {summary: test, view_requested: null}',
+        model="test",
+        tool_calls=None,
+    )
+
+    result = worker.handle_response(response, call_ms=100)
+
+    assert result is None
+    # Should have nudge message after the assistant message
+    nudge_msg = worker.messages[-1]
+    assert nudge_msg["role"] == "user"
+    assert "malformed" in nudge_msg["content"].lower()
 
 
 def test_worker_handle_response_with_view_request(session_db):

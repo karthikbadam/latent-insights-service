@@ -49,19 +49,19 @@ a pattern has an explanation worth finding, or two unrelated things connect.
 
 Return JSON:
 
-{
+{{
   "questions": [
-    {
+    {{
       "question": "Complete sentence question",
       "motivation": "Why interesting (1-2 sentences)",
       "entry_point": "Specific first analytical step",
       "difficulty": "simple | moderate | deep"
-    }
+    }}
   ]
-}
+}}
 
-Return 7-10 questions ranked by likelihood of non-obvious insights.
-Mix: 2-3 simple, 3-4 moderate, 2-3 deep.
+Return {num_questions} questions ranked by likelihood of non-obvious insights.
+Mix difficulty levels: simple, moderate, and deep.
 """
 
     def __init__(self, llm: LLMClient, model: str):
@@ -76,6 +76,7 @@ Mix: 2-3 simple, 3-4 moderate, 2-3 deep.
         schema_summary: str,
         table_name: str = "dataset",
         session_db=None,
+        num_questions: int = 8,
     ) -> ScoutOutput:
         """Run scout and return discovered questions."""
         exploration_data = ""
@@ -92,8 +93,10 @@ Mix: 2-3 simple, 3-4 moderate, 2-3 deep.
             "interesting questions this data could answer."
         )
 
+        system_prompt = self.SYSTEM_PROMPT.format(num_questions=num_questions)
+
         messages = [
-            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
 

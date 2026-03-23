@@ -7,6 +7,7 @@ Works with any dataset — no domain-specific assumptions.
 
 import json
 import logging
+import re
 import time
 
 from app.agents.base import Agent
@@ -221,19 +222,27 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
             })
             return None
 
-        try:
-            worker_result = parse_worker_response(response.content)
-        except (ValueError, json.JSONDecodeError):
-            logger.warning("Worker returned non-JSON response, requesting reformat")
-            self.messages.append({"role": "assistant", "content": response.content})
-            self.messages.append({
-                "role": "user",
-                "content": "Your response must be valid JSON matching the output format specified in the system prompt. Please reformat your answer as JSON.",
-            })
-            return None
+        # Check if response looks like it's attempting JSON (contains { })
+        has_json_block = bool(re.search(r"\{.*\}", response.content, re.DOTALL))
 
-        worker_result.llm_calls = self.llm_calls
-        return worker_result
+        if has_json_block:
+            try:
+                worker_result = parse_worker_response(response.content)
+            except (ValueError, json.JSONDecodeError):
+                logger.warning("Worker returned malformed JSON, requesting reformat")
+                self.messages.append({"role": "assistant", "content": response.content})
+                self.messages.append({
+                    "role": "user",
+                    "content": "Your response contained JSON but it was malformed. Please reformat as valid JSON matching the output format.",
+                })
+                return None
+            worker_result.llm_calls = self.llm_calls
+            return worker_result
+        else:
+            # Intermediate reasoning — no JSON, just thinking. Continue the loop.
+            logger.info(f"Worker intermediate reasoning ({len(response.content)} chars)")
+            self.messages.append({"role": "assistant", "content": response.content})
+            return None
 
     def _handle_tool_calls(self, response, call_ms: int) -> None:
         """Worker wants to execute SQL tools. Always returns None (needs another call)."""

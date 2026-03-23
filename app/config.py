@@ -1,8 +1,10 @@
 """
 Configuration — single source of truth for all settings.
 Everything is configurable via environment variables.
+Per-session overrides via with_overrides().
 """
 
+import copy
 import os
 from dataclasses import dataclass, field
 
@@ -93,6 +95,7 @@ class AppConfig:
 
     # Threading
     default_seed_threads: int = 3
+    num_scout_seed_questions: int = 8
 
     # Agents
     max_worker_retries: int = 3
@@ -103,6 +106,35 @@ class AppConfig:
     # Sub-configs
     models: ModelConfig = field(default_factory=ModelConfig)
     temperatures: TemperatureConfig = field(default_factory=TemperatureConfig)
+
+    def with_overrides(self, overrides: dict) -> "AppConfig":
+        """Return a copy with per-session overrides applied. None values are ignored."""
+        cfg = copy.copy(self)
+        cfg.models = copy.copy(self.models)
+        cfg.temperatures = copy.copy(self.temperatures)
+
+        model_fields = {
+            "model_profiler": "profiler", "model_scout": "scout",
+            "model_coordinator": "coordinator", "model_worker": "worker",
+            "model_worker_fallback": "worker_fallback",
+        }
+        for key, attr in model_fields.items():
+            if overrides.get(key) is not None:
+                setattr(cfg.models, attr, overrides[key])
+
+        temp_fields = {
+            "temp_profiler": "profiler", "temp_scout": "scout",
+            "temp_coordinator": "coordinator", "temp_worker": "worker",
+        }
+        for key, attr in temp_fields.items():
+            if overrides.get(key) is not None:
+                setattr(cfg.temperatures, attr, overrides[key])
+
+        for key in ["max_worker_retries", "max_consecutive_errors", "max_repeated_moves", "llm_timeout", "num_scout_seed_questions"]:
+            if overrides.get(key) is not None:
+                setattr(cfg, key, overrides[key])
+
+        return cfg
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -123,6 +155,7 @@ class AppConfig:
             app_url=os.getenv("APP_URL", cls.app_url),
             data_dir=os.getenv("DATA_DIR", cls.data_dir),
             default_seed_threads=int(os.getenv("DEFAULT_SEED_THREADS", cls.default_seed_threads)),
+            num_scout_seed_questions=int(os.getenv("NUM_SCOUT_SEED_QUESTIONS", cls.num_scout_seed_questions)),
             max_worker_retries=int(os.getenv("MAX_WORKER_RETRIES", cls.max_worker_retries)),
             max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", cls.max_consecutive_errors)),
             max_repeated_moves=int(os.getenv("MAX_REPEATED_MOVES", cls.max_repeated_moves)),

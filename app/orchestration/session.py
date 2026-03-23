@@ -68,6 +68,7 @@ class SessionFlow:
             schema_summary=schema_summary,
             table_name=table_name,
             session_db=session_db,
+            num_questions=self.config.num_scout_seed_questions,
         )
         scout_ms = round((time.monotonic() - t0) * 1000)
 
@@ -170,6 +171,7 @@ class SessionFlow:
             schema_summary=scout_schema,
             table_name=session.table_name,
             session_db=session_db,
+            num_questions=self.config.num_scout_seed_questions,
         )
         scout_ms = round((time.monotonic() - t0) * 1000)
         session_db.close()
