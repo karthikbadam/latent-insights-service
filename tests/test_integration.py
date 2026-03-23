@@ -12,8 +12,7 @@ from app.core.queue import Queue
 from app.core.state import StateStore, generate_id
 from app.core.tracing import TraceStore
 from app.models import ThreadStatus
-from app.orchestration.context import ThreadContext
-from app.orchestration.thread import start_thread, resume_thread
+from app.orchestration.thread import ThreadRunner
 
 
 # --- StateStore unit tests ---
@@ -263,9 +262,9 @@ def _make_worker_response(summary):
     })
 
 
-def _build_ctx(setup, thread, session_db=None, human_messages=None):
-    """Build a ThreadContext for testing."""
-    return ThreadContext(
+def _build_runner(setup, thread, session_db=None, human_messages=None):
+    """Build a ThreadRunner for testing."""
+    return ThreadRunner(
         config=setup["config"],
         llm=MagicMock(),
         session_db=session_db or setup["session_db"],
@@ -303,11 +302,13 @@ def test_thread_loop_three_steps_done(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    ctx = _build_ctx(setup, thread)
-    ctx.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.llm.call = mock_call
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    start_thread(ctx)
-    ctx.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     final_thread = state.get_thread(thread.id)
     assert final_thread.status == ThreadStatus.COMPLETE
@@ -362,11 +363,13 @@ def test_thread_loop_stuck_then_resume(integration_setup):
         return LLMResponse(content="{}", model=model)
 
     # Run until stuck
-    ctx = _build_ctx(setup, thread)
-    ctx.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.llm.call = mock_call
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    start_thread(ctx)
-    ctx.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     t = state.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
@@ -379,11 +382,13 @@ def test_thread_loop_stuck_then_resume(integration_setup):
         "CREATE TABLE dataset AS SELECT * FROM read_csv_auto('tests/fixtures/sample_dataset.csv')"
     )
 
-    ctx2 = _build_ctx(setup, thread, session_db=session_db2, human_messages=["Yes, this is a known effect"])
-    ctx2.llm.call = mock_call
+    runner2 = _build_runner(setup, thread, session_db=session_db2, human_messages=["Yes, this is a known effect"])
+    runner2.llm.call = mock_call
+    runner2.coordinator.llm.call = mock_call
+    runner2.worker.llm.call = mock_call
 
-    resume_thread(ctx2)
-    ctx2.done_event.wait(timeout=10)
+    runner2.resume()
+    runner2.done_event.wait(timeout=10)
 
     t = state.get_thread(thread.id)
     assert t.status == ThreadStatus.COMPLETE
@@ -413,11 +418,13 @@ def test_thread_emits_events(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    ctx = _build_ctx(setup, thread)
-    ctx.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.llm.call = mock_call
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    start_thread(ctx)
-    ctx.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     events = []
     while not event_queue.empty():
@@ -451,11 +458,13 @@ def test_thread_move_repetition_guard(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    ctx = _build_ctx(setup, thread)
-    ctx.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.llm.call = mock_call
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    start_thread(ctx)
-    ctx.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     t = state.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
@@ -477,11 +486,13 @@ def test_thread_error_becomes_waiting(integration_setup):
             raise RuntimeError("Simulated LLM failure")
         return LLMResponse(content="{}", model=model)
 
-    ctx = _build_ctx(setup, thread)
-    ctx.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.llm.call = mock_call
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    start_thread(ctx)
-    ctx.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     t = state.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING

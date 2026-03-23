@@ -5,9 +5,11 @@ One coordinator per thread. Receives history, decides next action.
 Works with any dataset — no domain-specific assumptions.
 """
 
+import json
 import logging
 import time
 
+from app.agents.base import Agent
 from app.core.llm import LLMClient
 from app.core.parsing import parse_coordinator_response
 from app.core.queue import Queue
@@ -15,7 +17,11 @@ from app.models import CoordinatorDecision, CoordinatorStatus, MoveType, StreamE
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """\
+
+class Coordinator(Agent):
+    """Thread judge — evaluates worker results and decides the next analytical move."""
+
+    SYSTEM_PROMPT = """\
 You are a thread coordinator for a data analysis system. You guide a
 single analytical thread from question to insight.
 
@@ -68,82 +74,111 @@ When DONE, worker_instruction should be a SYNTHESIZE producing the final summary
 - Do not ask the worker to run ML models, regressions, or clustering. DuckDB is a SQL engine — instruct the worker to use aggregates, grouping, correlations, and arithmetic.
 """
 
+    def __init__(
+        self,
+        llm: LLMClient,
+        model: str,
+        temperature: float = 0.3,
+        queue: Queue | None = None,
+        session_id: str = "",
+        thread_id: str = "",
+    ):
+        super().__init__(llm, model)
+        self.temperature = temperature
+        self.queue = queue
+        self.session_id = session_id
+        self.thread_id = thread_id
 
-def run_coordinator(
-    llm: LLMClient,
-    model: str,
-    seed_question: str,
-    motivation: str,
-    entry_point: str,
-    schema_summary: str,
-    thread_history: str,
-    temperature: float = 0.3,
-    queue: Queue | None = None,
-    session_id: str = "",
-    thread_id: str = "",
-) -> tuple[CoordinatorDecision, dict]:
-    """Run one coordinator step and return (decision, llm_call_log)."""
-    prompt = SYSTEM_PROMPT.format(
-        seed_question=seed_question,
-        motivation=motivation,
-        entry_point=entry_point,
-        schema_summary=schema_summary,
-        thread_history=thread_history,
-    )
+    @property
+    def role(self) -> str:
+        return "coordinator"
 
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": "Based on the thread history, decide your next move."},
-    ]
-
-    t0 = time.monotonic()
-    response = llm.call(
-        model=model,
-        messages=messages,
-        role="coordinator",
-        temperature=temperature,
-    )
-    call_ms = round((time.monotonic() - t0) * 1000)
-
-    if queue:
-        queue.emit(StreamEvent(
-            session_id=session_id, thread_id=thread_id,
-            event_type="llm_call",
-            message=f"Coordinator deciding next move ({call_ms}ms)",
-            data={"role": "coordinator", "model": model,
-                  "input_tokens": response.input_tokens,
-                  "output_tokens": response.output_tokens,
-                  "duration_ms": call_ms},
-        ))
-
-    if not response.content or not response.content.strip():
-        logger.warning("Coordinator returned empty response, retrying once")
-        response = llm.call(
-            model=model,
-            messages=messages,
-            role="coordinator",
-            temperature=temperature,
+    def call(
+        self,
+        seed_question: str,
+        motivation: str,
+        entry_point: str,
+        schema_summary: str,
+        thread_history: str,
+    ) -> tuple[CoordinatorDecision, dict]:
+        """Run one coordinator step and return (decision, llm_call_log)."""
+        prompt = self.SYSTEM_PROMPT.format(
+            seed_question=seed_question,
+            motivation=motivation,
+            entry_point=entry_point,
+            schema_summary=schema_summary,
+            thread_history=thread_history,
         )
+
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "Based on the thread history, decide your next move."},
+        ]
+
+        t0 = time.monotonic()
+        response = self.llm.call(
+            model=self.model,
+            messages=messages,
+            role=self.role,
+            temperature=self.temperature,
+        )
+        call_ms = round((time.monotonic() - t0) * 1000)
+
+        if self.queue:
+            self.queue.emit(StreamEvent(
+                session_id=self.session_id, thread_id=self.thread_id,
+                event_type="llm_call",
+                message=f"Coordinator deciding next move ({call_ms}ms)",
+                data={"role": self.role, "model": self.model,
+                      "input_tokens": response.input_tokens,
+                      "output_tokens": response.output_tokens,
+                      "duration_ms": call_ms},
+            ))
+
         if not response.content or not response.content.strip():
-            raise ValueError("Coordinator returned empty response twice")
+            logger.warning("Coordinator returned empty response, retrying once")
+            response = self.llm.call(
+                model=self.model,
+                messages=messages,
+                role=self.role,
+                temperature=self.temperature,
+            )
+            if not response.content or not response.content.strip():
+                raise ValueError("Coordinator returned empty response twice")
 
-    decision = parse_coordinator_response(response.content)
+        # Parse with retry on JSON errors
+        try:
+            decision = parse_coordinator_response(response.content)
+        except (ValueError, json.JSONDecodeError):
+            logger.warning("Coordinator returned non-JSON response, retrying with nudge")
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({
+                "role": "user",
+                "content": "Your response must be valid JSON matching the format specified. Please reformat your answer as JSON.",
+            })
+            response = self.llm.call(
+                model=self.model,
+                messages=messages,
+                role=self.role,
+                temperature=self.temperature,
+            )
+            decision = parse_coordinator_response(response.content)
 
-    # Validate consistency
-    if decision.status == CoordinatorStatus.DONE and decision.next_move != MoveType.SYNTHESIZE:
-        logger.warning("Coordinator returned DONE without SYNTHESIZE — correcting")
-        decision.next_move = MoveType.SYNTHESIZE
+        # Validate consistency
+        if decision.status == CoordinatorStatus.DONE and decision.next_move != MoveType.SYNTHESIZE:
+            logger.warning("Coordinator returned DONE without SYNTHESIZE — correcting")
+            decision.next_move = MoveType.SYNTHESIZE
 
-    if decision.status == CoordinatorStatus.STUCK and not decision.question_for_human:
-        logger.warning("Coordinator returned STUCK without question — adding default")
-        decision.question_for_human = "I need guidance on how to proceed with this analysis."
+        if decision.status == CoordinatorStatus.STUCK and not decision.question_for_human:
+            logger.warning("Coordinator returned STUCK without question — adding default")
+            decision.question_for_human = "I need guidance on how to proceed with this analysis."
 
-    llm_log = {
-        "agent": "coordinator",
-        "model": response.model,
-        "input_tokens": response.input_tokens,
-        "output_tokens": response.output_tokens,
-        "response": response.content[:500] if response.content else "",
-    }
+        llm_log = {
+            "agent": self.role,
+            "model": response.model,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "response": response.content[:500] if response.content else "",
+        }
 
-    return decision, llm_log
+        return decision, llm_log

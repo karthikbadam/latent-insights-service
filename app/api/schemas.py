@@ -14,6 +14,18 @@ class PostMessageRequest(BaseModel):
     content: str = Field(min_length=1)
 
 
+class StepEvent(BaseModel):
+    type: str
+    timestamp: float
+    agent: str | None = None
+    model: str | None = None
+    duration_ms: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    sql: str | None = None
+    tool_result: str | None = None
+
+
 class StepResponse(BaseModel):
     step_number: int
     move: str
@@ -21,6 +33,7 @@ class StepResponse(BaseModel):
     result: str
     view_created: str | None = None
     duration_ms: int | None = None
+    events: list[StepEvent] = []
 
 
 class ThreadResponse(BaseModel):
