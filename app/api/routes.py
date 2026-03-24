@@ -153,6 +153,17 @@ def create_session(
     }
 
 
+@router.get("/sessions/{session_id}/saved")
+def get_saved_session(session_id: str):
+    """Return a previously saved session from data/sessions/."""
+    from app.main import config as app_config
+    stored = os.path.join(app_config.data_dir, "sessions", f"{session_id}.json")
+    if not os.path.exists(stored):
+        raise HTTPException(status_code=404, detail="Saved session not found")
+    with open(stored) as f:
+        return json_mod.load(f)
+
+
 @router.get("/sessions/{session_id}")
 def get_session(session_id: str, request: Request):
     """Get full session state with threads and steps."""
