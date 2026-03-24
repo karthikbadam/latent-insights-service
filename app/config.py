@@ -17,9 +17,9 @@ PROVIDER_DEFAULTS = {
         "models": {
             "profiler": "google/gemini-2.5-flash",
             "scout": "google/gemini-2.5-flash",
-            "coordinator": "openai/gpt-oss-20b",
-            "worker": "openai/gpt-oss-20b",
-            "worker_fallback": "openai/gpt-oss-20b",
+            "coordinator": "openai/gpt-oss-20b:nitro",
+            "worker": "openai/gpt-oss-20b:nitro",
+            "worker_fallback": "openai/gpt-oss-20b:nitro",
         },
     },
     "ollama": {
