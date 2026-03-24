@@ -1,24 +1,28 @@
 """
 Worker agent — executes one analytical step via SQL.
 
-Stateless. Receives instruction, generates and executes SQL via tool use, summarizes.
+Manages its own message history, retry logic, tool-use loop, and event emission.
 Works with any dataset — no domain-specific assumptions.
 """
 
 import json
 import logging
+import re
 import time
 
-from openai import APITimeoutError
-
+from app.agents.base import Agent
 from app.core.llm import LLMClient
-from app.core.parsing import parse_worker_response
+from app.core.parsing import detect_degeneration, parse_worker_response
 from app.core.queue import Queue
 from app.models import StreamEvent, WorkerResult
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """\
+
+class Worker(Agent):
+    """Executes analytical steps via SQL tool-use loop."""
+
+    SYSTEM_PROMPT = """\
 You are a data analysis worker. You receive an analytical instruction
 and execute it against a DuckDB database using SQL.
 
@@ -64,167 +68,187 @@ anything not built into standard SQL must be computed manually.
 ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expressions.
 """
 
-RUN_SQL_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "run_sql",
-        "description": (
-            "Execute a read-only SQL query against the DuckDB database. "
-            "Returns column names and all result rows."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sql": {
-                    "type": "string",
-                    "description": "The SQL query to execute (DuckDB dialect)",
-                }
+    RUN_SQL_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "run_sql",
+            "description": (
+                "Execute a read-only SQL query against the DuckDB database. "
+                "Returns column names and all result rows."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "The SQL query to execute (DuckDB dialect)",
+                    }
+                },
+                "required": ["sql"],
             },
-            "required": ["sql"],
         },
-    },
-}
+    }
 
+    def __init__(
+        self,
+        llm: LLMClient,
+        model: str,
+        fallback_model: str,
+        schema_summary: str,
+        session_db,
+        config,
+        queue: Queue,
+        session_id: str,
+        thread_id: str,
+    ):
+        super().__init__(llm, model)
+        self.fallback_model = fallback_model
+        self.schema_summary = schema_summary
+        self.session_db = session_db
+        self.config = config
+        self.queue = queue
+        self.session_id = session_id
+        self.thread_id = thread_id
 
-def _format_results(col_names: list[str], rows: list) -> str:
-    """Format query results as a readable table string."""
-    if not rows:
-        return "(no rows returned)"
-    header = " | ".join(col_names)
-    lines = [header, "-" * len(header)]
-    for row in rows:
-        lines.append(" | ".join(str(v) for v in row))
-    return "\n".join(lines)
+        # Per-step state (reset in start())
+        self.messages: list[dict] = []
+        self.instruction: str = ""
+        self.current_model: str = model
+        self.consecutive_errors: int = 0
+        self.attempts: int = 0
+        self.llm_calls: list[dict] = []
 
+    @property
+    def role(self) -> str:
+        return "worker"
 
-def _execute_sql(session_db, sql: str) -> str:
-    """Execute SQL against session DB and return formatted results."""
-    try:
-        result = session_db.execute(sql)
-        rows = result.fetchall()
-        description = result.description
-        col_names = [d[0] for d in description] if description else []
-        return _format_results(col_names, rows)
-    except Exception as e:
-        return f"SQL ERROR: {e}"
+    def start(self, instruction: str, thread_views: str = "(none)"):
+        """Initialize worker state for a new step."""
+        self.instruction = instruction
+        self.current_model = self.model
+        self.consecutive_errors = 0
+        self.attempts = 0
+        self.llm_calls = []
 
+        prompt = self.SYSTEM_PROMPT.format(
+            schema_summary=self.schema_summary,
+            thread_views=thread_views,
+            worker_instruction=instruction,
+        )
+        self.messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "Execute this analysis and return results."},
+        ]
 
-def run_worker(
-    llm: LLMClient,
-    model: str,
-    fallback_model: str,
-    worker_instruction: str,
-    schema_summary: str,
-    session_db,
-    thread_views: str = "(none)",
-    max_retries: int = 3,
-    max_consecutive_errors: int = 5,
-    timeout: float = 120.0,
-    queue: Queue | None = None,
-    session_id: str = "",
-    thread_id: str = "",
-) -> WorkerResult:
-    """
-    Run one worker step using tool-use loop.
+    def call(self) -> tuple:
+        """Single LLM call. Returns (response, call_ms). Raises APITimeoutError on timeout."""
+        self.attempts += 1
+        if self.attempts > 50:
+            raise ValueError("Worker exceeded 50 LLM turns without producing a result")
 
-    The LLM calls run_sql to execute queries against the session DB,
-    then returns a final JSON response with summary and findings.
-    """
-    prompt = SYSTEM_PROMPT.format(
-        schema_summary=schema_summary,
-        thread_views=thread_views,
-        worker_instruction=worker_instruction,
-    )
-
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": "Execute this analysis and return results."},
-    ]
-
-    current_model = model
-    attempts = 0
-    consecutive_errors = 0
-    max_turns = 50
-    llm_calls = []
-
-    while True:
-        attempts += 1
-        if attempts > max_turns:
-            raise ValueError(f"Worker exceeded {max_turns} LLM turns without producing a result")
-        if consecutive_errors >= max_retries:
-            current_model = fallback_model
+        if self.consecutive_errors >= self.config.max_worker_retries:
+            self.current_model = self.fallback_model
 
         t0 = time.monotonic()
-        try:
-            response = llm.call(
-                model=current_model,
-                messages=messages,
-                role="worker",
-                temperature=0.0,
-                tools=[RUN_SQL_TOOL],
-                timeout=timeout,
-            )
-        except APITimeoutError:
-            call_ms = round((time.monotonic() - t0) * 1000)
-            logger.warning(f"Worker LLM call timed out after {call_ms}ms")
-            consecutive_errors += 1
-            messages.append({
-                "role": "user",
-                "content": "Your previous response timed out. Simplify your approach and respond more concisely.",
-            })
-            continue
+        response = self.llm.call(
+            model=self.current_model,
+            messages=self.messages,
+            role=self.role,
+            temperature=0.0,
+            tools=[self.RUN_SQL_TOOL],
+            timeout=self.config.llm_timeout,
+        )
         call_ms = round((time.monotonic() - t0) * 1000)
 
-        if queue:
-            has_tools = bool(response.tool_calls)
-            queue.emit(StreamEvent(
-                session_id=session_id, thread_id=thread_id,
-                event_type="llm_call",
-                message=f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)",
-                data={"role": "worker", "model": current_model,
-                      "input_tokens": response.input_tokens,
-                      "output_tokens": response.output_tokens,
-                      "duration_ms": call_ms, "has_tool_calls": has_tools},
-            ))
-
-        # If no tool calls, LLM returned its final answer
-        if not response.tool_calls:
-            llm_calls.append({
-                "agent": "worker",
-                "type": "response",
-                "duration_ms": call_ms,
-                "model": response.model,
+        has_tools = bool(response.tool_calls)
+        self.queue.emit(StreamEvent(
+            session_id=self.session_id,
+            thread_id=self.thread_id,
+            event_type="llm_call",
+            message=f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)",
+            data={
+                "role": self.role,
+                "model": self.current_model,
                 "input_tokens": response.input_tokens,
                 "output_tokens": response.output_tokens,
-                "response": response.content[:500] if response.content else "",
-            })
-            if not response.content or not response.content.strip():
-                logger.warning("Worker returned empty response, requesting JSON output")
-                messages.append({"role": "assistant", "content": response.content or ""})
-                messages.append({
-                    "role": "user",
-                    "content": "Your response was empty. Please provide your final answer as JSON matching the output format specified in the system prompt.",
-                })
-                continue
-            try:
-                result = parse_worker_response(response.content)
-            except ValueError:
-                # LLM returned text instead of JSON — ask it to reformat
-                logger.warning("Worker returned non-JSON response, requesting reformat")
-                messages.append({"role": "assistant", "content": response.content})
-                messages.append({
-                    "role": "user",
-                    "content": "Your response must be valid JSON matching the output format specified in the system prompt. Please reformat your answer as JSON.",
-                })
-                continue
-            result.llm_calls = llm_calls
-            return result
+                "duration_ms": call_ms,
+                "has_tool_calls": has_tools,
+            },
+        ))
 
-        # Process tool calls
-        # Append the assistant message with tool calls
+        return response, call_ms
+
+    def handle_timeout(self):
+        """Handle an APITimeoutError by appending a retry message."""
+        self.consecutive_errors += 1
+        self.messages.append({
+            "role": "user",
+            "content": "Your previous response timed out. Simplify your approach and respond more concisely.",
+        })
+
+    def handle_response(self, response, call_ms: int) -> WorkerResult | None:
+        """Process worker LLM response. Returns WorkerResult when done, None if another call needed."""
+        if response.tool_calls:
+            return self._handle_tool_calls(response, call_ms)
+        return self._handle_final(response, call_ms)
+
+    def _handle_final(self, response, call_ms: int) -> WorkerResult | None:
+        """Worker returned a final text response (no tool calls)."""
+        self.llm_calls.append({
+            "agent": self.role,
+            "type": "response",
+            "duration_ms": call_ms,
+            "model": response.model,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "response": response.content if response.content else "",
+        })
+
+        if not response.content or not response.content.strip():
+            logger.warning("Worker returned empty response, requesting JSON output")
+            self.messages.append({"role": "assistant", "content": response.content or ""})
+            self.messages.append({
+                "role": "user",
+                "content": "Your response was empty. Please provide your final answer as JSON matching the output format specified in the system prompt.",
+            })
+            return None
+
+        if detect_degeneration(response.content):
+            logger.warning(f"Worker output degeneration detected for thread {self.thread_id}")
+            self.messages.append({"role": "assistant", "content": response.content})
+            self.messages.append({
+                "role": "user",
+                "content": "Your output contained repeated/degenerate text. Please provide a concise, clean JSON response with your findings so far.",
+            })
+            return None
+
+        # Check if response looks like it's attempting JSON (contains { })
+        has_json_block = bool(re.search(r"\{.*\}", response.content, re.DOTALL))
+
+        if has_json_block:
+            try:
+                worker_result = parse_worker_response(response.content)
+            except (ValueError, json.JSONDecodeError):
+                logger.warning("Worker returned malformed JSON, requesting reformat")
+                self.messages.append({"role": "assistant", "content": response.content})
+                self.messages.append({
+                    "role": "user",
+                    "content": "Your response contained JSON but it was malformed. Please reformat as valid JSON matching the output format.",
+                })
+                return None
+            worker_result.llm_calls = self.llm_calls
+            return worker_result
+        else:
+            # Intermediate reasoning — no JSON, just thinking. Continue the loop.
+            logger.info(f"Worker intermediate reasoning ({len(response.content)} chars)")
+            self.messages.append({"role": "assistant", "content": response.content})
+            return None
+
+    def _handle_tool_calls(self, response, call_ms: int) -> None:
+        """Worker wants to execute SQL tools. Always returns None (needs another call)."""
         assistant_msg = {"role": "assistant", "content": response.content or None}
         assistant_msg["tool_calls"] = response.tool_calls
-        messages.append(assistant_msg)
+        self.messages.append(assistant_msg)
 
         tool_results = []
         for tool_call in response.tool_calls:
@@ -234,36 +258,36 @@ def run_worker(
                 sql = args.get("sql", "")
                 logger.info(f"Worker executing SQL: {sql[:200]}")
                 t_sql = time.monotonic()
-                result_text = _execute_sql(session_db, sql)
+                result_text = self.execute_sql(self.session_db, sql)
                 sql_ms = round((time.monotonic() - t_sql) * 1000)
 
-                if queue:
-                    queue.emit(StreamEvent(
-                        session_id=session_id, thread_id=thread_id,
-                        event_type="tool_call",
-                        message=sql,
-                        data={"sql": sql, "result": result_text, "duration_ms": sql_ms},
-                    ))
-                messages.append({
+                self.queue.emit(StreamEvent(
+                    session_id=self.session_id,
+                    thread_id=self.thread_id,
+                    event_type="tool_call",
+                    message=sql,
+                    data={"sql": sql, "result": result_text, "duration_ms": sql_ms},
+                ))
+                self.messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": result_text,
                 })
-                tool_results.append({"sql": sql, "result": result_text[:1000]})
+                tool_results.append({"sql": sql, "result": result_text})
                 if result_text.startswith("SQL ERROR:"):
-                    consecutive_errors += 1
+                    self.consecutive_errors += 1
                 else:
-                    consecutive_errors = 0
+                    self.consecutive_errors = 0
             else:
-                messages.append({
+                self.messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
                     "content": f"Unknown tool: {func['name']}",
                 })
 
         for tr in tool_results:
-            llm_calls.append({
-                "agent": "worker",
+            self.llm_calls.append({
+                "agent": self.role,
                 "type": "tool_call",
                 "duration_ms": call_ms,
                 "model": response.model,
@@ -273,24 +297,49 @@ def run_worker(
                 "tool_result": tr["result"],
             })
 
-        # Inject guidance when the worker keeps hitting SQL errors
-        if consecutive_errors >= max_consecutive_errors:
-            messages.append({
+        # Error guardrails
+        if self.consecutive_errors >= self.config.max_consecutive_errors:
+            self.messages.append({
                 "role": "user",
                 "content": (
-                    f"You have hit {consecutive_errors} consecutive SQL errors. "
+                    f"You have hit {self.consecutive_errors} consecutive SQL errors. "
                     "Stop trying SQL and return your final JSON answer NOW "
                     "with whatever findings you have so far. If you have no findings, "
                     "state that the analysis could not be completed and explain why."
                 ),
             })
-        elif consecutive_errors >= 2:
-            messages.append({
+        elif self.consecutive_errors >= 2:
+            self.messages.append({
                 "role": "user",
                 "content": (
-                    f"You have hit {consecutive_errors} consecutive SQL errors. "
+                    f"You have hit {self.consecutive_errors} consecutive SQL errors. "
                     "The function you are trying likely does not exist in DuckDB. "
                     "STOP retrying the same approach. Rewrite your analysis using "
                     "only basic SQL math and aggregates (AVG, STDDEV_POP, CORR, etc)."
                 ),
             })
+
+        return None
+
+    @staticmethod
+    def format_results(col_names: list[str], rows: list) -> str:
+        """Format query results as a readable table string."""
+        if not rows:
+            return "(no rows returned)"
+        header = " | ".join(col_names)
+        lines = [header, "-" * len(header)]
+        for row in rows:
+            lines.append(" | ".join(str(v) for v in row))
+        return "\n".join(lines)
+
+    @staticmethod
+    def execute_sql(session_db, sql: str) -> str:
+        """Execute SQL against session DB and return formatted results."""
+        try:
+            result = session_db.execute(sql)
+            rows = result.fetchall()
+            description = result.description
+            col_names = [d[0] for d in description] if description else []
+            return Worker.format_results(col_names, rows)
+        except Exception as e:
+            return f"SQL ERROR: {e}"

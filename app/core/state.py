@@ -40,6 +40,9 @@ class StateStore:
     def get_session(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
+    def get_all_sessions(self) -> list[Session]:
+        return list(self._sessions.values())
+
     def update_session_table_name(self, session_id: str, table_name: str):
         session = self._sessions.get(session_id)
         if session:

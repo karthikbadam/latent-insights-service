@@ -7,11 +7,16 @@ Works with any dataset — no domain-specific assumptions.
 
 import logging
 
+from app.agents.base import Agent
 from app.core.llm import LLMClient
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """\
+
+class Profiler(Agent):
+    """Examines a dataset and produces a concise schema summary."""
+
+    SYSTEM_PROMPT = """\
 You are a dataset profiler. Examine a dataset and produce a concise
 schema summary that other analysts will use as their reference.
 
@@ -38,133 +43,131 @@ Where <summary> is:
 that an analyst should know. Be precise. No filler.
 """
 
-NUMERIC_TYPES = frozenset({
-    "BIGINT", "INTEGER", "SMALLINT", "TINYINT", "HUGEINT",
-    "DOUBLE", "FLOAT", "DECIMAL", "REAL", "NUMERIC",
-    "UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT",
-})
+    NUMERIC_TYPES = frozenset({
+        "BIGINT", "INTEGER", "SMALLINT", "TINYINT", "HUGEINT",
+        "DOUBLE", "FLOAT", "DECIMAL", "REAL", "NUMERIC",
+        "UBIGINT", "UINTEGER", "USMALLINT", "UTINYINT",
+    })
 
+    def __init__(self, llm: LLMClient, model: str):
+        super().__init__(llm, model)
 
-def _is_numeric(col_type: str) -> bool:
-    base = col_type.split("(")[0].upper().strip()
-    return base in NUMERIC_TYPES
+    @property
+    def role(self) -> str:
+        return "profiler"
 
+    def call(self, session_db, table_name: str = "dataset") -> str:
+        """Run profiler and return schema summary as markdown string."""
+        info, row_count, column_stats = self._gather_schema_info(session_db, table_name)
+        col_count = len(info)
 
-def _gather_column_stats(session_db, table_name: str, columns_info: list) -> str:
-    """Run SQL to gather per-column statistics. Works on any dataset."""
-    tbl = f'"{table_name}"'
-    row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-    if row_count == 0:
-        return "(empty dataset)"
+        messages = [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "user", "content": (
+                f"The table is named `{table_name}` and has {row_count} rows and {col_count} columns.\n\n"
+                f"Here are the detailed column statistics I've gathered:\n\n{column_stats}\n\n"
+                "Using these stats, produce the schema summary in the format specified. "
+                "Add your observations in the Notable Patterns section."
+            )},
+        ]
 
-    stats_parts = []
+        response = self.llm.call(
+            model=self.model,
+            messages=messages,
+            role=self.role,
+            temperature=0.0,
+        )
 
-    for col_name, col_type, *_ in columns_info:
-        try:
-            non_null = session_db.execute(
-                f'SELECT COUNT("{col_name}") FROM {tbl}'
-            ).fetchone()[0]
-            null_pct = ((row_count - non_null) / row_count) * 100
+        if response.content.strip():
+            return response.content
 
-            if _is_numeric(col_type):
-                if non_null == 0:
-                    summary = "all NULL"
-                else:
-                    stats = session_db.execute(f"""
-                        SELECT MIN("{col_name}"), MAX("{col_name}"),
-                               AVG("{col_name}"), MEDIAN("{col_name}"),
-                               STDDEV("{col_name}")
-                        FROM {tbl} WHERE "{col_name}" IS NOT NULL
-                    """).fetchone()
-                    parts = []
-                    parts.append(f"min={stats[0]}")
-                    parts.append(f"max={stats[1]}")
-                    if stats[2] is not None:
-                        parts.append(f"mean={stats[2]:.4g}")
-                    if stats[3] is not None:
-                        parts.append(f"median={stats[3]}")
-                    if stats[4] is not None:
-                        parts.append(f"stddev={stats[4]:.4g}")
-                    summary = ", ".join(parts)
-            else:
-                unique_count = session_db.execute(
-                    f'SELECT COUNT(DISTINCT "{col_name}") FROM {tbl} WHERE "{col_name}" IS NOT NULL'
+        logger.warning("Profiler LLM returned empty content, using raw column stats")
+        return (
+            f"## Dataset summary\n"
+            f"- **Table:** {table_name}\n"
+            f"- **Rows:** {row_count}\n"
+            f"- **Columns:** {col_count}\n\n"
+            f"## Column profiles\n{column_stats}"
+        )
+
+    def _gather_schema_info(self, session_db, table_name: str) -> tuple[list, int, str]:
+        """Gather all DB stats."""
+        tbl = f'"{table_name}"'
+        info = session_db.execute(f"DESCRIBE {tbl}").fetchall()
+        row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+        column_stats = self._gather_column_stats(session_db, table_name, info)
+        return info, row_count, column_stats
+
+    def _gather_column_stats(self, session_db, table_name: str, columns_info: list) -> str:
+        """Run SQL to gather per-column statistics. Works on any dataset."""
+        tbl = f'"{table_name}"'
+        row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+        if row_count == 0:
+            return "(empty dataset)"
+
+        stats_parts = []
+
+        for col_name, col_type, *_ in columns_info:
+            try:
+                non_null = session_db.execute(
+                    f'SELECT COUNT("{col_name}") FROM {tbl}'
                 ).fetchone()[0]
+                null_pct = ((row_count - non_null) / row_count) * 100
 
-                if unique_count == 0:
-                    summary = "all NULL"
-                elif unique_count <= 20:
-                    value_counts = session_db.execute(f"""
-                        SELECT "{col_name}", COUNT(*) as cnt
-                        FROM {tbl} WHERE "{col_name}" IS NOT NULL
-                        GROUP BY "{col_name}" ORDER BY cnt DESC
-                    """).fetchall()
-                    summary = "; ".join(f"{v}: {c}" for v, c in value_counts)
+                if self._is_numeric(col_type):
+                    if non_null == 0:
+                        summary = "all NULL"
+                    else:
+                        stats = session_db.execute(f"""
+                            SELECT MIN("{col_name}"), MAX("{col_name}"),
+                                   AVG("{col_name}"), MEDIAN("{col_name}"),
+                                   STDDEV("{col_name}")
+                            FROM {tbl} WHERE "{col_name}" IS NOT NULL
+                        """).fetchone()
+                        parts = []
+                        parts.append(f"min={stats[0]}")
+                        parts.append(f"max={stats[1]}")
+                        if stats[2] is not None:
+                            parts.append(f"mean={stats[2]:.4g}")
+                        if stats[3] is not None:
+                            parts.append(f"median={stats[3]}")
+                        if stats[4] is not None:
+                            parts.append(f"stddev={stats[4]:.4g}")
+                        summary = ", ".join(parts)
                 else:
-                    top = session_db.execute(f"""
-                        SELECT "{col_name}", COUNT(*) as cnt
-                        FROM {tbl} WHERE "{col_name}" IS NOT NULL
-                        GROUP BY "{col_name}" ORDER BY cnt DESC LIMIT 5
-                    """).fetchall()
-                    summary = f"{unique_count} unique. Top: " + "; ".join(
-                        f"{v}: {c}" for v, c in top
-                    )
+                    unique_count = session_db.execute(
+                        f'SELECT COUNT(DISTINCT "{col_name}") FROM {tbl} WHERE "{col_name}" IS NOT NULL'
+                    ).fetchone()[0]
 
-            stats_parts.append(
-                f"{col_name} | {col_type} | {non_null}/{row_count} ({100 - null_pct:.0f}%) | {summary}"
-            )
-        except Exception as e:
-            logger.warning(f"Stats failed for column {col_name}: {e}")
-            stats_parts.append(f"{col_name} | {col_type} | (stats unavailable: {e})")
+                    if unique_count == 0:
+                        summary = "all NULL"
+                    elif unique_count <= 20:
+                        value_counts = session_db.execute(f"""
+                            SELECT "{col_name}", COUNT(*) as cnt
+                            FROM {tbl} WHERE "{col_name}" IS NOT NULL
+                            GROUP BY "{col_name}" ORDER BY cnt DESC
+                        """).fetchall()
+                        summary = "; ".join(f"{v}: {c}" for v, c in value_counts)
+                    else:
+                        top = session_db.execute(f"""
+                            SELECT "{col_name}", COUNT(*) as cnt
+                            FROM {tbl} WHERE "{col_name}" IS NOT NULL
+                            GROUP BY "{col_name}" ORDER BY cnt DESC LIMIT 5
+                        """).fetchall()
+                        summary = f"{unique_count} unique. Top: " + "; ".join(
+                            f"{v}: {c}" for v, c in top
+                        )
 
-    return "\n".join(stats_parts)
+                stats_parts.append(
+                    f"{col_name} | {col_type} | {non_null}/{row_count} ({100 - null_pct:.0f}%) | {summary}"
+                )
+            except Exception as e:
+                logger.warning(f"Stats failed for column {col_name}: {e}")
+                stats_parts.append(f"{col_name} | {col_type} | (stats unavailable: {e})")
 
+        return "\n".join(stats_parts)
 
-def _gather_schema_info(session_db, table_name: str) -> tuple[list, int, str]:
-    """Gather all DB stats."""
-    tbl = f'"{table_name}"'
-    info = session_db.execute(f"DESCRIBE {tbl}").fetchall()
-    row_count = session_db.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
-    column_stats = _gather_column_stats(session_db, table_name, info)
-    return info, row_count, column_stats
-
-
-def run_profiler(
-    llm: LLMClient,
-    model: str,
-    session_db,
-    table_name: str = "dataset",
-) -> str:
-    """Run profiler and return schema summary as markdown string."""
-    info, row_count, column_stats = _gather_schema_info(session_db, table_name)
-    col_count = len(info)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": (
-            f"The table is named `{table_name}` and has {row_count} rows and {col_count} columns.\n\n"
-            f"Here are the detailed column statistics I've gathered:\n\n{column_stats}\n\n"
-            "Using these stats, produce the schema summary in the format specified. "
-            "Add your observations in the Notable Patterns section."
-        )},
-    ]
-
-    response = llm.call(
-        model=model,
-        messages=messages,
-        role="profiler",
-        temperature=0.0,
-    )
-
-    if response.content.strip():
-        return response.content
-
-    # LLM returned empty — fall back to raw stats
-    logger.warning("Profiler LLM returned empty content, using raw column stats")
-    return (
-        f"## Dataset summary\n"
-        f"- **Table:** {table_name}\n"
-        f"- **Rows:** {row_count}\n"
-        f"- **Columns:** {col_count}\n\n"
-        f"## Column profiles\n{column_stats}"
-    )
+    @classmethod
+    def _is_numeric(cls, col_type: str) -> bool:
+        base = col_type.split("(")[0].upper().strip()
+        return base in cls.NUMERIC_TYPES

@@ -96,15 +96,51 @@ The coordinator picks moves freely based on data — no fixed order.
 ## API
 
 
-| Endpoint                          | Description                                                   |
-| --------------------------------- | ------------------------------------------------------------- |
-| `GET /health`                     | Health check                                                  |
-| `POST /api/sessions`              | Create session (upload CSV + profile + scout + spawn threads) |
-| `GET /api/sessions/{id}`          | Full session state with threads and steps                     |
-| `POST /api/sessions/{id}/threads` | Create custom thread with a question                          |
-| `POST /api/threads/{id}/messages` | Reply to stuck thread, resuming it                            |
-| `GET /api/sessions/{id}/events`   | SSE event stream (llm_call, tool_call, step, complete)        |
-| `GET /api/system/stats`           | Session and thread counts                                     |
+| Endpoint                           | Description                                                   |
+| ---------------------------------- | ------------------------------------------------------------- |
+| `GET /health`                      | Health check                                                  |
+| `POST /api/sessions`               | Create session (upload CSV + profile + scout + spawn threads) |
+| `GET /api/sessions`                | List all sessions with metadata and thread counts             |
+| `GET /api/sessions/{id}`           | Full session state with threads and steps                     |
+| `POST /api/sessions/{id}/threads`  | Create custom thread with a question                          |
+| `POST /api/sessions/{id}/continue` | Resume stuck threads + scout new questions                    |
+| `GET /api/threads/{id}`            | Get single thread with steps and events                       |
+| `POST /api/threads/{id}/messages`  | Reply to stuck thread, resuming it                            |
+| `GET /api/sessions/{id}/events`    | SSE event stream (llm_call, tool_call, step, complete)        |
+| `GET /api/system/stats`            | Session and thread counts                                     |
+
+
+### Per-session config
+
+`POST /api/sessions` accepts optional per-session overrides via a `config` object. All fields are optional — omitted fields use server defaults from environment variables.
+
+```bash
+curl -X POST http://localhost:8000/api/sessions \
+  -F "file=@data/samples/cars.csv" \
+  -F 'config={"max_threads": 20, "num_scout_seed_questions": 12, "initial_questions": ["What is an interesting visual insight in this dataset?", "What factors most influence fuel efficiency?", "Are there regional differences in car specifications?"]}'
+```
+
+Available config fields:
+
+
+| Field                      | Type       | Description                               |
+| -------------------------- | ---------- | ----------------------------------------- |
+| `model_profiler`           | `string`   | Model for dataset profiling               |
+| `model_scout`              | `string`   | Model for question discovery              |
+| `model_coordinator`        | `string`   | Model for thread coordination             |
+| `model_worker`             | `string`   | Model for SQL analysis                    |
+| `model_worker_fallback`    | `string`   | Fallback model after worker retries       |
+| `temp_profiler`            | `float`    | Temperature for profiler                  |
+| `temp_scout`               | `float`    | Temperature for scout                     |
+| `temp_coordinator`         | `float`    | Temperature for coordinator               |
+| `temp_worker`              | `float`    | Temperature for worker                    |
+| `max_threads`              | `int`      | Cap on total threads spawned              |
+| `max_worker_retries`       | `int`      | Worker retries before fallback model      |
+| `max_consecutive_errors`   | `int`      | SQL errors before forcing summary         |
+| `max_repeated_moves`       | `int`      | Repeated coordinator moves before abort   |
+| `llm_timeout`              | `float`    | LLM call timeout in seconds               |
+| `num_scout_seed_questions` | `int`      | Number of questions scout should discover |
+| `initial_questions`        | `string[]` | Seed questions to start alongside scout   |
 
 
 ## Docs

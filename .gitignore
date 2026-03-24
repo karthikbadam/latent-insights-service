@@ -1,9 +1,12 @@
 __pycache__/
 *.pyc
 .env
-data/
-*.duckdb
-*.duckdb.wal
+data/samples
+data/traces
+data/state
+data/uploads
+data/*.duckdb
+data/*.duckdb.wal
 .venv/
 .ruff_cache/
 .pytest_cache/

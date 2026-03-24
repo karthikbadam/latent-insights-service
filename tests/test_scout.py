@@ -1,38 +1,47 @@
 """Tests for app.agents.scout — question discovery agent."""
 
 
-from app.agents.scout import _run_exploratory_queries, run_scout
+from app.agents.scout import Scout
 from app.models import ScoutOutput
 from tests.conftest import make_mock_llm
 
 
 def test_run_exploratory_queries_shape(session_db):
-    result = _run_exploratory_queries(session_db, "dataset")
+    mock = make_mock_llm("scout_response.json")
+    scout = Scout(llm=mock, model="test")
+    result = scout._run_exploratory_queries(session_db, "dataset")
     assert "103 rows" in result
     assert "19 columns" in result
 
 
 def test_run_exploratory_queries_column_overview(session_db):
-    result = _run_exploratory_queries(session_db, "dataset")
+    mock = make_mock_llm("scout_response.json")
+    scout = Scout(llm=mock, model="test")
+    result = scout._run_exploratory_queries(session_db, "dataset")
     assert "pl_name" in result
     assert "discoverymethod" in result
 
 
 def test_run_exploratory_queries_distributions(session_db):
-    result = _run_exploratory_queries(session_db, "dataset")
+    mock = make_mock_llm("scout_response.json")
+    scout = Scout(llm=mock, model="test")
+    result = scout._run_exploratory_queries(session_db, "dataset")
     # discoverymethod has <15 distinct values — should show distribution
     assert "Transit" in result
 
 
 def test_run_exploratory_queries_numeric_stats(session_db):
-    result = _run_exploratory_queries(session_db, "dataset")
+    mock = make_mock_llm("scout_response.json")
+    scout = Scout(llm=mock, model="test")
+    result = scout._run_exploratory_queries(session_db, "dataset")
     assert "min=" in result
     assert "max=" in result
 
 
 def test_run_scout_basic(schema_summary):
     mock = make_mock_llm("scout_response.json")
-    result = run_scout(llm=mock, model="test", schema_summary=schema_summary)
+    scout = Scout(llm=mock, model="test")
+    result = scout.call(schema_summary=schema_summary)
 
     assert isinstance(result, ScoutOutput)
     assert len(result.exploration_notes) > 0
@@ -41,8 +50,9 @@ def test_run_scout_basic(schema_summary):
 
 def test_run_scout_with_session_db(session_db, schema_summary):
     mock = make_mock_llm("scout_response.json")
-    result = run_scout(
-        llm=mock, model="test", schema_summary=schema_summary, session_db=session_db,
+    scout = Scout(llm=mock, model="test")
+    result = scout.call(
+        schema_summary=schema_summary, session_db=session_db,
     )
 
     assert isinstance(result, ScoutOutput)
@@ -57,7 +67,8 @@ def test_run_scout_with_session_db(session_db, schema_summary):
 
 def test_run_scout_without_session_db(schema_summary):
     mock = make_mock_llm("scout_response.json")
-    result = run_scout(llm=mock, model="test", schema_summary=schema_summary)
+    scout = Scout(llm=mock, model="test")
+    result = scout.call(schema_summary=schema_summary)
 
     assert isinstance(result, ScoutOutput)
 
@@ -70,7 +81,8 @@ def test_run_scout_without_session_db(schema_summary):
 
 def test_scout_question_fields(schema_summary):
     mock = make_mock_llm("scout_response.json")
-    result = run_scout(llm=mock, model="test", schema_summary=schema_summary)
+    scout = Scout(llm=mock, model="test")
+    result = scout.call(schema_summary=schema_summary)
 
     for q in result.questions:
         assert q.question, "question must be non-empty"

@@ -5,593 +5,473 @@ as a future to the pool. Pool threads are released between steps so other
 analytical threads can make progress.
 """
 
-import json
 import logging
 import time
+from threading import Event
+from typing import Any
 
 from openai import APITimeoutError
 
-from app.agents.coordinator import run_coordinator
-from app.agents.worker import RUN_SQL_TOOL, SYSTEM_PROMPT as WORKER_SYSTEM_PROMPT, _execute_sql
-from app.core.parsing import detect_degeneration, parse_worker_response
+from app.agents.coordinator import Coordinator
+from app.agents.worker import Worker
+from app.config import AppConfig
+from app.core.llm import LLMClient
+from app.core.parsing import detect_degeneration
+from app.core.queue import Queue
+from app.core.state import StateStore
+from app.core.tracing import Span, TraceStore
 from app.models import (
+    CoordinatorDecision,
     CoordinatorStatus,
+    MoveType,
     StreamEvent,
+    Thread,
     ThreadStatus,
     WorkerResult,
 )
-from app.orchestration.context import ThreadContext
 
 logger = logging.getLogger(__name__)
 
 
-def _get_thread_views(session_db, thread_id: str) -> str:
-    """List existing views for this thread."""
-    try:
-        rows = session_db.execute("""
-            SELECT table_name FROM information_schema.tables
-            WHERE table_type = 'VIEW' AND table_name LIKE ?
-        """, [f"thread_{thread_id}_%"]).fetchall()
-        if rows:
-            return "\n".join(r[0] for r in rows)
-    except Exception:
-        pass
-    return "(none)"
+class ThreadRunner:
+    """Drives one analytical thread through its coordinator-worker lifecycle."""
 
+    def __init__(
+        self,
+        config: AppConfig,
+        llm: LLMClient,
+        session_db: Any,
+        queue: Queue,
+        state: StateStore,
+        trace_store: TraceStore,
+        thread: Thread,
+        schema_summary: str,
+        human_messages: list[str] | None = None,
+    ):
+        self.config = config
+        self.llm = llm
+        self.session_db = session_db
+        self.queue = queue
+        self.state = state
+        self.trace_store = trace_store
+        self.thread = thread
+        self.schema_summary = schema_summary
+        self.human_messages = human_messages or []
 
-# --- Public API ---
+        # Step state
+        self.step_number: int = 0
+        self.step_span: Span | None = None
+        self.step_start: float = 0.0
+        self.decision: CoordinatorDecision | None = None
+        self.coordinator_ms: int = 0
+        self.move_history: list[str] = []
+        self.thread_start: float = time.monotonic()
 
+        # Error tracking
+        self.error_count: int = 0
 
-def start_thread(ctx: ThreadContext):
-    """Kick off the thread state machine. Non-blocking — returns immediately."""
-    _start_step(ctx)
+        # Completion signaling
+        self.done_event: Event = Event()
 
+        # Agents
+        self.coordinator = Coordinator(
+            llm=llm,
+            model=config.models.coordinator,
+            temperature=config.temperatures.coordinator,
+            queue=queue,
+            session_id=thread.session_id,
+            thread_id=thread.id,
+        )
+        self.worker = Worker(
+            llm=llm,
+            model=config.models.worker,
+            fallback_model=config.models.worker_fallback,
+            schema_summary=schema_summary,
+            session_db=session_db,
+            config=config,
+            queue=queue,
+            session_id=thread.session_id,
+            thread_id=thread.id,
+        )
 
-def resume_thread(ctx: ThreadContext):
-    """Resume a stuck thread. Human messages should already be set on ctx."""
-    if not ctx.trace_store.get_spans(ctx.thread.id):
-        ctx.trace_store.load_trace(ctx.thread.id, ctx.thread.session_id)
+    @property
+    def tid(self) -> str:
+        return self.thread.id[:8]
 
-    ctx.state.update_thread_status(ctx.thread.id, ThreadStatus.RUNNING)
-    start_thread(ctx)
+    # --- Public API ---
 
+    def start(self):
+        """Kick off the thread state machine. Non-blocking — returns immediately."""
+        self._run_step()
 
-# --- State machine: coordinator ---
+    def resume(self, human_messages: list[str] | None = None):
+        """Resume a stuck thread. Human messages guide the next step."""
+        if human_messages:
+            self.human_messages = human_messages
 
+        if not self.trace_store.get_spans(self.thread.id):
+            self.trace_store.load_trace(self.thread.id, self.thread.session_id)
 
-def _start_step(ctx: ThreadContext):
-    """Begin a new coordinator-worker step by scheduling the coordinator call."""
-    ctx.step_number = len(ctx.trace_store.get_step_spans(ctx.thread.id)) + 1
-    ctx.step_start = time.monotonic()
-    ctx.step_span = ctx.trace_store.start_span(
-        trace_id=ctx.thread.id,
-        name=f"step_{ctx.step_number}",
-        kind="step",
-    )
+        self.state.update_thread_status(self.thread.id, ThreadStatus.RUNNING)
+        self.start()
 
-    # Emit thread_start on first step
-    if ctx.step_number == 1:
-        ctx.queue.emit(StreamEvent(
-            session_id=ctx.thread.session_id,
-            thread_id=ctx.thread.id,
-            event_type="thread_start",
-            message=ctx.thread.seed_question,
+    # --- State machine ---
+
+    def _run_step(self):
+        """Begin a new coordinator-worker step by scheduling the coordinator call."""
+        self.step_number = len(self.trace_store.get_step_spans(self.thread.id)) + 1
+        self.step_start = time.monotonic()
+        self.step_span = self.trace_store.start_span(
+            trace_id=self.thread.id,
+            name=f"step_{self.step_number}",
+            kind="step",
+        )
+
+        if self.step_number == 1:
+            self.queue.emit(StreamEvent(
+                session_id=self.thread.session_id,
+                thread_id=self.thread.id,
+                event_type="thread_start",
+                message=self.thread.seed_question,
+                data={
+                    "seed_question": self.thread.seed_question,
+                    "motivation": self.thread.motivation,
+                    "entry_point": self.thread.entry_point,
+                },
+            ))
+
+        future = self.queue.schedule(
+            fn=self._coordinator_call,
+            args=(),
+            task_id=f"coord-{self.tid}-{self.step_number}",
+            session_id=self.thread.session_id,
+            thread_id=self.thread.id,
+            description=f"Coordinator step {self.step_number}: {self.thread.seed_question[:60]}",
+        )
+        future.add_done_callback(lambda f: self._safe_callback(self._on_coordinator_done, f))
+
+    def _coordinator_call(self):
+        """Run coordinator LLM call. Executes on pool thread."""
+        thread_history = self.trace_store.format_thread_history(
+            self.thread.id, self.human_messages, running_summary=self.thread.running_summary,
+        )
+        thread_views = self._get_thread_views()
+
+        t0 = time.monotonic()
+        decision, log = self.coordinator.call(
+            seed_question=self.thread.seed_question,
+            motivation=self.thread.motivation,
+            entry_point=self.thread.entry_point,
+            schema_summary=self.schema_summary,
+            thread_history=thread_history,
+        )
+        coordinator_ms = round((time.monotonic() - t0) * 1000)
+        log["duration_ms"] = coordinator_ms
+        return decision, log, coordinator_ms, thread_views
+
+    def _on_coordinator_done(self, future):
+        """Process coordinator result and schedule worker or finalize."""
+        decision, coord_log, coordinator_ms, thread_views = future.result()
+
+        self.decision = decision
+        self.coordinator_ms = coordinator_ms
+
+        self.trace_store.add_event(self.step_span, "llm_call", {
+            "agent": "coordinator",
+            "model": coord_log["model"],
+            "duration_ms": coordinator_ms,
+            "input_tokens": coord_log.get("input_tokens"),
+            "output_tokens": coord_log.get("output_tokens"),
+            "response": coord_log.get("response"),
+        })
+
+        logger.info(
+            f"Thread {self.thread.id} coordinator: {decision.status.value} "
+            f"-> {decision.next_move.value} ({coordinator_ms}ms)"
+        )
+
+        if decision.status == CoordinatorStatus.STUCK:
+            if self.step_number <= 2:
+                logger.warning(
+                    f"Thread {self.tid} STUCK on step {self.step_number} — overriding to FORAGE"
+                )
+                decision.status = CoordinatorStatus.CONTINUE
+                decision.next_move = MoveType.FORAGE
+                decision.worker_instruction = (
+                    f"Try a different exploratory approach to answer: {self.thread.seed_question}"
+                )
+            else:
+                self._finalize("stuck")
+                return
+
+        # Initialize worker for this step
+        self.worker.start(
+            instruction=decision.worker_instruction or "",
+            thread_views=thread_views,
+        )
+
+        self.queue.emit(StreamEvent(
+            session_id=self.thread.session_id,
+            thread_id=self.thread.id,
+            event_type="step_start",
+            message=decision.worker_instruction or "",
             data={
-                "seed_question": ctx.thread.seed_question,
-                "motivation": ctx.thread.motivation,
-                "entry_point": ctx.thread.entry_point,
+                "move": decision.next_move.value,
+                "step_number": self.step_number,
+                "instruction": decision.worker_instruction or "",
             },
         ))
 
-    future = ctx.queue.schedule(
-        fn=_coordinator_call,
-        args=(ctx,),
-        task_id=f"coord-{ctx.tid}-{ctx.step_number}",
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-        description=f"Coordinator step {ctx.step_number}: {ctx.thread.seed_question[:60]}",
-    )
-    future.add_done_callback(lambda f: _safe_callback(_handle_coordinator_done, ctx, f))
+        self._schedule_worker_call()
 
-
-def _coordinator_call(ctx: ThreadContext):
-    """Run coordinator LLM call. Executes on pool thread."""
-    thread_history = ctx.trace_store.format_thread_history(
-        ctx.thread.id, ctx.human_messages, running_summary=ctx.thread.running_summary,
-    )
-    ctx.thread_views = _get_thread_views(ctx.session_db, ctx.thread.id)
-
-    t0 = time.monotonic()
-    decision, log = run_coordinator(
-        llm=ctx.llm,
-        model=ctx.config.models.coordinator,
-        seed_question=ctx.thread.seed_question,
-        motivation=ctx.thread.motivation,
-        entry_point=ctx.thread.entry_point,
-        schema_summary=ctx.schema_summary,
-        thread_history=thread_history,
-        temperature=ctx.config.temperatures.coordinator,
-        queue=ctx.queue,
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-    )
-    coordinator_ms = round((time.monotonic() - t0) * 1000)
-    log["duration_ms"] = coordinator_ms
-    return decision, log, coordinator_ms
-
-
-def _handle_coordinator_done(ctx: ThreadContext, future):
-    """Process coordinator result and schedule worker or finalize."""
-    decision, coordinator_log, coordinator_ms = future.result()
-
-    ctx.decision = decision
-    ctx.coordinator_ms = coordinator_ms
-
-    ctx.trace_store.add_event(ctx.step_span, "coordinator", {
-        "model": ctx.config.models.coordinator,
-        "duration_ms": coordinator_ms,
-        "status": decision.status.value,
-        "next_move": decision.next_move.value,
-        "assessment": decision.assessment,
-        "rationale": decision.rationale,
-    })
-
-    logger.info(
-        f"Thread {ctx.thread.id} coordinator: {decision.status.value} "
-        f"-> {decision.next_move.value} ({coordinator_ms}ms)"
-    )
-
-    if decision.status == CoordinatorStatus.STUCK:
-        _finalize_stuck(ctx)
-        return
-
-    # Initialize worker state
-    ctx.worker_instruction = decision.worker_instruction or ""
-    ctx.current_model = ctx.config.models.worker
-    ctx.consecutive_errors = 0
-    ctx.attempts = 0
-    ctx.llm_calls = []
-
-    prompt = WORKER_SYSTEM_PROMPT.format(
-        schema_summary=ctx.schema_summary,
-        thread_views=ctx.thread_views,
-        worker_instruction=ctx.worker_instruction,
-    )
-    ctx.worker_messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": "Execute this analysis and return results."},
-    ]
-
-    ctx.queue.emit(StreamEvent(
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-        event_type="step_start",
-        message=ctx.worker_instruction,
-        data={
-            "move": decision.next_move.value,
-            "step_number": ctx.step_number,
-            "instruction": ctx.worker_instruction,
-        },
-    ))
-
-    _schedule_worker_call(ctx)
-
-
-# --- State machine: worker ---
-
-
-def _schedule_worker_call(ctx: ThreadContext):
-    """Submit the next worker LLM call as a future."""
-    future = ctx.queue.schedule(
-        fn=_worker_call,
-        args=(ctx,),
-        task_id=f"worker-{ctx.tid}-{ctx.step_number}-{ctx.attempts}",
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-        description=f"Worker call {ctx.attempts}: {ctx.worker_instruction[:60]}",
-    )
-    future.add_done_callback(lambda f: _safe_callback(_handle_worker_done, ctx, f))
-
-
-def _worker_call(ctx: ThreadContext):
-    """Single worker LLM call. Executes on pool thread."""
-    ctx.attempts += 1
-    if ctx.attempts > 50:
-        raise ValueError("Worker exceeded 50 LLM turns without producing a result")
-
-    if ctx.consecutive_errors >= ctx.config.max_worker_retries:
-        ctx.current_model = ctx.config.models.worker_fallback
-
-    t0 = time.monotonic()
-    response = ctx.llm.call(
-        model=ctx.current_model,
-        messages=ctx.worker_messages,
-        role="worker",
-        temperature=0.0,
-        tools=[RUN_SQL_TOOL],
-        timeout=ctx.config.llm_timeout,
-    )
-    call_ms = round((time.monotonic() - t0) * 1000)
-
-    has_tools = bool(response.tool_calls)
-    ctx.queue.emit(StreamEvent(
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-        event_type="llm_call",
-        message=f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)",
-        data={
-            "role": "worker",
-            "model": ctx.current_model,
-            "input_tokens": response.input_tokens,
-            "output_tokens": response.output_tokens,
-            "duration_ms": call_ms,
-            "has_tool_calls": has_tools,
-        },
-    ))
-
-    return response, call_ms
-
-
-def _handle_worker_done(ctx: ThreadContext, future):
-    """Process worker LLM response — tool calls or final answer."""
-    try:
-        response, call_ms = future.result()
-    except APITimeoutError:
-        logger.warning(f"Worker LLM call timed out for thread {ctx.thread.id}")
-        ctx.consecutive_errors += 1
-        ctx.worker_messages.append({
-            "role": "user",
-            "content": "Your previous response timed out. Simplify your approach and respond more concisely.",
-        })
-        _schedule_worker_call(ctx)
-        return
-
-    if not response.tool_calls:
-        _handle_worker_final(ctx, response, call_ms)
-    else:
-        _handle_worker_tool_calls(ctx, response, call_ms)
-
-
-def _handle_worker_final(ctx: ThreadContext, response, call_ms: int):
-    """Worker returned a final text response (no tool calls)."""
-    ctx.llm_calls.append({
-        "agent": "worker",
-        "type": "response",
-        "duration_ms": call_ms,
-        "model": response.model,
-        "input_tokens": response.input_tokens,
-        "output_tokens": response.output_tokens,
-        "response": response.content if response.content else "",
-    })
-
-    if not response.content or not response.content.strip():
-        logger.warning("Worker returned empty response, requesting JSON output")
-        ctx.worker_messages.append({"role": "assistant", "content": response.content or ""})
-        ctx.worker_messages.append({
-            "role": "user",
-            "content": "Your response was empty. Please provide your final answer as JSON matching the output format specified in the system prompt.",
-        })
-        _schedule_worker_call(ctx)
-        return
-
-    # Check for LLM degeneration (token loops like "pull pull pull...")
-    if detect_degeneration(response.content):
-        logger.warning(f"Worker output degeneration detected for thread {ctx.thread.id}")
-        ctx.worker_messages.append({"role": "assistant", "content": response.content})
-        ctx.worker_messages.append({
-            "role": "user",
-            "content": "Your output contained repeated/degenerate text. Please provide a concise, clean JSON response with your findings so far.",
-        })
-        _schedule_worker_call(ctx)
-        return
-
-    try:
-        worker_result = parse_worker_response(response.content)
-    except (ValueError, json.JSONDecodeError):
-        logger.warning("Worker returned non-JSON response, requesting reformat")
-        ctx.worker_messages.append({"role": "assistant", "content": response.content})
-        ctx.worker_messages.append({
-            "role": "user",
-            "content": "Your response must be valid JSON matching the output format specified in the system prompt. Please reformat your answer as JSON.",
-        })
-        _schedule_worker_call(ctx)
-        return
-
-    worker_result.llm_calls = ctx.llm_calls
-    _complete_step(ctx, worker_result)
-
-
-def _handle_worker_tool_calls(ctx: ThreadContext, response, call_ms: int):
-    """Worker wants to execute SQL tools — run inline (fast) then schedule next call."""
-    assistant_msg = {"role": "assistant", "content": response.content or None}
-    assistant_msg["tool_calls"] = response.tool_calls
-    ctx.worker_messages.append(assistant_msg)
-
-    tool_results = []
-    for tool_call in response.tool_calls:
-        func = tool_call["function"]
-        if func["name"] == "run_sql":
-            args = json.loads(func["arguments"])
-            sql = args.get("sql", "")
-            logger.info(f"Worker executing SQL: {sql[:200]}")
-            t_sql = time.monotonic()
-            result_text = _execute_sql(ctx.session_db, sql)
-            sql_ms = round((time.monotonic() - t_sql) * 1000)
-
-            ctx.queue.emit(StreamEvent(
-                session_id=ctx.thread.session_id,
-                thread_id=ctx.thread.id,
-                event_type="tool_call",
-                message=sql,
-                data={"sql": sql, "result": result_text, "duration_ms": sql_ms},
-            ))
-            ctx.worker_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "content": result_text,
-            })
-            tool_results.append({"sql": sql, "result": result_text[:1000]})
-            if result_text.startswith("SQL ERROR:"):
-                ctx.consecutive_errors += 1
-            else:
-                ctx.consecutive_errors = 0
-        else:
-            ctx.worker_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "content": f"Unknown tool: {func['name']}",
-            })
-
-    for tr in tool_results:
-        ctx.llm_calls.append({
-            "agent": "worker",
-            "type": "tool_call",
-            "duration_ms": call_ms,
-            "model": response.model,
-            "input_tokens": response.input_tokens,
-            "output_tokens": response.output_tokens,
-            "sql": tr["sql"],
-            "tool_result": tr["result"],
-        })
-
-    # Error guardrails
-    if ctx.consecutive_errors >= ctx.config.max_consecutive_errors:
-        ctx.worker_messages.append({
-            "role": "user",
-            "content": (
-                f"You have hit {ctx.consecutive_errors} consecutive SQL errors. "
-                "Stop trying SQL and return your final JSON answer NOW "
-                "with whatever findings you have so far. If you have no findings, "
-                "state that the analysis could not be completed and explain why."
-            ),
-        })
-    elif ctx.consecutive_errors >= 2:
-        ctx.worker_messages.append({
-            "role": "user",
-            "content": (
-                f"You have hit {ctx.consecutive_errors} consecutive SQL errors. "
-                "The function you are trying likely does not exist in DuckDB. "
-                "STOP retrying the same approach. Rewrite your analysis using "
-                "only basic SQL math and aggregates (AVG, STDDEV_POP, CORR, etc)."
-            ),
-        })
-
-    _schedule_worker_call(ctx)
-
-
-# --- Step completion and finalization ---
-
-
-def _complete_step(ctx: ThreadContext, worker_result: WorkerResult):
-    """A worker step finished. Record it and decide next action."""
-    step_ms = round((time.monotonic() - ctx.step_start) * 1000)
-    worker_ms = step_ms - ctx.coordinator_ms
-
-    ctx.trace_store.add_event(ctx.step_span, "worker", {
-        "model": ctx.config.models.worker,
-        "duration_ms": worker_ms,
-        "result_preview": worker_result.result[:200],
-    })
-    if worker_result.llm_calls:
-        for call in worker_result.llm_calls:
-            ctx.trace_store.add_event(ctx.step_span, "llm_call", call)
-
-    ctx.step_span.attributes.update({
-        "move": ctx.decision.next_move.value,
-        "instruction": ctx.decision.worker_instruction,
-        "result": worker_result.result,
-        "coordinator_ms": ctx.coordinator_ms,
-        "worker_ms": worker_ms,
-    })
-    ctx.trace_store.end_span(ctx.step_span)
-
-    logger.info(
-        f"Thread {ctx.thread.id} step {ctx.step_number} "
-        f"({ctx.decision.next_move.value}): "
-        f"coordinator={ctx.coordinator_ms}ms worker={worker_ms}ms "
-        f"total={step_ms}ms"
-    )
-
-    ctx.queue.emit(StreamEvent(
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-        event_type="step_complete",
-        message=worker_result.result,
-        data={
-            "step_number": ctx.step_number,
-            "move": ctx.decision.next_move.value,
-            "result": worker_result.result,
-        },
-    ))
-
-    if ctx.step_number > 1 and ctx.step_number % 5 == 0:
-        _maybe_summarize(ctx)
-
-    # Move repetition guard
-    ctx.move_history.append(ctx.decision.next_move.value)
-    max_same = ctx.config.max_repeated_moves
-    if (
-        len(ctx.move_history) >= max_same
-        and len(set(ctx.move_history[-max_same:])) == 1
-        and ctx.decision.status != CoordinatorStatus.DONE
-    ):
-        move_name = ctx.move_history[-1]
-        logger.warning(
-            f"Thread {ctx.thread.id} repeated {move_name} {max_same} times — forcing STUCK"
+    def _schedule_worker_call(self):
+        """Submit the next worker LLM call as a future."""
+        future = self.queue.schedule(
+            fn=self.worker.call,
+            args=(),
+            task_id=f"worker-{self.tid}-{self.step_number}-{self.worker.attempts}",
+            session_id=self.thread.session_id,
+            thread_id=self.thread.id,
+            description=f"Worker call {self.worker.attempts}: {self.worker.instruction[:60]}",
         )
-        ctx.decision.status = CoordinatorStatus.STUCK
-        ctx.decision.question_for_human = (
-            f"Thread has repeated {move_name} {max_same} times without progress. "
-            "What direction should the analysis take?"
-        )
-        ctx.decision.context = f"Last {max_same} moves: {', '.join(ctx.move_history[-max_same:])}"
-        _finalize_stuck(ctx)
-        return
+        future.add_done_callback(lambda f: self._safe_callback(self._on_worker_done, f))
 
-    if ctx.decision.status == CoordinatorStatus.DONE:
-        _finalize_complete(ctx, worker_result)
-    else:
-        ctx.human_messages = []
-        _start_step(ctx)
-
-
-def _finalize_complete(ctx: ThreadContext, worker_result: WorkerResult):
-    """Thread finished successfully."""
-    thread_elapsed = round(time.monotonic() - ctx.thread_start, 2)
-    logger.info(
-        f"Thread {ctx.thread.id} complete: "
-        f"{ctx.step_number} steps in {thread_elapsed}s"
-    )
-
-    ctx.trace_store.flush_to_file(ctx.thread.id, ctx.thread.session_id)
-    ctx.trace_store.clear_trace(ctx.thread.id)
-    ctx.state.update_thread_status(
-        ctx.thread.id, ThreadStatus.COMPLETE,
-        summary=worker_result.result,
-    )
-    ctx.state.dump_session(ctx.thread.session_id)
-
-    ctx.queue.emit(StreamEvent(
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-        event_type="thread_complete",
-        message=worker_result.result,
-        data={
-            "summary": worker_result.result,
-            "total_seconds": thread_elapsed,
-            "step_count": ctx.step_number,
-        },
-    ))
-
-    _cleanup(ctx)
-
-
-def _finalize_stuck(ctx: ThreadContext):
-    """Thread is stuck and needs human input."""
-    decision = ctx.decision
-    ctx.step_span.attributes.update({
-        "move": decision.next_move.value,
-        "instruction": decision.question_for_human or "",
-        "result": f"STUCK: {decision.context or ''}",
-    })
-    ctx.trace_store.end_span(ctx.step_span, status="stuck")
-
-    ctx.trace_store.flush_to_file(ctx.thread.id, ctx.thread.session_id)
-    ctx.trace_store.clear_trace(ctx.thread.id)
-    ctx.state.update_thread_status(ctx.thread.id, ThreadStatus.WAITING)
-    ctx.state.dump_session(ctx.thread.session_id)
-
-    ctx.queue.emit(StreamEvent(
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-        event_type="thread_waiting",
-        message=decision.question_for_human or "Thread needs guidance.",
-        data={
-            "question": decision.question_for_human,
-            "context": decision.context,
-        },
-    ))
-
-    _cleanup(ctx)
-
-
-def _finalize_error(ctx: ThreadContext, error: Exception):
-    """Thread hit an error — ask the human for help instead of dying."""
-    error_msg = f"{type(error).__name__}: {error}"
-    logger.error(
-        f"Thread {ctx.thread.id} error: {error_msg}",
-        exc_info=True,
-    )
-    try:
-        if ctx.step_span:
-            ctx.step_span.attributes.update({
-                "move": ctx.decision.next_move.value if ctx.decision else "ERROR",
-                "instruction": (ctx.decision.worker_instruction or "") if ctx.decision else "",
-                "result": f"Error: {error_msg}",
-                "error": error_msg,
-            })
-            ctx.trace_store.end_span(ctx.step_span, status="error")
-        ctx.trace_store.flush_to_file(ctx.thread.id, ctx.thread.session_id)
-        ctx.trace_store.clear_trace(ctx.thread.id)
-    except Exception:
-        pass
-
-    ctx.state.update_thread_status(ctx.thread.id, ThreadStatus.WAITING)
-    ctx.state.dump_session(ctx.thread.session_id)
-
-    ctx.queue.emit(StreamEvent(
-        session_id=ctx.thread.session_id,
-        thread_id=ctx.thread.id,
-        event_type="thread_waiting",
-        message=f"Thread encountered an error: {error_msg}. How should it proceed?",
-        data={
-            "question": f"Thread encountered an error: {error_msg}. How should it proceed?",
-            "context": error_msg,
-        },
-    ))
-
-    _cleanup(ctx)
-
-
-# --- Helpers ---
-
-
-def _safe_callback(handler, ctx: ThreadContext, future):
-    """Wrap a done callback to catch exceptions and route to finalize_error."""
-    try:
-        handler(ctx, future)
-    except Exception as e:
-        logger.error(f"Thread {ctx.thread.id} callback error: {e}", exc_info=True)
+    def _on_worker_done(self, future):
+        """Process worker LLM response — tool calls or final answer."""
         try:
-            _finalize_error(ctx, e)
-        except Exception:
-            logger.error(f"Thread {ctx.thread.id} failed to finalize after error", exc_info=True)
-            ctx.done_event.set()
+            response, call_ms = future.result()
+        except APITimeoutError:
+            logger.warning(f"Worker LLM call timed out for thread {self.thread.id}")
+            self.worker.handle_timeout()
+            self._schedule_worker_call()
+            return
 
+        result = self.worker.handle_response(response, call_ms)
+        if result is None:
+            self._schedule_worker_call()
+        else:
+            self._complete_step(result)
 
-def _cleanup(ctx: ThreadContext):
-    """Close DB and signal completion."""
-    try:
-        ctx.session_db.close()
-    except Exception:
-        pass
-    ctx.done_event.set()
+    def _complete_step(self, worker_result: WorkerResult):
+        """A worker step finished. Record it and decide next action."""
+        step_ms = round((time.monotonic() - self.step_start) * 1000)
+        worker_ms = step_ms - self.coordinator_ms
 
+        if worker_result.llm_calls:
+            for call in worker_result.llm_calls:
+                self.trace_store.add_event(self.step_span, "llm_call", call)
 
-def _maybe_summarize(ctx: ThreadContext):
-    """Summarize thread history if it's getting long."""
-    try:
-        summary = ctx.trace_store.summarize_history(
-            trace_id=ctx.thread.id,
-            llm=ctx.llm,
-            model=ctx.config.models.coordinator,
-            seed_question=ctx.thread.seed_question,
+        self.step_span.attributes.update({
+            "move": self.decision.next_move.value,
+            "instruction": self.decision.worker_instruction,
+            "result": worker_result.result,
+            "coordinator_ms": self.coordinator_ms,
+            "worker_ms": worker_ms,
+        })
+        self.trace_store.end_span(self.step_span)
+
+        logger.info(
+            f"Thread {self.thread.id} step {self.step_number} "
+            f"({self.decision.next_move.value}): "
+            f"coordinator={self.coordinator_ms}ms worker={worker_ms}ms "
+            f"total={step_ms}ms"
         )
-        if summary and not detect_degeneration(summary):
-            ctx.state.update_thread_running_summary(ctx.thread.id, summary)
-            ctx.thread.running_summary = summary
-            logger.info(f"Thread {ctx.thread.id} history summarized")
-        elif summary:
-            logger.warning(f"Thread {ctx.thread.id} summary discarded — degenerate output detected")
-    except Exception as e:
-        logger.warning(f"History summarization failed: {e}")
+
+        self.queue.emit(StreamEvent(
+            session_id=self.thread.session_id,
+            thread_id=self.thread.id,
+            event_type="step_complete",
+            message=worker_result.result,
+            data={
+                "step_number": self.step_number,
+                "move": self.decision.next_move.value,
+                "result": worker_result.result,
+            },
+        ))
+
+        if self.step_number > 1 and self.step_number % 5 == 0:
+            self._maybe_summarize()
+
+        # Move repetition guard
+        self.move_history.append(self.decision.next_move.value)
+        max_same = self.config.max_repeated_moves
+        if (
+            len(self.move_history) >= max_same
+            and len(set(self.move_history[-max_same:])) == 1
+            and self.decision.status != CoordinatorStatus.DONE
+        ):
+            move_name = self.move_history[-1]
+            logger.warning(
+                f"Thread {self.thread.id} repeated {move_name} {max_same} times — forcing STUCK"
+            )
+            self.decision.status = CoordinatorStatus.STUCK
+            self.decision.question_for_human = (
+                f"Thread has repeated {move_name} {max_same} times without progress. "
+                "What direction should the analysis take?"
+            )
+            self.decision.context = f"Last {max_same} moves: {', '.join(self.move_history[-max_same:])}"
+            self._finalize("stuck")
+            return
+
+        if self.decision.status == CoordinatorStatus.DONE:
+            self._finalize("complete", worker_result=worker_result)
+        else:
+            self.human_messages = []
+            self._run_step()
+
+    def _finalize(
+        self,
+        status: str,
+        worker_result: WorkerResult | None = None,
+        error: Exception | None = None,
+    ):
+        """Finalize thread — complete, stuck, or error. Handles trace, state, events, cleanup."""
+        if status == "complete" and worker_result:
+            thread_elapsed = round(time.monotonic() - self.thread_start, 2)
+            logger.info(
+                f"Thread {self.thread.id} complete: "
+                f"{self.step_number} steps in {thread_elapsed}s"
+            )
+            self.trace_store.flush_to_file(self.thread.id, self.thread.session_id)
+            self.trace_store.clear_trace(self.thread.id)
+            self.state.update_thread_status(
+                self.thread.id, ThreadStatus.COMPLETE,
+                summary=worker_result.result,
+            )
+            self.state.dump_session(self.thread.session_id)
+            self.queue.emit(StreamEvent(
+                session_id=self.thread.session_id,
+                thread_id=self.thread.id,
+                event_type="thread_complete",
+                message=worker_result.result,
+                data={
+                    "summary": worker_result.result,
+                    "total_seconds": thread_elapsed,
+                    "step_count": self.step_number,
+                },
+            ))
+
+        elif status == "stuck":
+            decision = self.decision
+            if self.step_span:
+                self.step_span.attributes.update({
+                    "move": decision.next_move.value if decision else "STUCK",
+                    "instruction": (decision.question_for_human or "") if decision else "",
+                    "result": f"STUCK: {decision.context or ''}" if decision else "STUCK",
+                })
+                self.trace_store.end_span(self.step_span, status="stuck")
+
+            self.trace_store.flush_to_file(self.thread.id, self.thread.session_id)
+            self.trace_store.clear_trace(self.thread.id)
+            self.state.update_thread_status(self.thread.id, ThreadStatus.WAITING)
+            self.state.dump_session(self.thread.session_id)
+            self.queue.emit(StreamEvent(
+                session_id=self.thread.session_id,
+                thread_id=self.thread.id,
+                event_type="thread_waiting",
+                message=(decision.question_for_human or "Thread needs guidance.") if decision else "Thread needs guidance.",
+                data={
+                    "question": decision.question_for_human if decision else None,
+                    "context": decision.context if decision else None,
+                },
+            ))
+
+        elif status == "error" and error:
+            error_msg = f"{type(error).__name__}: {error}"
+            logger.error(
+                f"Thread {self.thread.id} error: {error_msg}",
+                exc_info=True,
+            )
+            try:
+                if self.step_span:
+                    self.step_span.attributes.update({
+                        "move": self.decision.next_move.value if self.decision else "ERROR",
+                        "instruction": (self.decision.worker_instruction or "") if self.decision else "",
+                        "result": f"Error: {error_msg}",
+                        "error": error_msg,
+                    })
+                    self.trace_store.end_span(self.step_span, status="error")
+                self.trace_store.flush_to_file(self.thread.id, self.thread.session_id)
+                self.trace_store.clear_trace(self.thread.id)
+            except Exception:
+                pass
+
+            self.state.update_thread_status(self.thread.id, ThreadStatus.WAITING)
+            self.state.dump_session(self.thread.session_id)
+            self.queue.emit(StreamEvent(
+                session_id=self.thread.session_id,
+                thread_id=self.thread.id,
+                event_type="thread_waiting",
+                message=f"Thread encountered an error: {error_msg}. How should it proceed?",
+                data={
+                    "question": f"Thread encountered an error: {error_msg}. How should it proceed?",
+                    "context": error_msg,
+                },
+            ))
+
+        # Cleanup: close DB and signal completion
+        try:
+            self.session_db.close()
+        except Exception:
+            pass
+        self.done_event.set()
+
+    def _safe_callback(self, handler, future):
+        """Wrap a done callback to catch exceptions and route to _finalize."""
+        try:
+            handler(future)
+        except Exception as e:
+            self.error_count += 1
+            if self.error_count < 3:
+                logger.warning(
+                    f"Thread {self.tid} error (attempt {self.error_count}), retrying step: {e}"
+                )
+                try:
+                    if self.step_span:
+                        self.step_span.attributes.update({
+                            "move": "ERROR",
+                            "result": f"Error: {e}",
+                        })
+                        self.trace_store.end_span(self.step_span, status="error")
+                    self._run_step()
+                except Exception:
+                    logger.error(f"Thread {self.tid} failed to retry after error", exc_info=True)
+                    self._finalize("error", error=e)
+            else:
+                logger.error(f"Thread {self.thread.id} callback error: {e}", exc_info=True)
+                try:
+                    self._finalize("error", error=e)
+                except Exception:
+                    logger.error(f"Thread {self.thread.id} failed to finalize after error", exc_info=True)
+                    self.done_event.set()
+
+    def _maybe_summarize(self):
+        """Summarize thread history if it's getting long."""
+        try:
+            summary = self.trace_store.summarize_history(
+                trace_id=self.thread.id,
+                llm=self.llm,
+                model=self.config.models.coordinator,
+                seed_question=self.thread.seed_question,
+            )
+            if summary and not detect_degeneration(summary):
+                self.state.update_thread_running_summary(self.thread.id, summary)
+                self.thread.running_summary = summary
+                logger.info(f"Thread {self.thread.id} history summarized")
+            elif summary:
+                logger.warning(f"Thread {self.thread.id} summary discarded — degenerate output detected")
+        except Exception as e:
+            logger.warning(f"History summarization failed: {e}")
+
+    def _get_thread_views(self) -> str:
+        """List existing views for this thread."""
+        try:
+            rows = self.session_db.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_type = 'VIEW' AND table_name LIKE ?
+            """, [f"thread_{self.thread.id}_%"]).fetchall()
+            if rows:
+                return "\n".join(r[0] for r in rows)
+        except Exception:
+            pass
+        return "(none)"

@@ -25,6 +25,8 @@ class MoveType(str, Enum):
     FRAME = "FRAME"
     INTERROGATE = "INTERROGATE"
     SYNTHESIZE = "SYNTHESIZE"
+    STUCK = "STUCK"
+    DONE = "DONE"
 
 
 class CoordinatorStatus(str, Enum):

@@ -114,6 +114,34 @@ def test_parse_coordinator_response_stuck():
     assert result.context is not None
 
 
+def test_parse_coordinator_response_stuck_as_move():
+    """Coordinator returns STUCK as next_move — should parse as valid MoveType."""
+    raw = """{
+        "assessment": "Cannot proceed",
+        "next_move": "STUCK",
+        "rationale": "No data available",
+        "status": "STUCK",
+        "question_for_human": "What column has region data?"
+    }"""
+    result = parse_coordinator_response(raw)
+    assert result.next_move == MoveType.STUCK
+    assert result.status == CoordinatorStatus.STUCK
+
+
+def test_parse_coordinator_response_done_as_move():
+    """Coordinator returns DONE as next_move — should parse as valid MoveType."""
+    raw = """{
+        "assessment": "Analysis complete",
+        "next_move": "DONE",
+        "rationale": "All questions answered",
+        "status": "DONE",
+        "worker_instruction": "Summarize findings"
+    }"""
+    result = parse_coordinator_response(raw)
+    assert result.next_move == MoveType.DONE
+    assert result.status == CoordinatorStatus.DONE
+
+
 def test_parse_coordinator_response_defaults():
     raw = '{"assessment": "test"}'
     result = parse_coordinator_response(raw)

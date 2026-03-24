@@ -1,13 +1,15 @@
 """Tests for app.agents.profiler — dataset profiling agent."""
 
 
-from app.agents.profiler import _gather_column_stats, run_profiler
+from app.agents.profiler import Profiler
 from tests.conftest import make_mock_llm
 
 
 def test_gather_column_stats_has_all_columns(session_db):
+    mock = make_mock_llm("profiler_response.json")
+    profiler = Profiler(llm=mock, model="test-model")
     info = session_db.execute("DESCRIBE dataset").fetchall()
-    stats = _gather_column_stats(session_db, "dataset", info)
+    stats = profiler._gather_column_stats(session_db, "dataset", info)
 
     assert "pl_name" in stats
     assert "discoverymethod" in stats
@@ -16,8 +18,10 @@ def test_gather_column_stats_has_all_columns(session_db):
 
 
 def test_gather_column_stats_numeric(session_db):
+    mock = make_mock_llm("profiler_response.json")
+    profiler = Profiler(llm=mock, model="test-model")
     info = session_db.execute("DESCRIBE dataset").fetchall()
-    stats = _gather_column_stats(session_db, "dataset", info)
+    stats = profiler._gather_column_stats(session_db, "dataset", info)
 
     # pl_orbper is numeric — should have min, max, mean
     assert "min=" in stats
@@ -26,16 +30,20 @@ def test_gather_column_stats_numeric(session_db):
 
 
 def test_gather_column_stats_categorical(session_db):
+    mock = make_mock_llm("profiler_response.json")
+    profiler = Profiler(llm=mock, model="test-model")
     info = session_db.execute("DESCRIBE dataset").fetchall()
-    stats = _gather_column_stats(session_db, "dataset", info)
+    stats = profiler._gather_column_stats(session_db, "dataset", info)
 
     # discoverymethod has <20 unique — should show value counts
     assert "Transit" in stats
 
 
 def test_gather_column_stats_null_rates(session_db):
+    mock = make_mock_llm("profiler_response.json")
+    profiler = Profiler(llm=mock, model="test-model")
     info = session_db.execute("DESCRIBE dataset").fetchall()
-    stats = _gather_column_stats(session_db, "dataset", info)
+    stats = profiler._gather_column_stats(session_db, "dataset", info)
 
     # pl_orbeccen has NULLs — should show non-100% rate
     lines = stats.split("\n")
@@ -45,9 +53,8 @@ def test_gather_column_stats_null_rates(session_db):
 
 def test_run_profiler(session_db):
     mock = make_mock_llm("profiler_response.json")
-    result = run_profiler(
-        llm=mock, model="test-model", session_db=session_db,
-    )
+    profiler = Profiler(llm=mock, model="test-model")
+    result = profiler.call(session_db=session_db)
 
     assert isinstance(result, str)
     assert len(result) > 0
@@ -64,7 +71,8 @@ def test_run_profiler(session_db):
 
 def test_run_profiler_output_contains_fixture_content(session_db):
     mock = make_mock_llm("profiler_response.json")
-    result = run_profiler(llm=mock, model="test-model", session_db=session_db)
+    profiler = Profiler(llm=mock, model="test-model")
+    result = profiler.call(session_db=session_db)
 
     # Output should be the fixture content
     assert "Dataset summary" in result

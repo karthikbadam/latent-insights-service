@@ -4,16 +4,20 @@ import json
 from unittest.mock import MagicMock
 
 
-from app.agents.coordinator import run_coordinator
+from app.agents.coordinator import Coordinator
 from app.core.llm import LLMResponse
 from app.models import CoordinatorStatus, MoveType
 from tests.conftest import make_mock_llm
 
 
-def test_run_coordinator_continue(schema_summary):
+def _make_coordinator(mock_llm):
+    return Coordinator(llm=mock_llm, model="test")
+
+
+def test_coordinator_continue(schema_summary):
     mock = make_mock_llm("coordinator_response.json")
-    result, _ = run_coordinator(
-        llm=mock, model="test",
+    coord = _make_coordinator(mock)
+    result, _ = coord.call(
         seed_question="Why gaps?",
         motivation="Detection bias",
         entry_point="Compare distributions",
@@ -27,10 +31,10 @@ def test_run_coordinator_continue(schema_summary):
     assert len(result.assessment) > 0
 
 
-def test_run_coordinator_stuck(schema_summary):
+def test_coordinator_stuck(schema_summary):
     mock = make_mock_llm("coordinator_stuck_response.json")
-    result, _ = run_coordinator(
-        llm=mock, model="test",
+    coord = _make_coordinator(mock)
+    result, _ = coord.call(
         seed_question="Why eccentric?",
         motivation="Dynamics",
         entry_point="Plot eccentricity",
@@ -43,10 +47,10 @@ def test_run_coordinator_stuck(schema_summary):
     assert result.context is not None
 
 
-def test_run_coordinator_done(schema_summary):
+def test_coordinator_done(schema_summary):
     mock = make_mock_llm("coordinator_done_response.json")
-    result, _ = run_coordinator(
-        llm=mock, model="test",
+    coord = _make_coordinator(mock)
+    result, _ = coord.call(
         seed_question="Test",
         motivation="Test",
         entry_point="Test",
@@ -73,8 +77,8 @@ def test_coordinator_validates_done_requires_synthesize(schema_summary):
         model="test",
     )
 
-    result, _ = run_coordinator(
-        llm=mock, model="test",
+    coord = _make_coordinator(mock)
+    result, _ = coord.call(
         seed_question="Test", motivation="", entry_point="",
         schema_summary=schema_summary,
         thread_history="Step 1...",
@@ -98,8 +102,8 @@ def test_coordinator_validates_stuck_has_question(schema_summary):
         model="test",
     )
 
-    result, _ = run_coordinator(
-        llm=mock, model="test",
+    coord = _make_coordinator(mock)
+    result, _ = coord.call(
         seed_question="Test", motivation="", entry_point="",
         schema_summary=schema_summary,
         thread_history="Step 1...",
@@ -112,8 +116,8 @@ def test_coordinator_validates_stuck_has_question(schema_summary):
 def test_coordinator_prompt_contains_context(schema_summary):
     """Verify prompt includes seed question, schema, and history."""
     mock = make_mock_llm("coordinator_response.json")
-    run_coordinator(
-        llm=mock, model="test",
+    coord = _make_coordinator(mock)
+    coord.call(
         seed_question="Are planets missing?",
         motivation="Bias analysis",
         entry_point="Check methods",
@@ -128,3 +132,33 @@ def test_coordinator_prompt_contains_context(schema_summary):
     assert "Are planets missing?" in system_msg
     assert "Bias analysis" in system_msg
     assert "Step 1 [SCOPE]: filtered" in system_msg
+
+
+def test_coordinator_retries_on_json_error(schema_summary):
+    """Coordinator should retry once with a nudge if initial response isn't valid JSON."""
+    mock = MagicMock()
+
+    # First call: non-JSON response
+    bad_response = LLMResponse(content="I think we should forage next", model="test")
+    # Second call: valid JSON
+    good_response = LLMResponse(
+        content=json.dumps({
+            "assessment": "Need more data",
+            "next_move": "FORAGE",
+            "rationale": "explore",
+            "worker_instruction": "look at distributions",
+            "status": "CONTINUE",
+        }),
+        model="test",
+    )
+    mock.call.side_effect = [bad_response, good_response]
+
+    coord = _make_coordinator(mock)
+    result, _ = coord.call(
+        seed_question="Test", motivation="", entry_point="",
+        schema_summary=schema_summary,
+        thread_history="Step 1...",
+    )
+
+    assert result.status == CoordinatorStatus.CONTINUE
+    assert mock.call.call_count == 2

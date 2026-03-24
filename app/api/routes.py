@@ -5,13 +5,18 @@ API routes — thin HTTP layer over orchestration.
 import logging
 import os
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Query
+import json as json_mod
+
+from fastapi import APIRouter, Form, HTTPException, Request, UploadFile, File, Query
 
 from app.api.schemas import (
     CreateThreadRequest,
     PostMessageRequest,
+    SessionConfig,
     SessionResponse,
+    SessionSummary,
     SessionUrls,
+    StepEvent,
     StepResponse,
     SystemStats,
     ThreadResponse,
@@ -50,6 +55,25 @@ def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
         duration_ms = None
         if span.end_time and span.start_time:
             duration_ms = round((span.end_time - span.start_time) * 1000)
+
+        # Build interleaved event timeline from span events
+        step_events = []
+        for event in span.events:
+            event_attrs = event.get("attributes", {})
+            step_events.append(StepEvent(
+                type=event["name"],
+                timestamp=event.get("timestamp", 0),
+                agent=event_attrs.get("agent"),
+                model=event_attrs.get("model"),
+                duration_ms=event_attrs.get("duration_ms"),
+                input_tokens=event_attrs.get("input_tokens"),
+                output_tokens=event_attrs.get("output_tokens"),
+                sql=event_attrs.get("sql"),
+                tool_result=event_attrs.get("tool_result"),
+                response=event_attrs.get("response"),
+            ))
+        step_events.sort(key=lambda e: e.timestamp)
+
         steps.append(StepResponse(
             step_number=i,
             move=attrs.get("move", ""),
@@ -57,6 +81,7 @@ def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
             result=attrs.get("result", ""),
             view_created=attrs.get("view_created"),
             duration_ms=duration_ms,
+            events=step_events,
         ))
     return steps
 
@@ -69,15 +94,26 @@ def create_session(
     request: Request,
     file: UploadFile | None = File(None),
     dataset_path: str | None = Query(None),
+    config_json: str | None = Form(None, alias="config"),
 ):
     """Create a new analysis session from file upload or existing dataset path."""
     config, llm, db, queue, state, trace_store = _get_state()
+
+    # Parse per-session config overrides
+    session_config = config
+    if config_json:
+        try:
+            raw = json_mod.loads(config_json)
+        except json_mod.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in config field")
+        parsed = SessionConfig(**raw)
+        session_config = config.with_overrides(parsed.model_dump())
 
     if file and file.filename:
         if not file.filename.endswith(".csv"):
             raise HTTPException(status_code=400, detail="Only CSV files are supported")
 
-        upload_dir = os.path.join(config.data_dir, "uploads")
+        upload_dir = os.path.join(session_config.data_dir, "uploads")
         os.makedirs(upload_dir, exist_ok=True)
         resolved_path = os.path.join(upload_dir, file.filename)
         content = file.file.read()
@@ -91,14 +127,15 @@ def create_session(
         raise HTTPException(status_code=400, detail="Provide either a file upload or dataset_path")
 
     from app.db.connection import table_name_from_path
-    from app.orchestration.session import create_session_flow
+    from app.orchestration.session import SessionFlow
 
     table_name = table_name_from_path(resolved_path)
     session = state.create_session(resolved_path, table_name)
 
+    flow = SessionFlow(session_config, llm, db, queue, state, trace_store)
     queue.schedule(
-        fn=create_session_flow,
-        args=(config, llm, db, queue, state, trace_store, session.id, resolved_path),
+        fn=flow.create,
+        args=(session.id, resolved_path),
         task_id=f"session-{session.id}",
         session_id=session.id,
         description=f"Session setup: {os.path.basename(resolved_path)}",
@@ -161,8 +198,7 @@ def get_session(session_id: str, request: Request):
 def create_thread(session_id: str, request: CreateThreadRequest):
     """Create a user-initiated thread with a custom question."""
     config, llm, db, queue, state, trace_store = _get_state()
-    from app.orchestration.context import ThreadContext
-    from app.orchestration.thread import start_thread
+    from app.orchestration.thread import ThreadRunner
 
     session = state.get_session(session_id)
     if session is None:
@@ -176,7 +212,7 @@ def create_thread(session_id: str, request: CreateThreadRequest):
 
     thread_db = db.open_session_connection(session_id)
 
-    ctx = ThreadContext(
+    runner = ThreadRunner(
         config=config,
         llm=llm,
         session_db=thread_db,
@@ -186,7 +222,7 @@ def create_thread(session_id: str, request: CreateThreadRequest):
         thread=thread,
         schema_summary=session.schema_summary,
     )
-    start_thread(ctx)
+    runner.start()
 
     return ThreadResponse(
         id=thread.id,
@@ -201,7 +237,7 @@ def create_thread(session_id: str, request: CreateThreadRequest):
 def continue_session(session_id: str):
     """Continue a session: resume stuck threads + scout new questions."""
     config, llm, db, queue, state, trace_store = _get_state()
-    from app.orchestration.session import continue_session_flow
+    from app.orchestration.session import SessionFlow
 
     session = state.get_session(session_id)
     if session is None:
@@ -209,9 +245,10 @@ def continue_session(session_id: str):
     if session.schema_summary is None:
         raise HTTPException(status_code=400, detail="Session profiling not complete yet")
 
+    flow = SessionFlow(config, llm, db, queue, state, trace_store)
     queue.schedule(
-        fn=continue_session_flow,
-        args=(config, llm, db, queue, state, trace_store, session_id),
+        fn=flow.continue_,
+        args=(session_id,),
         task_id=f"continue-{session_id}",
         session_id=session_id,
         description=f"Continue session {session_id}",
@@ -231,8 +268,7 @@ def continue_session(session_id: str):
 def post_message(thread_id: str, request: PostMessageRequest):
     """Post a human message to a stuck thread, resuming it."""
     config, llm, db, queue, state, trace_store = _get_state()
-    from app.orchestration.context import ThreadContext
-    from app.orchestration.thread import resume_thread
+    from app.orchestration.thread import ThreadRunner
 
     thread = state.get_thread(thread_id)
     if thread is None:
@@ -243,7 +279,7 @@ def post_message(thread_id: str, request: PostMessageRequest):
     session = state.get_session(thread.session_id)
     thread_db = db.open_session_connection(thread.session_id)
 
-    ctx = ThreadContext(
+    runner = ThreadRunner(
         config=config,
         llm=llm,
         session_db=thread_db,
@@ -252,11 +288,57 @@ def post_message(thread_id: str, request: PostMessageRequest):
         trace_store=trace_store,
         thread=thread,
         schema_summary=session.schema_summary or "",
-        human_messages=[request.content],
     )
-    resume_thread(ctx)
+    runner.resume(human_messages=[request.content])
 
     return {"status": "resumed", "thread_id": thread_id}
+
+
+@router.get("/sessions")
+def list_sessions():
+    """List all sessions with metadata."""
+    _, _, _, _, state, _ = _get_state()
+
+    sessions = state.get_all_sessions()
+    summaries = []
+    for s in sessions:
+        threads = state.get_threads(s.id)
+        status_counts: dict[str, int] = {}
+        for t in threads:
+            status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
+        summaries.append(SessionSummary(
+            id=s.id,
+            dataset_path=s.dataset_path,
+            table_name=s.table_name,
+            thread_count=len(threads),
+            status_counts=status_counts,
+            created_at=s.created_at.isoformat() if s.created_at else "",
+        ))
+
+    return summaries
+
+
+@router.get("/threads/{thread_id}")
+def get_thread(thread_id: str):
+    """Get a single thread with its steps."""
+    _, _, _, _, state, trace_store = _get_state()
+
+    thread = state.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    steps = _steps_from_trace(trace_store, thread)
+    return ThreadResponse(
+        id=thread.id,
+        seed_question=thread.seed_question,
+        motivation=thread.motivation,
+        status=thread.status.value,
+        summary=thread.summary,
+        running_summary=thread.running_summary,
+        error=thread.error,
+        steps=steps,
+        updated_at=thread.updated_at.isoformat() if thread.updated_at else "",
+    )
 
 
 # --- System ---
