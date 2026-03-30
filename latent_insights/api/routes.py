@@ -9,7 +9,7 @@ import json as json_mod
 
 from fastapi import APIRouter, Form, HTTPException, Request, UploadFile, File, Query
 
-from app.api.schemas import (
+from latent_insights.api.schemas import (
     CreateThreadRequest,
     PostMessageRequest,
     SessionConfig,
@@ -31,12 +31,12 @@ def _base_url(request: Request) -> str:
     return str(request.base_url).rstrip("/")
 
 
-def _get_state():
-    """Get global app state from main module."""
-    from app import main
-    if not main.config or not main.llm or not main.db or not main.queue_instance or not main.state_store:
+def _get_state(request: Request):
+    """Get app state from request.app.state (set during lifespan)."""
+    s = request.app.state
+    if not hasattr(s, "config") or not s.config:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    return main.config, main.llm, main.db, main.queue_instance, main.state_store, main.trace_store
+    return s.config, s.llm, s.db, s.queue, s.state_store, s.trace_store
 
 
 def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
@@ -97,7 +97,7 @@ def create_session(
     config_json: str | None = Form(None, alias="config"),
 ):
     """Create a new analysis session from file upload or existing dataset path."""
-    config, llm, db, queue, state, trace_store = _get_state()
+    config, llm, db, queue, state, trace_store = _get_state(request)
 
     # Parse per-session config overrides
     session_config = config
@@ -126,8 +126,8 @@ def create_session(
     else:
         raise HTTPException(status_code=400, detail="Provide either a file upload or dataset_path")
 
-    from app.db.connection import table_name_from_path
-    from app.orchestration.session import SessionFlow
+    from latent_insights.db.connection import table_name_from_path
+    from latent_insights.orchestration.session import SessionFlow
 
     table_name = table_name_from_path(resolved_path)
     session = state.create_session(resolved_path, table_name)
@@ -154,10 +154,10 @@ def create_session(
 
 
 @router.get("/sessions/{session_id}/saved")
-def get_saved_session(session_id: str):
+def get_saved_session(session_id: str, request: Request):
     """Return a previously saved session from data/sessions/."""
-    from app.main import config as app_config
-    stored = os.path.join(app_config.data_dir, "sessions", f"{session_id}.json")
+    config, *_ = _get_state(request)
+    stored = os.path.join(config.data_dir, "sessions", f"{session_id}.json")
     if not os.path.exists(stored):
         raise HTTPException(status_code=404, detail="Saved session not found")
     with open(stored) as f:
@@ -167,7 +167,7 @@ def get_saved_session(session_id: str):
 @router.get("/sessions/{session_id}")
 def get_session(session_id: str, request: Request):
     """Get full session state with threads and steps."""
-    _, _, _, _, state, trace_store = _get_state()
+    _, _, _, _, state, trace_store = _get_state(request)
 
     session = state.get_session(session_id)
     if session is None:
@@ -206,10 +206,10 @@ def get_session(session_id: str, request: Request):
 
 
 @router.post("/sessions/{session_id}/threads")
-def create_thread(session_id: str, request: CreateThreadRequest):
+def create_thread(session_id: str, request: Request, body: CreateThreadRequest):
     """Create a user-initiated thread with a custom question."""
-    config, llm, db, queue, state, trace_store = _get_state()
-    from app.orchestration.thread import ThreadRunner
+    config, llm, db, queue, state, trace_store = _get_state(request)
+    from latent_insights.orchestration.thread import ThreadRunner
 
     session = state.get_session(session_id)
     if session is None:
@@ -218,7 +218,7 @@ def create_thread(session_id: str, request: CreateThreadRequest):
         raise HTTPException(status_code=400, detail="Session profiling not complete yet")
 
     thread = state.create_thread(
-        session_id, request.question, request.motivation or "", "",
+        session_id, body.question, body.motivation or "", "",
     )
 
     thread_db = db.open_session_connection(session_id)
@@ -245,10 +245,10 @@ def create_thread(session_id: str, request: CreateThreadRequest):
 
 
 @router.post("/sessions/{session_id}/continue")
-def continue_session(session_id: str):
+def continue_session(session_id: str, request: Request):
     """Continue a session: resume stuck threads + scout new questions."""
-    config, llm, db, queue, state, trace_store = _get_state()
-    from app.orchestration.session import SessionFlow
+    config, llm, db, queue, state, trace_store = _get_state(request)
+    from latent_insights.orchestration.session import SessionFlow
 
     session = state.get_session(session_id)
     if session is None:
@@ -276,10 +276,10 @@ def continue_session(session_id: str):
 
 
 @router.post("/threads/{thread_id}/messages")
-def post_message(thread_id: str, request: PostMessageRequest):
+def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     """Post a human message to a stuck thread, resuming it."""
-    config, llm, db, queue, state, trace_store = _get_state()
-    from app.orchestration.thread import ThreadRunner
+    config, llm, db, queue, state, trace_store = _get_state(request)
+    from latent_insights.orchestration.thread import ThreadRunner
 
     thread = state.get_thread(thread_id)
     if thread is None:
@@ -300,15 +300,15 @@ def post_message(thread_id: str, request: PostMessageRequest):
         thread=thread,
         schema_summary=session.schema_summary or "",
     )
-    runner.resume(human_messages=[request.content])
+    runner.resume(human_messages=[body.content])
 
     return {"status": "resumed", "thread_id": thread_id}
 
 
 @router.get("/sessions")
-def list_sessions():
+def list_sessions(request: Request):
     """List all sessions with metadata."""
-    _, _, _, _, state, _ = _get_state()
+    _, _, _, _, state, _ = _get_state(request)
 
     sessions = state.get_all_sessions()
     summaries = []
@@ -330,9 +330,9 @@ def list_sessions():
 
 
 @router.get("/threads/{thread_id}")
-def get_thread(thread_id: str):
+def get_thread(thread_id: str, request: Request):
     """Get a single thread with its steps."""
-    _, _, _, _, state, trace_store = _get_state()
+    _, _, _, _, state, trace_store = _get_state(request)
 
     thread = state.get_thread(thread_id)
     if thread is None:
@@ -356,9 +356,9 @@ def get_thread(thread_id: str):
 
 
 @router.get("/system/stats")
-def system_stats() -> SystemStats:
+def system_stats(request: Request) -> SystemStats:
     """Session and thread counts."""
-    _, _, _, _, state, _ = _get_state()
+    _, _, _, _, state, _ = _get_state(request)
 
     return SystemStats(
         session_count=state.session_count,

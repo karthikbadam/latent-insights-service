@@ -1,8 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "latent-insights"
 version = "0.1.0"
 description = "Parallel agent sensemaking tool — collaborative async data analysis with LLM threads"
 requires-python = ">=3.12"
+license = {text = "MIT"}
+readme = "README.md"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: FastAPI",
+    "Topic :: Scientific/Engineering",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
@@ -20,6 +33,12 @@ dev = [
     "pytest-asyncio>=0.25",
     "httpx>=0.28",
 ]
+
+[project.scripts]
+latent-insights = "latent_insights.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["latent_insights"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

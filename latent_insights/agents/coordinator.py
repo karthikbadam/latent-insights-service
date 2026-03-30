@@ -9,11 +9,11 @@ import json
 import logging
 import time
 
-from app.agents.base import Agent
-from app.core.llm import LLMClient
-from app.core.parsing import parse_coordinator_response
-from app.core.queue import Queue
-from app.models import CoordinatorDecision, CoordinatorStatus, MoveType, StreamEvent
+from latent_insights.agents.base import Agent
+from latent_insights.core.llm import LLMClient
+from latent_insights.core.parsing import parse_coordinator_response
+from latent_insights.core.queue import Queue
+from latent_insights.models import CoordinatorDecision, CoordinatorStatus, MoveType, StreamEvent
 
 logger = logging.getLogger(__name__)
 

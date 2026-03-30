@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 
-from app.core.llm import LLMClient
+from latent_insights.core.llm import LLMClient
 
 
 class Agent(ABC):

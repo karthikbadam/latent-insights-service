@@ -7,8 +7,8 @@ from unittest.mock import MagicMock
 import duckdb
 import pytest
 
-from app.core.llm import LLMClient, LLMResponse
-from app.core.state import StateStore
+from latent_insights.core.llm import LLMClient, LLMResponse
+from latent_insights.core.state import StateStore
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 

@@ -7,10 +7,10 @@ Works with any dataset — no domain-specific assumptions.
 
 import logging
 
-from app.agents.base import Agent
-from app.core.llm import LLMClient
-from app.core.parsing import parse_scout_response
-from app.models import ScoutOutput
+from latent_insights.agents.base import Agent
+from latent_insights.core.llm import LLMClient
+from latent_insights.core.parsing import parse_scout_response
+from latent_insights.models import ScoutOutput
 
 logger = logging.getLogger(__name__)
 

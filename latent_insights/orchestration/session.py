@@ -4,16 +4,16 @@ import logging
 import time
 from dataclasses import asdict
 
-from app.agents.profiler import Profiler
-from app.agents.scout import Scout
-from app.config import AppConfig
-from app.core.llm import LLMClient
-from app.core.queue import Queue
-from app.core.state import StateStore
-from app.core.tracing import TraceStore
-from app.db.connection import Database
-from app.models import ScoutQuestion, StreamEvent, ThreadStatus
-from app.orchestration.thread import ThreadRunner
+from latent_insights.agents.profiler import Profiler
+from latent_insights.agents.scout import Scout
+from latent_insights.config import AppConfig
+from latent_insights.core.llm import LLMClient
+from latent_insights.core.queue import Queue
+from latent_insights.core.state import StateStore
+from latent_insights.core.tracing import TraceStore
+from latent_insights.db.connection import Database
+from latent_insights.models import ScoutQuestion, StreamEvent, ThreadStatus
+from latent_insights.orchestration.thread import ThreadRunner
 
 logger = logging.getLogger(__name__)
 

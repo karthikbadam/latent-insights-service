@@ -11,7 +11,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from app.models import StreamEvent
+from latent_insights.models import StreamEvent
 
 logger = logging.getLogger(__name__)
 
