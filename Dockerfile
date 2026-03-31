@@ -5,9 +5,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 
 COPY pyproject.toml uv.lock* ./
+COPY latent_insights/ latent_insights/
 RUN uv sync --frozen --no-dev
-
-COPY . .
 
 EXPOSE ${PORT:-8000}
 
