@@ -2,14 +2,14 @@
 
 import pytest
 
-from app.core.parsing import (
+from latent_insights.core.parsing import (
     detect_degeneration,
     extract_json,
     parse_coordinator_response,
     parse_scout_response,
     parse_worker_response,
 )
-from app.models import CoordinatorStatus, MoveType
+from latent_insights.models import CoordinatorStatus, MoveType
 
 
 # --- detect_degeneration ---

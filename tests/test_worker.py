@@ -3,9 +3,9 @@
 import json
 from unittest.mock import MagicMock
 
-from app.agents.worker import Worker
-from app.core.llm import LLMResponse
-from app.models import WorkerResult
+from latent_insights.agents.worker import Worker
+from latent_insights.core.llm import LLMResponse
+from latent_insights.models import WorkerResult
 
 
 # --- static helpers ---

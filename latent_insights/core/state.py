@@ -13,7 +13,7 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime
 
-from app.models import Session, Thread, ThreadStatus
+from latent_insights.models import Session, Thread, ThreadStatus
 
 logger = logging.getLogger(__name__)
 

@@ -8,7 +8,7 @@ missing fields, extra whitespace.
 import json
 import re
 
-from app.models import (
+from latent_insights.models import (
     CoordinatorDecision,
     CoordinatorStatus,
     MoveType,

@@ -3,7 +3,7 @@
 from unittest.mock import MagicMock
 
 
-from app.core.llm import LLMClient, LLMResponse
+from latent_insights.core.llm import LLMClient, LLMResponse
 
 
 def test_call_returns_response():

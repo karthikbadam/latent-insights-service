@@ -5,23 +5,26 @@ For any uploaded dataset, the system discovers questions, spawns analytical thre
 
 The agent is designed to follow steps from a sensemaking process such as foraging for evidence, framing the hypothesis, investigating the data, and synthesizing the results. 
 
+## Install
+
+```bash
+pip install latent-insights
+```
+
 ## Quick start
 
 ### OpenRouter (default)
 
 ```bash
-uv sync --extra dev
-export LLM_PROVIDER=openrouter
 export LLM_API_KEY=<your-key>
-uv run uvicorn app.main:app --reload
+latent-insights
 ```
 
 ### Ollama (local, free)
 
 ```bash
-ollama pull gpt-oss:20b
 export LLM_PROVIDER=ollama
-uv run uvicorn app.main:app --reload
+latent-insights
 ```
 
 Override individual models if needed:
@@ -29,14 +32,50 @@ Override individual models if needed:
 ```bash
 export LLM_PROVIDER=ollama
 export MODEL_WORKER=gemma3:4b
-uv run uvicorn app.main:app --reload
+latent-insights
 ```
 
-## Tests
+### As a library
+
+```python
+from latent_insights import AppConfig
+from latent_insights.core.llm import LLMClient
+from latent_insights.core.queue import Queue
+from latent_insights.core.state import StateStore
+from latent_insights.core.tracing import TraceStore
+from latent_insights.db.connection import Database
+from latent_insights.orchestration.session import SessionFlow
+
+config = AppConfig.from_env()
+llm = LLMClient(
+    api_key=config.llm_api_key,
+    base_url=config.llm_base_url,
+    app_name=config.app_name,
+    app_url=config.app_url,
+)
+db = Database(data_dir=config.data_dir)
+queue = Queue()
+state = StateStore(data_dir=config.data_dir)
+trace = TraceStore(data_dir=config.data_dir)
+
+flow = SessionFlow(config, llm, db, queue, state, trace)
+flow.create(session_id, "path/to/data.csv")
+```
+
+## Development
 
 ```bash
+git clone https://github.com/karthikbadam/latent-insights.git
+cd latent-insights
+uv sync --extra dev
+
+# Run dev server with hot reload
+uv run uvicorn latent_insights.main:app --reload
+
+# Run tests
 uv run pytest                    # all tests
 uv run pytest -m "not live"      # skip API-calling tests
+uv run ruff check .
 ```
 
 ## Architecture
@@ -142,6 +181,19 @@ Available config fields:
 | `num_scout_seed_questions` | `int`      | Number of questions scout should discover |
 | `initial_questions`        | `string[]` | Seed questions to start alongside scout   |
 
+
+## Publishing to PyPI
+
+```bash
+# Build the package
+uv build
+
+# Publish (requires PyPI API token)
+uv publish
+
+# Or test with TestPyPI first
+uv publish --publish-url https://test.pypi.org/legacy/
+```
 
 ## Docs
 

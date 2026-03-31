@@ -10,11 +10,11 @@ import logging
 import re
 import time
 
-from app.agents.base import Agent
-from app.core.llm import LLMClient
-from app.core.parsing import detect_degeneration, parse_worker_response
-from app.core.queue import Queue
-from app.models import StreamEvent, WorkerResult
+from latent_insights.agents.base import Agent
+from latent_insights.core.llm import LLMClient
+from latent_insights.core.parsing import detect_degeneration, parse_worker_response
+from latent_insights.core.queue import Queue
+from latent_insights.models import StreamEvent, WorkerResult
 
 logger = logging.getLogger(__name__)
 

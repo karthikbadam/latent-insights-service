@@ -4,9 +4,9 @@ import json
 from unittest.mock import MagicMock
 
 
-from app.agents.coordinator import Coordinator
-from app.core.llm import LLMResponse
-from app.models import CoordinatorStatus, MoveType
+from latent_insights.agents.coordinator import Coordinator
+from latent_insights.core.llm import LLMResponse
+from latent_insights.models import CoordinatorStatus, MoveType
 from tests.conftest import make_mock_llm
 
 

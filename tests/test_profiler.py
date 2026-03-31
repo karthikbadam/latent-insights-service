@@ -1,7 +1,7 @@
 """Tests for app.agents.profiler — dataset profiling agent."""
 
 
-from app.agents.profiler import Profiler
+from latent_insights.agents.profiler import Profiler
 from tests.conftest import make_mock_llm
 
 

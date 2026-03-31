@@ -6,13 +6,13 @@ from unittest.mock import MagicMock
 import duckdb
 import pytest
 
-from app.config import AppConfig
-from app.core.llm import LLMResponse
-from app.core.queue import Queue
-from app.core.state import StateStore, generate_id
-from app.core.tracing import TraceStore
-from app.models import ThreadStatus
-from app.orchestration.thread import ThreadRunner
+from latent_insights.config import AppConfig
+from latent_insights.core.llm import LLMResponse
+from latent_insights.core.queue import Queue
+from latent_insights.core.state import StateStore, generate_id
+from latent_insights.core.tracing import TraceStore
+from latent_insights.models import ThreadStatus
+from latent_insights.orchestration.thread import ThreadRunner
 
 
 # --- StateStore unit tests ---

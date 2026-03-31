@@ -1,7 +1,8 @@
 """
 FastAPI application — entry point.
 
-Run with: uv run uvicorn app.main:app --reload
+Run with: uv run uvicorn latent_insights.main:app --reload
+Or after pip install: latent-insights
 """
 
 import logging
@@ -10,30 +11,20 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import AppConfig
-from app.core.llm import LLMClient
-from app.core.queue import Queue
-from app.core.state import StateStore
-from app.core.tracing import TraceStore
-from app.db.connection import Database
-from app.api import routes, sse
+from latent_insights.config import AppConfig
+from latent_insights.core.llm import LLMClient
+from latent_insights.core.queue import Queue
+from latent_insights.core.state import StateStore
+from latent_insights.core.tracing import TraceStore
+from latent_insights.db.connection import Database
+from latent_insights.api import routes, sse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Global app state — set during lifespan
-config: AppConfig | None = None
-llm: LLMClient | None = None
-db: Database | None = None
-queue_instance: Queue | None = None
-state_store: StateStore | None = None
-trace_store: TraceStore | None = None
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, llm, db, queue_instance, state_store, trace_store
-
     config = AppConfig.from_env()
     logger.info(f"Starting {config.app_name}")
     logger.info(f"LLM provider: {config.llm_provider}, base: {config.llm_base_url}")
@@ -48,11 +39,17 @@ async def lifespan(app: FastAPI):
     )
 
     db = Database(data_dir=config.data_dir)
-
     queue_instance = Queue()
     state_store = StateStore(data_dir=config.data_dir)
     trace_store = TraceStore(data_dir=config.data_dir)
-    sse.queue = queue_instance
+
+    # Store on app.state for access in route handlers
+    app.state.config = config
+    app.state.llm = llm
+    app.state.db = db
+    app.state.queue = queue_instance
+    app.state.state_store = state_store
+    app.state.trace_store = trace_store
 
     logger.info("Ready")
     yield
@@ -82,3 +79,9 @@ app.include_router(sse.router, prefix="/api")
 @app.get("/health")
 async def health():
     return {"status": "ok", "app": "latent-insights"}
+
+
+def cli():
+    """Console entry point — run the Latent Insights server."""
+    import uvicorn
+    uvicorn.run("latent_insights.main:app", host="0.0.0.0", port=8000)

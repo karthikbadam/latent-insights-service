@@ -6,19 +6,14 @@ import asyncio
 import json
 import queue as stdlib_queue
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from sse_starlette.sse import EventSourceResponse
-
-from app.core.queue import Queue
 
 router = APIRouter()
 
-# Will be set by main.py on startup
-queue: Queue | None = None
-
 
 @router.get("/sessions/{session_id}/events")
-async def session_events(session_id: str):
+async def session_events(session_id: str, request: Request):
     """
     SSE endpoint — streams thread events as human-readable messages.
 
@@ -30,6 +25,8 @@ async def session_events(session_id: str):
     - error: thread encountered an error
     - scout_done: scout finished, questions available
     """
+
+    queue = request.app.state.queue
 
     async def event_generator():
         q = queue.subscribe(session_id)

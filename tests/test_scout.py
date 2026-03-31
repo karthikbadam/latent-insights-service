@@ -1,8 +1,8 @@
 """Tests for app.agents.scout — question discovery agent."""
 
 
-from app.agents.scout import Scout
-from app.models import ScoutOutput
+from latent_insights.agents.scout import Scout
+from latent_insights.models import ScoutOutput
 from tests.conftest import make_mock_llm
 
 

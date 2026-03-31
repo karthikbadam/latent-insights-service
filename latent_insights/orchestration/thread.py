@@ -12,15 +12,15 @@ from typing import Any
 
 from openai import APITimeoutError
 
-from app.agents.coordinator import Coordinator
-from app.agents.worker import Worker
-from app.config import AppConfig
-from app.core.llm import LLMClient
-from app.core.parsing import detect_degeneration
-from app.core.queue import Queue
-from app.core.state import StateStore
-from app.core.tracing import Span, TraceStore
-from app.models import (
+from latent_insights.agents.coordinator import Coordinator
+from latent_insights.agents.worker import Worker
+from latent_insights.config import AppConfig
+from latent_insights.core.llm import LLMClient
+from latent_insights.core.parsing import detect_degeneration
+from latent_insights.core.queue import Queue
+from latent_insights.core.state import StateStore
+from latent_insights.core.tracing import Span, TraceStore
+from latent_insights.models import (
     CoordinatorDecision,
     CoordinatorStatus,
     MoveType,
