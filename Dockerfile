@@ -8,6 +8,9 @@ COPY pyproject.toml uv.lock* README.md LICENSE ./
 COPY latent_insights/ latent_insights/
 RUN uv sync --frozen --no-dev
 
+COPY data/ data/
+COPY docs/ docs/
+
 EXPOSE ${PORT:-8000}
 
 CMD uv run uvicorn latent_insights.main:app --host 0.0.0.0 --port ${PORT:-8000}
