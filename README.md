@@ -17,14 +17,12 @@ pip install latent-insights
 
 ```bash
 export LLM_API_KEY=<your-key>
-latent-insights
 ```
 
 ### Ollama (local, free)
 
 ```bash
 export LLM_PROVIDER=ollama
-latent-insights
 ```
 
 Override individual models if needed:
@@ -32,7 +30,6 @@ Override individual models if needed:
 ```bash
 export LLM_PROVIDER=ollama
 export MODEL_WORKER=gemma3:4b
-latent-insights
 ```
 
 ### As a library
