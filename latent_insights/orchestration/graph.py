@@ -77,6 +77,7 @@ def make_coordinator_node(
     coordinator: Coordinator,
     trace_store: TraceStore,
     queue: Queue,
+    state_store: StateStore,
 ):
     """Create the coordinator node function."""
 
@@ -85,11 +86,18 @@ def make_coordinator_node(
         session_id = state["session_id"]
         step_number = state.get("step_number", 0) + 1
 
+        # Drain any pending messages injected mid-run via the interrupt API
+        injected = state_store.drain_pending_messages(thread_id)
+        human_messages = list(state.get("human_messages", []))
+        if injected:
+            human_messages.extend(injected)
+            logger.info(f"Thread {thread_id[:8]} received {len(injected)} injected message(s)")
+
         # Format history from trace spans
         running_summary = None
         thread_history = trace_store.format_thread_history(
             thread_id,
-            state.get("human_messages", []),
+            human_messages,
             running_summary=running_summary,
         )
 
@@ -505,7 +513,7 @@ def build_thread_graph(
     graph = StateGraph(ThreadState)
 
     # Register nodes
-    graph.add_node("coordinator", make_coordinator_node(coordinator, trace_store, queue))
+    graph.add_node("coordinator", make_coordinator_node(coordinator, trace_store, queue, state_store))
     graph.add_node("worker", make_worker_node(worker, trace_store, queue, session_db))
     graph.add_node("finalize_complete", make_finalize_complete_node(state_store, trace_store, queue))
     graph.add_node("finalize_stuck", make_finalize_stuck_node(state_store, trace_store, queue))

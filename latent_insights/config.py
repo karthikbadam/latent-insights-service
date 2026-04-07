@@ -99,6 +99,11 @@ class AppConfig:
     max_threads: int | None = None
     initial_questions: list[str] = field(default_factory=list)
 
+    # Question source: "scout" (auto-discover), "human" (user-provided only), "both"
+    question_source: str = "scout"
+    # Free-text context to guide scout question generation
+    scout_context: str = ""
+
     # Agents
     max_worker_retries: int = 3
     max_consecutive_errors: int = 5
@@ -134,7 +139,7 @@ class AppConfig:
 
         for key in ["max_worker_retries", "max_consecutive_errors", "max_repeated_moves",
                     "llm_timeout", "num_scout_seed_questions", "max_threads",
-                    "initial_questions"]:
+                    "initial_questions", "question_source", "scout_context"]:
             if overrides.get(key) is not None:
                 setattr(cfg, key, overrides[key])
 

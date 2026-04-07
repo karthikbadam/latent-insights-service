@@ -26,6 +26,8 @@ from latent_insights.api.schemas import (
     ThreadResponse,
 )
 
+from latent_insights.models import StreamEvent, ThreadStatus
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -281,15 +283,34 @@ def continue_session(session_id: str, request: Request):
 
 @router.post("/threads/{thread_id}/messages")
 def post_message(thread_id: str, request: Request, body: PostMessageRequest):
-    """Post a human message to a stuck thread, resuming it."""
+    """Post a human message to a thread.
+
+    - If thread is WAITING or COMPLETE: resumes the thread with the message.
+    - If thread is RUNNING: injects the message into the next coordinator step
+      (non-blocking interrupt).
+    """
     config, llm, db, queue, state, trace_store = _get_state(request)
-    from latent_insights.orchestration.thread import ThreadRunner
 
     thread = state.get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
+
+    if thread.status == ThreadStatus.RUNNING:
+        # Inject message into the running thread — picked up at next coordinator step
+        state.push_pending_message(thread_id, body.content)
+        queue.emit(StreamEvent(
+            session_id=thread.session_id,
+            thread_id=thread_id,
+            event_type="message_injected",
+            message=body.content,
+            data={"content": body.content, "target": "thread"},
+        ))
+        return {"status": "injected", "thread_id": thread_id}
+
     if thread.status.value not in ("waiting", "complete"):
-        raise HTTPException(status_code=400, detail="Thread is not waiting or complete")
+        raise HTTPException(status_code=400, detail=f"Thread status '{thread.status.value}' does not accept messages")
+
+    from latent_insights.orchestration.thread import ThreadRunner
 
     session = state.get_session(thread.session_id)
     thread_db = db.open_session_connection(thread.session_id)
@@ -307,6 +328,59 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     runner.resume(human_messages=[body.content])
 
     return {"status": "resumed", "thread_id": thread_id}
+
+
+@router.post("/sessions/{session_id}/messages")
+def post_session_message(session_id: str, request: Request, body: PostMessageRequest):
+    """Broadcast a human message to all running threads in a session.
+
+    The message is injected into each running thread and picked up at
+    the next coordinator step. Also resumes any waiting threads.
+    """
+    config, llm, db, queue, state, trace_store = _get_state(request)
+
+    session = state.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    threads = state.get_threads(session_id)
+    injected_ids = []
+    resumed_ids = []
+
+    for t in threads:
+        if t.status == ThreadStatus.RUNNING:
+            state.push_pending_message(t.id, body.content)
+            injected_ids.append(t.id)
+        elif t.status == ThreadStatus.WAITING:
+            from latent_insights.orchestration.thread import ThreadRunner
+            thread_db = db.open_session_connection(session_id)
+            runner = ThreadRunner(
+                config=config, llm=llm, session_db=thread_db, queue=queue,
+                state=state, trace_store=trace_store, thread=t,
+                schema_summary=session.schema_summary or "",
+            )
+            runner.resume(human_messages=[body.content])
+            resumed_ids.append(t.id)
+
+    queue.emit(StreamEvent(
+        session_id=session_id,
+        thread_id="",
+        event_type="message_injected",
+        message=body.content,
+        data={
+            "content": body.content,
+            "target": "session",
+            "injected_threads": injected_ids,
+            "resumed_threads": resumed_ids,
+        },
+    ))
+
+    return {
+        "status": "delivered",
+        "session_id": session_id,
+        "injected_threads": len(injected_ids),
+        "resumed_threads": len(resumed_ids),
+    }
 
 
 @router.get("/sessions")

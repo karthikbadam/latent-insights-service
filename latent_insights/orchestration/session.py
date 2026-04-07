@@ -44,12 +44,21 @@ class SessionFlow:
         Full session creation flow (runs as background task):
         1. Create session DB with dataset loaded
         2. Run profiler -> store schema_summary
-        3. Run scout -> store scout_output
-        4. Spawn threads for scout questions
+        3. Optionally run scout -> store scout_output (controlled by question_source)
+        4. Spawn threads for scout/initial questions
+
+        question_source controls where seed questions come from:
+        - "scout": auto-discover questions via scout agent (default)
+        - "human": skip scout, only use initial_questions or wait for user
+        - "both": run scout AND use initial_questions
         """
         session_start = time.monotonic()
+        question_source = self.config.question_source
 
-        logger.info(f"Session {session_id} flow starting for {dataset_path}")
+        logger.info(
+            f"Session {session_id} flow starting for {dataset_path} "
+            f"(question_source={question_source})"
+        )
 
         session_db, table_name = self.db.create_session_db(session_id, dataset_path)
         self.state.update_session_table_name(session_id, table_name)
@@ -75,11 +84,41 @@ class SessionFlow:
             self._spawn_threads(session_id, initial_q_objects, schema_summary)
             logger.info(f"Session {session_id} spawned {len(initial_questions)} initial question threads")
 
+        # Skip scout if question_source is "human"
+        if question_source == "human":
+            setup_elapsed = round(time.monotonic() - session_start, 2)
+            logger.info(
+                f"Session {session_id} ready for human questions "
+                f"(profiler={profiler_ms}ms setup={setup_elapsed}s)"
+            )
+            self.queue.emit(StreamEvent(
+                session_id=session_id,
+                thread_id="",
+                event_type="session_ready",
+                message="Session profiled. Waiting for human questions.",
+                data={
+                    "question_source": "human",
+                    "schema_summary": schema_summary[:500],
+                },
+            ))
+            self.state.dump_session(session_id)
+            return session_id
+
         # Run scout with a read-only connection
+        # Prepend user-provided scout_context if available
+        scout_schema = schema_summary
+        scout_context = self.config.scout_context
+        if scout_context:
+            scout_schema = (
+                f"## User guidance\n\n{scout_context}\n\n"
+                f"Use the guidance above to focus your question discovery.\n\n"
+                f"{schema_summary}"
+            )
+
         scout_db = self.db.open_session_connection(session_id)
         t0 = time.monotonic()
         scout_output = self.scout.call(
-            schema_summary=schema_summary,
+            schema_summary=scout_schema,
             table_name=table_name,
             session_db=scout_db,
             num_questions=self.config.num_scout_seed_questions,
@@ -185,6 +224,15 @@ class SessionFlow:
             prior_context += "\n\nUse these findings to ask deeper follow-up questions."
 
         scout_schema = schema_summary + prior_context
+
+        # Prepend scout_context if provided
+        scout_context = self.config.scout_context
+        if scout_context:
+            scout_schema = (
+                f"## User guidance\n\n{scout_context}\n\n"
+                f"Use the guidance above to focus your question discovery.\n\n"
+                f"{scout_schema}"
+            )
 
         session_db = self.db.open_session_connection(session_id)
         t0 = time.monotonic()

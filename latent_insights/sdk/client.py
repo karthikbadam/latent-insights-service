@@ -96,8 +96,24 @@ class LatentInsightsClient:
         return resp.json()
 
     def post_message(self, thread_id: str, content: str) -> dict:
-        """Post a human message to a stuck thread, resuming it."""
+        """Post a human message to a thread.
+
+        If the thread is running, the message is injected into the next
+        coordinator step. If waiting/complete, the thread is resumed.
+        """
         resp = self._http.post(f"/threads/{thread_id}/messages", json={"content": content})
+        resp.raise_for_status()
+        return resp.json()
+
+    def post_session_message(self, session_id: str, content: str) -> dict:
+        """Broadcast a message to all running threads in a session.
+
+        Running threads receive it at their next coordinator step.
+        Waiting threads are resumed with the message.
+        """
+        resp = self._http.post(
+            f"/sessions/{session_id}/messages", json={"content": content},
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -191,6 +207,10 @@ class SessionHandle:
     def stream(self) -> Iterator[dict]:
         """Stream all events for this session."""
         return self._client.stream_events(self._session_id)
+
+    def send_message(self, content: str) -> dict:
+        """Broadcast a message to all running/waiting threads."""
+        return self._client.post_session_message(self._session_id, content)
 
     def continue_(self) -> dict:
         """Resume stuck threads and scout new questions."""
