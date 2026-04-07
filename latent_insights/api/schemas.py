@@ -108,3 +108,31 @@ class SessionSummary(BaseModel):
 class SystemStats(BaseModel):
     session_count: int
     thread_count: int
+
+
+# --- Pattern / graph schemas ---
+
+
+class PatternInfo(BaseModel):
+    name: str
+    description: str
+    input_schema: dict
+
+
+class RunPatternRequest(BaseModel):
+    inputs: dict = {}
+
+
+class RunPatternResponse(BaseModel):
+    thread_id: str
+    pattern: str
+    status: str
+
+
+class GraphStateResponse(BaseModel):
+    thread_id: str
+    step_number: int
+    current_node: str | None = None
+    move_history: list[str] = []
+    status: str
+    decision: dict | None = None
