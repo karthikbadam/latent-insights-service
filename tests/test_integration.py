@@ -303,7 +303,6 @@ def test_thread_loop_three_steps_done(integration_setup):
         return LLMResponse(content="{}", model=model)
 
     runner = _build_runner(setup, thread)
-    runner.llm.call = mock_call
     runner.coordinator.llm.call = mock_call
     runner.worker.llm.call = mock_call
 
@@ -364,7 +363,6 @@ def test_thread_loop_stuck_then_resume(integration_setup):
 
     # Run until stuck
     runner = _build_runner(setup, thread)
-    runner.llm.call = mock_call
     runner.coordinator.llm.call = mock_call
     runner.worker.llm.call = mock_call
 
@@ -383,7 +381,6 @@ def test_thread_loop_stuck_then_resume(integration_setup):
     )
 
     runner2 = _build_runner(setup, thread, session_db=session_db2, human_messages=["Yes, this is a known effect"])
-    runner2.llm.call = mock_call
     runner2.coordinator.llm.call = mock_call
     runner2.worker.llm.call = mock_call
 
@@ -419,7 +416,6 @@ def test_thread_emits_events(integration_setup):
         return LLMResponse(content="{}", model=model)
 
     runner = _build_runner(setup, thread)
-    runner.llm.call = mock_call
     runner.coordinator.llm.call = mock_call
     runner.worker.llm.call = mock_call
 
@@ -459,7 +455,6 @@ def test_thread_move_repetition_guard(integration_setup):
         return LLMResponse(content="{}", model=model)
 
     runner = _build_runner(setup, thread)
-    runner.llm.call = mock_call
     runner.coordinator.llm.call = mock_call
     runner.worker.llm.call = mock_call
 
@@ -487,7 +482,6 @@ def test_thread_error_becomes_waiting(integration_setup):
         return LLMResponse(content="{}", model=model)
 
     runner = _build_runner(setup, thread)
-    runner.llm.call = mock_call
     runner.coordinator.llm.call = mock_call
     runner.worker.llm.call = mock_call
 
