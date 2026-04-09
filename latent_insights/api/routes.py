@@ -500,33 +500,34 @@ def run_pattern(
         questions = inputs.get("questions", [])
         if not questions:
             raise HTTPException(status_code=400, detail="'questions' is required")
-        from latent_insights.orchestration.thread import ThreadRunner
+        from latent_insights.orchestration.patterns import fan_out_with_synthesis
 
-        thread_ids = []
-        for q in questions:
-            thread = state.create_thread(session_id, q, "", "")
-            thread_db = db.open_session_connection(session_id)
-            runner = ThreadRunner(
-                config=config, llm=llm, session_db=thread_db, queue=queue,
-                state=state, trace_store=trace_store, thread=thread,
-                schema_summary=session.schema_summary,
-            )
-            runner.start()
-            thread_ids.append(thread.id)
-        return {"pattern": pattern_name, "status": "running", "thread_ids": thread_ids}
+        thread_ids = fan_out_with_synthesis(
+            questions=questions,
+            session_id=session_id,
+            config=config, llm=llm, db=db, queue=queue,
+            state_store=state, trace_store=trace_store,
+            schema_summary=session.schema_summary,
+        )
+        return {
+            "pattern": pattern_name,
+            "status": "running",
+            "thread_ids": thread_ids,
+            "synthesis": "pending",
+        }
 
     elif pattern_name == "human_in_the_loop":
         question = inputs.get("question", "")
         if not question:
             raise HTTPException(status_code=400, detail="'question' is required")
-        from latent_insights.orchestration.thread import ThreadRunner
+        from latent_insights.orchestration.patterns import human_in_the_loop_step
 
         thread = state.create_thread(session_id, question, inputs.get("motivation", ""), "")
         thread_db = db.open_session_connection(session_id)
-        runner = ThreadRunner(
+        runner = human_in_the_loop_step(
             config=config, llm=llm, session_db=thread_db, queue=queue,
-            state=state, trace_store=trace_store, thread=thread,
-            schema_summary=session.schema_summary,
+            state_store=state, trace_store=trace_store,
+            thread=thread, schema_summary=session.schema_summary,
         )
         runner.start()
         return RunPatternResponse(
