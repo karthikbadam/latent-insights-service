@@ -191,6 +191,10 @@ def make_coordinator_node(
                 "move": decision.next_move.value,
                 "step_number": step_number,
                 "instruction": decision.worker_instruction or "",
+                # The coordinator has already committed to this move (including
+                # the early-stuck override at step <= 2). The UI can render it
+                # authoritatively rather than waiting for step_complete.
+                "provisional": False,
             },
         ))
 
@@ -282,6 +286,7 @@ def make_worker_node(
             f"coordinator={state.get('coordinator_ms', 0)}ms worker={worker_ms}ms"
         )
 
+        coordinator_ms = state.get("coordinator_ms", 0)
         queue.emit(StreamEvent(
             session_id=session_id,
             thread_id=thread_id,
@@ -290,7 +295,9 @@ def make_worker_node(
             data={
                 "step_number": step_number,
                 "move": decision.next_move.value,
+                "instruction": decision.worker_instruction or "",
                 "result": result.result,
+                "duration_ms": coordinator_ms + worker_ms,
             },
         ))
 
@@ -339,6 +346,7 @@ def make_finalize_complete_node(
             data={
                 "summary": summary,
                 "total_seconds": thread_elapsed,
+                "total_ms": round(thread_elapsed * 1000),
                 "step_count": state["step_number"],
             },
         ))

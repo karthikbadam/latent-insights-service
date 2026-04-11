@@ -20,6 +20,10 @@ class SessionConfig(BaseModel):
     temp_coordinator: float | None = None
     temp_worker: float | None = None
     max_threads: int | None = None
+    # Alias for max_threads + num_scout_seed_questions: if set, caps both the
+    # number of scout questions generated AND the total spawned thread count.
+    # max_threads takes precedence when both are provided.
+    seed_threads: int | None = None
     max_worker_retries: int | None = None
     max_consecutive_errors: int | None = None
     max_repeated_moves: int | None = None

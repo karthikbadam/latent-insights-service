@@ -146,6 +146,15 @@ class AppConfig:
             if overrides.get(key) is not None:
                 setattr(cfg, key, overrides[key])
 
+        # seed_threads is an alias that caps both scout question generation and
+        # total thread count. An explicit max_threads override (applied above)
+        # takes precedence.
+        seed_threads = overrides.get("seed_threads")
+        if seed_threads is not None:
+            cfg.num_scout_seed_questions = seed_threads
+            if overrides.get("max_threads") is None:
+                cfg.max_threads = seed_threads
+
         return cfg
 
     @classmethod

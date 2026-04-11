@@ -71,6 +71,17 @@ class SessionFlow:
         self.state.update_session_schema(session_id, schema_summary)
         logger.info(f"Session {session_id} profiled ({profiler_ms}ms)")
 
+        # Surface the full schema_summary over SSE so the UI can render the
+        # dataset panel without waiting for a snapshot refresh. Fires on both
+        # scout and human question paths.
+        self.queue.emit(StreamEvent(
+            session_id=session_id,
+            thread_id="",
+            event_type="schema_summary_ready",
+            message="Dataset profiled.",
+            data={"schema_summary": schema_summary},
+        ))
+
         # Close read-write connection — all further access is read-only
         session_db.close()
 
@@ -98,7 +109,6 @@ class SessionFlow:
                 message="Session profiled. Waiting for human questions.",
                 data={
                     "question_source": "human",
-                    "schema_summary": schema_summary[:500],
                 },
             ))
             self.state.dump_session(session_id)

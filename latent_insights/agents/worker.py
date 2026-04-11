@@ -167,12 +167,13 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
             event_type="llm_call",
             message=f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)",
             data={
-                "role": self.role,
+                "agent": self.role,
                 "model": self.current_model,
                 "input_tokens": response.input_tokens,
                 "output_tokens": response.output_tokens,
                 "duration_ms": call_ms,
                 "has_tool_calls": has_tools,
+                "response": response.content or "",
             },
         ))
 
@@ -258,7 +259,12 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
                     thread_id=self.thread_id,
                     event_type="tool_call",
                     message=sql,
-                    data={"sql": sql, "result": result_text, "duration_ms": sql_ms},
+                    data={
+                        "agent": self.role,
+                        "sql": sql,
+                        "tool_result": result_text,
+                        "duration_ms": sql_ms,
+                    },
                 ))
                 self.messages.append({
                     "role": "tool",

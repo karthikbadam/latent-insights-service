@@ -118,9 +118,26 @@ class WorkerResult:
 
 @dataclass
 class StreamEvent:
+    """
+    SSE event payload. `data` fields are flattened into the top-level JSON
+    by the SSE serializer (api/sse.py), so keys in `data` become sibling
+    fields to `thread_id`/`message`/`timestamp` on the wire.
+
+    Field naming and semantics are aligned with api/schemas.py::StepEvent so
+    the SSE stream can be used to reconstruct the same shapes the REST
+    snapshot returns. Any `duration_ms`/`total_ms` field is always an integer
+    in milliseconds.
+
+    Known event_types:
+      session-scoped:  schema_summary_ready, scout_done, session_ready,
+                       message_injected, synthesis_start
+      thread-scoped:   thread_start, step_start, llm_call, tool_call,
+                       step_complete, thread_complete, thread_waiting
+    """
+
     session_id: str
     thread_id: str
-    event_type: str  # scout_done, thread_start, step_start, llm_call, tool_call, step_complete, thread_complete, thread_waiting
+    event_type: str
     message: str  # Human-readable, e.g. "[abc123] FORAGE: Analyzing orbital periods..."
     data: dict = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)

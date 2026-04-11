@@ -129,10 +129,14 @@ When DONE, worker_instruction should be a SYNTHESIZE producing the final summary
                 session_id=self.session_id, thread_id=self.thread_id,
                 event_type="llm_call",
                 message=f"Coordinator deciding next move ({call_ms}ms)",
-                data={"role": self.role, "model": self.model,
-                      "input_tokens": response.input_tokens,
-                      "output_tokens": response.output_tokens,
-                      "duration_ms": call_ms},
+                data={
+                    "agent": self.role,
+                    "model": self.model,
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "duration_ms": call_ms,
+                    "response": response.content or "",
+                },
             ))
 
         if not response.content or not response.content.strip():
