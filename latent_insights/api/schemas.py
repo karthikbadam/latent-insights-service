@@ -26,6 +26,12 @@ class SessionConfig(BaseModel):
     llm_timeout: float | None = None
     num_scout_seed_questions: int | None = None
     initial_questions: list[str] | None = None
+    # Question source: "scout" (auto-discover), "human" (user-provided only), "both"
+    question_source: str | None = None
+    # Free-text context to guide scout question generation
+    scout_context: str | None = None
+    # Default pattern for session-spawned threads
+    default_pattern: str | None = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -108,3 +114,31 @@ class SessionSummary(BaseModel):
 class SystemStats(BaseModel):
     session_count: int
     thread_count: int
+
+
+# --- Pattern / graph schemas ---
+
+
+class PatternInfo(BaseModel):
+    name: str
+    description: str
+    input_schema: dict
+
+
+class RunPatternRequest(BaseModel):
+    inputs: dict = {}
+
+
+class RunPatternResponse(BaseModel):
+    thread_id: str
+    pattern: str
+    status: str
+
+
+class GraphStateResponse(BaseModel):
+    thread_id: str
+    step_number: int
+    current_node: str | None = None
+    move_history: list[str] = []
+    status: str
+    decision: dict | None = None

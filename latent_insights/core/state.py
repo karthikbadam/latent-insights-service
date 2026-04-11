@@ -28,6 +28,8 @@ class StateStore:
         self._threads: dict[str, Thread] = {}
         self._session_threads: dict[str, list[str]] = {}
         self._data_dir = data_dir
+        # Pending messages for running threads — thread-safe via GIL for simple dict ops
+        self._pending_messages: dict[str, list[str]] = {}
 
     # --- Sessions ---
 
@@ -108,6 +110,18 @@ class StateStore:
         thread = self._threads.get(thread_id)
         if thread:
             thread.running_summary = running_summary
+
+    # --- Pending messages (for interrupting running threads) ---
+
+    def push_pending_message(self, thread_id: str, message: str):
+        """Queue a message for a running thread. Picked up at the next coordinator step."""
+        if thread_id not in self._pending_messages:
+            self._pending_messages[thread_id] = []
+        self._pending_messages[thread_id].append(message)
+
+    def drain_pending_messages(self, thread_id: str) -> list[str]:
+        """Retrieve and clear all pending messages for a thread."""
+        return self._pending_messages.pop(thread_id, [])
 
     # --- Persistence ---
 

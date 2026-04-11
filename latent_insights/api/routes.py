@@ -11,7 +11,11 @@ from fastapi import APIRouter, Form, HTTPException, Request, UploadFile, File, Q
 
 from latent_insights.api.schemas import (
     CreateThreadRequest,
+    GraphStateResponse,
+    PatternInfo,
     PostMessageRequest,
+    RunPatternRequest,
+    RunPatternResponse,
     SessionConfig,
     SessionResponse,
     SessionSummary,
@@ -21,6 +25,8 @@ from latent_insights.api.schemas import (
     SystemStats,
     ThreadResponse,
 )
+
+from latent_insights.models import StreamEvent, ThreadStatus
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +113,20 @@ def create_session(
         except json_mod.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in config field")
         parsed = SessionConfig(**raw)
+
+        # Validate default_pattern if provided
+        if parsed.default_pattern:
+            from latent_insights.orchestration.patterns import PATTERN_REGISTRY
+            valid_patterns = {"coordinator_worker", "fan_out", "human_in_the_loop"}
+            if parsed.default_pattern not in valid_patterns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unknown default_pattern '{parsed.default_pattern}'. "
+                        f"Must be one of: {sorted(valid_patterns)}"
+                    ),
+                )
+
         session_config = config.with_overrides(parsed.model_dump())
 
     if file and file.filename:
@@ -277,15 +297,34 @@ def continue_session(session_id: str, request: Request):
 
 @router.post("/threads/{thread_id}/messages")
 def post_message(thread_id: str, request: Request, body: PostMessageRequest):
-    """Post a human message to a stuck thread, resuming it."""
+    """Post a human message to a thread.
+
+    - If thread is WAITING or COMPLETE: resumes the thread with the message.
+    - If thread is RUNNING: injects the message into the next coordinator step
+      (non-blocking interrupt).
+    """
     config, llm, db, queue, state, trace_store = _get_state(request)
-    from latent_insights.orchestration.thread import ThreadRunner
 
     thread = state.get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
+
+    if thread.status == ThreadStatus.RUNNING:
+        # Inject message into the running thread — picked up at next coordinator step
+        state.push_pending_message(thread_id, body.content)
+        queue.emit(StreamEvent(
+            session_id=thread.session_id,
+            thread_id=thread_id,
+            event_type="message_injected",
+            message=body.content,
+            data={"content": body.content, "target": "thread"},
+        ))
+        return {"status": "injected", "thread_id": thread_id}
+
     if thread.status.value not in ("waiting", "complete"):
-        raise HTTPException(status_code=400, detail="Thread is not waiting or complete")
+        raise HTTPException(status_code=400, detail=f"Thread status '{thread.status.value}' does not accept messages")
+
+    from latent_insights.orchestration.thread import ThreadRunner
 
     session = state.get_session(thread.session_id)
     thread_db = db.open_session_connection(thread.session_id)
@@ -303,6 +342,59 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     runner.resume(human_messages=[body.content])
 
     return {"status": "resumed", "thread_id": thread_id}
+
+
+@router.post("/sessions/{session_id}/messages")
+def post_session_message(session_id: str, request: Request, body: PostMessageRequest):
+    """Broadcast a human message to all running threads in a session.
+
+    The message is injected into each running thread and picked up at
+    the next coordinator step. Also resumes any waiting threads.
+    """
+    config, llm, db, queue, state, trace_store = _get_state(request)
+
+    session = state.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    threads = state.get_threads(session_id)
+    injected_ids = []
+    resumed_ids = []
+
+    for t in threads:
+        if t.status == ThreadStatus.RUNNING:
+            state.push_pending_message(t.id, body.content)
+            injected_ids.append(t.id)
+        elif t.status == ThreadStatus.WAITING:
+            from latent_insights.orchestration.thread import ThreadRunner
+            thread_db = db.open_session_connection(session_id)
+            runner = ThreadRunner(
+                config=config, llm=llm, session_db=thread_db, queue=queue,
+                state=state, trace_store=trace_store, thread=t,
+                schema_summary=session.schema_summary or "",
+            )
+            runner.resume(human_messages=[body.content])
+            resumed_ids.append(t.id)
+
+    queue.emit(StreamEvent(
+        session_id=session_id,
+        thread_id="",
+        event_type="message_injected",
+        message=body.content,
+        data={
+            "content": body.content,
+            "target": "session",
+            "injected_threads": injected_ids,
+            "resumed_threads": resumed_ids,
+        },
+    ))
+
+    return {
+        "status": "delivered",
+        "session_id": session_id,
+        "injected_threads": len(injected_ids),
+        "resumed_threads": len(resumed_ids),
+    }
 
 
 @router.get("/sessions")
@@ -363,4 +455,135 @@ def system_stats(request: Request) -> SystemStats:
     return SystemStats(
         session_count=state.session_count,
         thread_count=state.thread_count,
+    )
+
+
+# --- Patterns ---
+
+
+@router.get("/patterns")
+def list_patterns() -> list[PatternInfo]:
+    """List available agentic patterns."""
+    from latent_insights.orchestration.patterns import PATTERN_REGISTRY
+
+    return [PatternInfo(**p) for p in PATTERN_REGISTRY.values()]
+
+
+@router.post("/sessions/{session_id}/patterns/{pattern_name}")
+def run_pattern(
+    session_id: str,
+    pattern_name: str,
+    request: Request,
+    body: RunPatternRequest,
+):
+    """Run a named pattern for a session."""
+    config, llm, db, queue, state, trace_store = _get_state(request)
+    from latent_insights.orchestration.patterns import PATTERN_REGISTRY
+
+    session = state.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.schema_summary is None:
+        raise HTTPException(status_code=400, detail="Session profiling not complete yet")
+    if pattern_name not in PATTERN_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Unknown pattern: {pattern_name}")
+
+    inputs = body.inputs
+
+    if pattern_name == "coordinator_worker":
+        question = inputs.get("question", "")
+        if not question:
+            raise HTTPException(status_code=400, detail="'question' is required")
+        from latent_insights.orchestration.thread import ThreadRunner
+
+        thread = state.create_thread(
+            session_id, question, inputs.get("motivation", ""), "",
+        )
+        thread_db = db.open_session_connection(session_id)
+        runner = ThreadRunner(
+            config=config, llm=llm, session_db=thread_db, queue=queue,
+            state=state, trace_store=trace_store, thread=thread,
+            schema_summary=session.schema_summary,
+        )
+        runner.start()
+        return RunPatternResponse(
+            thread_id=thread.id, pattern=pattern_name, status="running",
+        )
+
+    elif pattern_name == "fan_out":
+        questions = inputs.get("questions", [])
+        if not questions:
+            raise HTTPException(status_code=400, detail="'questions' is required")
+        from latent_insights.orchestration.patterns import fan_out_with_synthesis
+
+        thread_ids = fan_out_with_synthesis(
+            questions=questions,
+            session_id=session_id,
+            config=config, llm=llm, db=db, queue=queue,
+            state_store=state, trace_store=trace_store,
+            schema_summary=session.schema_summary,
+        )
+        return {
+            "pattern": pattern_name,
+            "status": "running",
+            "thread_ids": thread_ids,
+            "synthesis": "pending",
+        }
+
+    elif pattern_name == "human_in_the_loop":
+        question = inputs.get("question", "")
+        if not question:
+            raise HTTPException(status_code=400, detail="'question' is required")
+        from latent_insights.orchestration.patterns import human_in_the_loop_step
+
+        thread = state.create_thread(session_id, question, inputs.get("motivation", ""), "")
+        thread_db = db.open_session_connection(session_id)
+        runner = human_in_the_loop_step(
+            config=config, llm=llm, session_db=thread_db, queue=queue,
+            state_store=state, trace_store=trace_store,
+            thread=thread, schema_summary=session.schema_summary,
+        )
+        runner.start()
+        return RunPatternResponse(
+            thread_id=thread.id, pattern=pattern_name, status="running",
+        )
+
+    raise HTTPException(status_code=400, detail=f"Pattern '{pattern_name}' not yet implemented")
+
+
+# --- Graph State (debug) ---
+
+
+@router.get("/threads/{thread_id}/graph-state")
+def get_graph_state(thread_id: str, request: Request):
+    """Inspect the current LangGraph state for a thread."""
+    _, _, _, _, state, trace_store = _get_state(request)
+
+    thread = state.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    spans = trace_store.get_step_spans(thread_id)
+    if not spans:
+        trace_store.load_trace(thread_id, thread.session_id)
+        spans = trace_store.get_step_spans(thread_id)
+
+    move_history = []
+    for span in spans:
+        move = span.attributes.get("move")
+        if move:
+            move_history.append(move)
+
+    # Determine current node from thread status
+    current_node = None
+    if thread.status.value == "running":
+        current_node = "coordinator" if not spans or spans[-1].end_time else "worker"
+
+    return GraphStateResponse(
+        thread_id=thread_id,
+        step_number=len(spans),
+        current_node=current_node,
+        move_history=move_history,
+        status=thread.status.value,
+        decision=spans[-1].attributes if spans else None,
     )

@@ -24,9 +24,13 @@ dependencies = [
     "pydantic>=2.10",
     "sse-starlette>=2.2",
     "python-multipart>=0.0.18",
+    "langgraph>=0.2",
 ]
 
 [project.optional-dependencies]
+sdk = [
+    "httpx>=0.28",
+]
 dev = [
     "ruff>=0.9",
     "pytest>=8.3",
