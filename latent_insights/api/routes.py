@@ -113,6 +113,20 @@ def create_session(
         except json_mod.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in config field")
         parsed = SessionConfig(**raw)
+
+        # Validate default_pattern if provided
+        if parsed.default_pattern:
+            from latent_insights.orchestration.patterns import PATTERN_REGISTRY
+            valid_patterns = {"coordinator_worker", "fan_out", "human_in_the_loop"}
+            if parsed.default_pattern not in valid_patterns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unknown default_pattern '{parsed.default_pattern}'. "
+                        f"Must be one of: {sorted(valid_patterns)}"
+                    ),
+                )
+
         session_config = config.with_overrides(parsed.model_dump())
 
     if file and file.filename:

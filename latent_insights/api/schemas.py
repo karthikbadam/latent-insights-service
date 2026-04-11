@@ -30,6 +30,8 @@ class SessionConfig(BaseModel):
     question_source: str | None = None
     # Free-text context to guide scout question generation
     scout_context: str | None = None
+    # Default pattern for session-spawned threads
+    default_pattern: str | None = None
 
 
 class CreateSessionRequest(BaseModel):

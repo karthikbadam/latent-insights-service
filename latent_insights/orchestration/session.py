@@ -283,7 +283,54 @@ class SessionFlow:
         return session_id
 
     def _spawn_threads(self, session_id: str, questions, schema_summary: str):
-        """Create and start threads for a list of scout questions."""
+        """Create and start threads for a list of questions using the configured pattern.
+
+        Pattern dispatch:
+        - "coordinator_worker" (default): one ThreadRunner per question, independent
+        - "fan_out": spawn all questions as a fan-out with post-hoc synthesis
+        - "human_in_the_loop": each thread pauses after every step for human review
+        """
+        pattern = self.config.default_pattern
+        if not questions:
+            return
+
+        if pattern == "fan_out":
+            from latent_insights.orchestration.patterns import fan_out_with_synthesis
+            question_texts = [q.question for q in questions]
+            fan_out_with_synthesis(
+                questions=question_texts,
+                session_id=session_id,
+                config=self.config,
+                llm=self.llm,
+                db=self.db,
+                queue=self.queue,
+                state_store=self.state,
+                trace_store=self.trace_store,
+                schema_summary=schema_summary,
+            )
+            return
+
+        if pattern == "human_in_the_loop":
+            from latent_insights.orchestration.patterns import human_in_the_loop_step
+            for q in questions:
+                thread = self.state.create_thread(
+                    session_id, q.question, q.motivation, q.entry_point,
+                )
+                thread_db = self.db.open_session_connection(session_id)
+                runner = human_in_the_loop_step(
+                    config=self.config,
+                    llm=self.llm,
+                    session_db=thread_db,
+                    queue=self.queue,
+                    state_store=self.state,
+                    trace_store=self.trace_store,
+                    thread=thread,
+                    schema_summary=schema_summary,
+                )
+                runner.start()
+            return
+
+        # Default: coordinator_worker
         for q in questions:
             thread = self.state.create_thread(
                 session_id, q.question, q.motivation, q.entry_point,

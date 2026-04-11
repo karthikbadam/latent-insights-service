@@ -103,6 +103,8 @@ class AppConfig:
     question_source: str = "scout"
     # Free-text context to guide scout question generation
     scout_context: str = ""
+    # Default pattern for session-spawned threads: "coordinator_worker", "fan_out", "human_in_the_loop"
+    default_pattern: str = "coordinator_worker"
 
     # Agents
     max_worker_retries: int = 3
@@ -139,7 +141,8 @@ class AppConfig:
 
         for key in ["max_worker_retries", "max_consecutive_errors", "max_repeated_moves",
                     "llm_timeout", "num_scout_seed_questions", "max_threads",
-                    "initial_questions", "question_source", "scout_context"]:
+                    "initial_questions", "question_source", "scout_context",
+                    "default_pattern"]:
             if overrides.get(key) is not None:
                 setattr(cfg, key, overrides[key])
 

@@ -22,13 +22,16 @@ def pattern_setup(tmp_path):
     queue = Queue()
     state = StateStore(data_dir=str(tmp_path))
     trace_store = TraceStore(data_dir=str(tmp_path))
-    return {
-        "config": config,
-        "queue": queue,
-        "state": state,
-        "trace_store": trace_store,
-        "tmp_path": tmp_path,
-    }
+    try:
+        yield {
+            "config": config,
+            "queue": queue,
+            "state": state,
+            "trace_store": trace_store,
+            "tmp_path": tmp_path,
+        }
+    finally:
+        queue.shutdown(wait=False)
 
 
 def _make_coordinator_response(status, move, instruction=None):
@@ -96,10 +99,11 @@ class TestFanOutWithSynthesis:
         session_db.close()
         state.update_session_schema(session.id, "test schema")
 
-        mock_call = _make_mock_call(done_on_step=1)
-
-        with patch("latent_insights.orchestration.thread.ThreadRunner.start") as mock_start:
-            # Prevent actual graph execution, just verify thread creation
+        # Patch ThreadRunner.start to be a no-op, AND patch queue.schedule
+        # so the synthesis wait task never runs (it would block for hours
+        # waiting on done_events that never fire).
+        with patch("latent_insights.orchestration.thread.ThreadRunner.start"), \
+             patch.object(queue, "schedule") as mock_schedule:
             thread_ids = fan_out_with_synthesis(
                 questions=["Q1?", "Q2?", "Q3?"],
                 session_id=session.id,
@@ -107,6 +111,10 @@ class TestFanOutWithSynthesis:
                 state_store=state, trace_store=trace_store,
                 schema_summary="test schema",
             )
+            # Verify synthesis task was scheduled
+            assert mock_schedule.called
+            scheduled_task = mock_schedule.call_args.kwargs.get("task_id", "")
+            assert "fanout-synth" in scheduled_task
 
         # Should have created 3 analysis threads
         assert len(thread_ids) == 3
@@ -268,3 +276,135 @@ class TestPatternRegistry:
         hitl = PATTERN_REGISTRY["human_in_the_loop"]
         assert "question" in hitl["input_schema"]
         assert hitl["input_schema"]["question"]["type"] == "string"
+
+
+# ---------------------------------------------------------------------------
+# SessionFlow default_pattern dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestSessionFlowPatternDispatch:
+    def test_default_pattern_coordinator_worker(self, pattern_setup, tmp_path):
+        """default_pattern='coordinator_worker' uses ThreadRunner per question."""
+        from latent_insights.db.connection import Database
+        from latent_insights.models import ScoutQuestion
+        from latent_insights.orchestration.session import SessionFlow
+
+        config = AppConfig(default_pattern="coordinator_worker", data_dir=str(tmp_path))
+        state = pattern_setup["state"]
+        queue = pattern_setup["queue"]
+        trace_store = pattern_setup["trace_store"]
+        db = Database(data_dir=str(tmp_path))
+
+        csv_path = str(tmp_path / "test.csv")
+        with open(csv_path, "w") as f:
+            f.write("a,b,c\n1,2,3\n")
+        session = state.create_session(csv_path, "test")
+        session_db, _ = db.create_session_db(session.id, csv_path)
+        session_db.close()
+        state.update_session_schema(session.id, "test schema")
+
+        flow = SessionFlow(config, MagicMock(), db, queue, state, trace_store)
+
+        questions = [
+            ScoutQuestion(question="Q1?", motivation="", entry_point="", difficulty="moderate"),
+            ScoutQuestion(question="Q2?", motivation="", entry_point="", difficulty="moderate"),
+        ]
+
+        with patch("latent_insights.orchestration.thread.ThreadRunner.start") as mock_start:
+            flow._spawn_threads(session.id, questions, "test schema")
+            # coordinator_worker: one ThreadRunner.start() per question
+            assert mock_start.call_count == 2
+
+        # Two threads created
+        threads = state.get_threads(session.id)
+        assert len(threads) == 2
+
+    def test_default_pattern_fan_out(self, pattern_setup, tmp_path):
+        """default_pattern='fan_out' calls fan_out_with_synthesis."""
+        from latent_insights.db.connection import Database
+        from latent_insights.models import ScoutQuestion
+        from latent_insights.orchestration.session import SessionFlow
+
+        config = AppConfig(default_pattern="fan_out", data_dir=str(tmp_path))
+        state = pattern_setup["state"]
+        queue = pattern_setup["queue"]
+        trace_store = pattern_setup["trace_store"]
+        db = Database(data_dir=str(tmp_path))
+
+        csv_path = str(tmp_path / "test.csv")
+        with open(csv_path, "w") as f:
+            f.write("a,b,c\n1,2,3\n")
+        session = state.create_session(csv_path, "test")
+        session_db, _ = db.create_session_db(session.id, csv_path)
+        session_db.close()
+
+        flow = SessionFlow(config, MagicMock(), db, queue, state, trace_store)
+
+        questions = [
+            ScoutQuestion(question="Q1?", motivation="", entry_point="", difficulty="moderate"),
+            ScoutQuestion(question="Q2?", motivation="", entry_point="", difficulty="moderate"),
+            ScoutQuestion(question="Q3?", motivation="", entry_point="", difficulty="moderate"),
+        ]
+
+        with patch(
+            "latent_insights.orchestration.patterns.fan_out_with_synthesis"
+        ) as mock_fan_out:
+            mock_fan_out.return_value = ["t1", "t2", "t3"]
+            flow._spawn_threads(session.id, questions, "test schema")
+            assert mock_fan_out.called
+            call_kwargs = mock_fan_out.call_args.kwargs
+            assert call_kwargs["questions"] == ["Q1?", "Q2?", "Q3?"]
+            assert call_kwargs["session_id"] == session.id
+
+    def test_default_pattern_human_in_the_loop(self, pattern_setup, tmp_path):
+        """default_pattern='human_in_the_loop' uses human_in_the_loop_step."""
+        from latent_insights.db.connection import Database
+        from latent_insights.models import ScoutQuestion
+        from latent_insights.orchestration.session import SessionFlow
+
+        config = AppConfig(default_pattern="human_in_the_loop", data_dir=str(tmp_path))
+        state = pattern_setup["state"]
+        queue = pattern_setup["queue"]
+        trace_store = pattern_setup["trace_store"]
+        db = Database(data_dir=str(tmp_path))
+
+        csv_path = str(tmp_path / "test.csv")
+        with open(csv_path, "w") as f:
+            f.write("a,b,c\n1,2,3\n")
+        session = state.create_session(csv_path, "test")
+        session_db, _ = db.create_session_db(session.id, csv_path)
+        session_db.close()
+
+        flow = SessionFlow(config, MagicMock(), db, queue, state, trace_store)
+
+        questions = [
+            ScoutQuestion(question="Q1?", motivation="", entry_point="", difficulty="moderate"),
+            ScoutQuestion(question="Q2?", motivation="", entry_point="", difficulty="moderate"),
+        ]
+
+        with patch(
+            "latent_insights.orchestration.patterns.human_in_the_loop_step"
+        ) as mock_hitl:
+            mock_runner = MagicMock()
+            mock_hitl.return_value = mock_runner
+            flow._spawn_threads(session.id, questions, "test schema")
+            assert mock_hitl.call_count == 2
+            assert mock_runner.start.call_count == 2
+
+    def test_empty_questions_does_nothing(self, pattern_setup, tmp_path):
+        """_spawn_threads with empty list returns early, no threads created."""
+        from latent_insights.db.connection import Database
+        from latent_insights.orchestration.session import SessionFlow
+
+        config = AppConfig(default_pattern="coordinator_worker", data_dir=str(tmp_path))
+        state = pattern_setup["state"]
+        queue = pattern_setup["queue"]
+        trace_store = pattern_setup["trace_store"]
+        db = Database(data_dir=str(tmp_path))
+
+        session = state.create_session("test.csv", "test")
+        flow = SessionFlow(config, MagicMock(), db, queue, state, trace_store)
+
+        flow._spawn_threads(session.id, [], "test schema")
+        assert len(state.get_threads(session.id)) == 0

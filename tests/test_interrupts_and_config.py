@@ -207,6 +207,16 @@ class TestAppConfigExtensions:
         assert new.question_source == "human"
         assert new.scout_context == "test"
 
+    def test_default_pattern_default(self):
+        config = AppConfig()
+        assert config.default_pattern == "coordinator_worker"
+
+    def test_with_overrides_default_pattern(self):
+        config = AppConfig()
+        new = config.with_overrides({"default_pattern": "fan_out"})
+        assert new.default_pattern == "fan_out"
+        assert config.default_pattern == "coordinator_worker"  # original unchanged
+
 
 # ---------------------------------------------------------------------------
 # SessionFlow: question_source="human" skips scout
