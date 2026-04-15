@@ -21,7 +21,7 @@ from latent_insights.core.llm import LLMClient
 from latent_insights.core.queue import Queue
 from latent_insights.core.state import StateStore
 from latent_insights.core.tracing import TraceStore
-from latent_insights.models import Thread, ThreadStatus
+from latent_insights.models import StreamEvent, Thread, ThreadStatus
 from latent_insights.orchestration.graph import ThreadState, build_thread_graph
 
 logger = logging.getLogger(__name__)
@@ -154,6 +154,22 @@ class ThreadRunner:
         self._initial_state["thread_start"] = time.monotonic()
 
         self.state.update_thread_status(self.thread.id, ThreadStatus.RUNNING)
+
+        # Signal WAITING/COMPLETE -> RUNNING transition so the UI can leave the
+        # terminal state before the next step_start arrives. Without this, the
+        # card stays pinned to WAITING/COMPLETE while step events stream under
+        # it.
+        self.queue.emit(StreamEvent(
+            session_id=self.thread.session_id,
+            thread_id=self.thread.id,
+            event_type="thread_resumed",
+            message=self.thread.seed_question,
+            data={
+                "from_step": existing_steps,
+                "human_messages": self.human_messages,
+            },
+        ))
+
         self.start()
 
     # --- Internal ---

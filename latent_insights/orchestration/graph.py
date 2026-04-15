@@ -10,6 +10,7 @@ move repetition) that was previously scattered across callbacks.
 import logging
 import time
 from dataclasses import asdict
+from datetime import timezone
 from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -107,8 +108,20 @@ def make_coordinator_node(
             running_summary=running_summary,
         )
 
-        # Emit thread_start on first step
+        # Emit thread_start on first step. Stamp with the thread's creation
+        # time (earliest guaranteed moment for this thread) and step_number=0
+        # so any FE ordering by (step_number, timestamp) places START before
+        # the first step_start even when the coordinator LLM call is fast.
         if step_number == 1:
+            thread_obj = state_store.get_thread(thread_id)
+            if thread_obj:
+                # created_at is a naive datetime semantically in UTC; treat
+                # it as such so the Unix timestamp matches time.time().
+                created_ts = thread_obj.created_at.replace(
+                    tzinfo=timezone.utc
+                ).timestamp()
+            else:
+                created_ts = time.time()
             queue.emit(StreamEvent(
                 session_id=session_id,
                 thread_id=thread_id,
@@ -118,7 +131,9 @@ def make_coordinator_node(
                     "seed_question": state["seed_question"],
                     "motivation": state.get("motivation", ""),
                     "entry_point": state.get("entry_point", ""),
+                    "step_number": 0,
                 },
+                timestamp=created_ts,
             ))
 
         # Start trace span
@@ -297,7 +312,11 @@ def make_worker_node(
             span = spans[-1]
             if result.llm_calls:
                 for call in result.llm_calls:
-                    trace_store.add_event(span, "llm_call", call)
+                    # Worker tags each record with its event vocabulary
+                    # ("llm_call" for LLM turns, "tool_call" for SQL execs).
+                    # Trust the producer; the record's own `type` is the
+                    # event name on the trace.
+                    trace_store.add_event(span, call["type"], call)
             span.attributes.update({
                 "move": decision.next_move.value,
                 "instruction": decision.worker_instruction,
@@ -374,6 +393,11 @@ def make_finalize_complete_node(
                 "total_seconds": thread_elapsed,
                 "total_ms": round(thread_elapsed * 1000),
                 "step_count": state["step_number"],
+                # Terminal marker: FE uses this to render a COMPLETE node in
+                # the DAG viz without maintaining client-side state. Paired
+                # with step_number so the terminal lands after the last step.
+                "is_terminal": True,
+                "step_number": state["step_number"] + 1,
             },
         ))
         return {"status": "complete"}
@@ -402,6 +426,7 @@ def emit_thread_waiting(
     """
     # End current span if still open
     spans = trace_store.get_step_spans(thread_id)
+    step_count = len(spans)
     if spans and spans[-1].end_time is None:
         span = spans[-1]
         span.attributes.setdefault("result", f"{reason}: {context or error or ''}")
@@ -431,6 +456,10 @@ def emit_thread_waiting(
             "context": context,
             "error": error,
             "running_summary": running_summary,
+            # Terminal marker for the WAITING branch of the DAG viz. Paired
+            # with step_number so the terminal lands after the last step.
+            "is_terminal": True,
+            "step_number": step_count + 1,
         },
     ))
 

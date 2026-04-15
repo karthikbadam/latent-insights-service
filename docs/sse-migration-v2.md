@@ -135,6 +135,10 @@ them to match snapshot fidelity.
 | `thread_waiting`  | `running_summary`   | Thread's accumulated findings so far (or `null`).         |
 | `thread_waiting`  | `error`             | Non-null only on the error path.                          |
 | `thread_complete` | `total_ms`          | Integer ms. `total_seconds` (float) still present for bwc.|
+| `thread_resumed`  | —                   | New event. Fires on WAITING/COMPLETE → RUNNING; UI should leave the terminal state. Carries `from_step` and `human_messages`. |
+| `thread_start`    | `step_number: 0`    | Sort hint. Event is also stamped with `thread.created_at` so sorting by `(step_number, timestamp)` places START first. |
+| `thread_complete` | `is_terminal: true` | Terminal-node render flag. Paired with `step_number` (= last step + 1) so FE can place the terminal after the final step. |
+| `thread_waiting`  | `is_terminal: true` | Same as above for the WAITING branch. |
 
 ### Why `step_number` and `move` on every event
 
@@ -261,6 +265,37 @@ streaming equivalent:
       from the upload call; keep only the `config` JSON field.
 - [ ] Update the session-upload code path so the UI no longer tries to
       read `schema_summary` from `session_ready` (it has been removed).
+
+---
+
+## `llm_call` vs `tool_call` contract
+
+Both the SSE stream and the REST snapshot's `step.events[]` now agree on
+which record type represents an LLM turn and which represents a tool
+execution.
+
+**`llm_call`** — one per LLM turn (coordinator or worker). Carries the
+model's decision for the turn.
+
+Required fields: `agent`, `model`, `input_tokens`, `output_tokens`,
+`duration_ms` (LLM call latency), `response`.
+
+- `response` is always populated. For a final-answer turn it is the JSON
+  answer; for a tool-use turn it is the SQL string(s) the model decided
+  to run (multiple tool calls are newline-joined).
+- Never carries `sql` or `tool_result`.
+
+**`tool_call`** — one per executed SQL (worker only).
+
+Required fields: `agent: "worker"`, `sql`, `tool_result`, `duration_ms`
+(SQL execution time — not LLM latency).
+
+- Never carries `model`, `input_tokens`, `output_tokens`, or `response`.
+  That metadata lives on the sibling `llm_call` for the turn that
+  produced this SQL.
+
+A worker tool-use turn emits: one `llm_call` (with `response` = the SQL
+string) followed by one `tool_call` per executed SQL statement.
 
 ---
 

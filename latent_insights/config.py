@@ -15,8 +15,8 @@ PROVIDER_DEFAULTS = {
         "api_key": "",
         "think": True,
         "models": {
-            "profiler": "google/gemini-2.5-flash",
-            "scout": "google/gemini-2.5-flash",
+            "profiler": "google/gemini-2.5-flash-lite:nitro",
+            "scout": "google/gemini-2.5-flash-lite:nitro",
             "coordinator": "openai/gpt-oss-20b:nitro",
             "worker": "openai/gpt-oss-20b:nitro",
             "worker_fallback": "openai/gpt-oss-20b:nitro",

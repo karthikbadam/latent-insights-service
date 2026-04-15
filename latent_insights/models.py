@@ -131,8 +131,9 @@ class StreamEvent:
     Known event_types:
       session-scoped:  schema_summary_ready, scout_done, session_ready,
                        message_injected, synthesis_start
-      thread-scoped:   thread_start, step_start, llm_call, tool_call,
-                       step_complete, thread_complete, thread_waiting
+      thread-scoped:   thread_start, thread_resumed, step_start, llm_call,
+                       tool_call, step_complete, thread_complete,
+                       thread_waiting
     """
 
     session_id: str

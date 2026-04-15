@@ -44,7 +44,8 @@ Suggested entry point: {entry_point}
 **FORAGE** — Exploratory analysis. Distributions, correlations, groups, outliers.
 **FRAME** — Propose tentative insight/hypothesis. State as testable claim.
 **INTERROGATE** — Stress-test the frame. Contradictions, subgroups, confounds.
-**SYNTHESIZE** — Thread conclusion. Finding, confidence, limitations.
+**SYNTHESIZE** — Terminal move. Thread conclusion: finding, confidence, limitations.
+                 Always pair with status=DONE on the same step.
 
 No fixed order. Let data guide you.
 
@@ -65,7 +66,9 @@ Return JSON:
 }}
 
 When STUCK, replace worker_instruction with question_for_human and context.
-When DONE, worker_instruction should be a SYNTHESIZE producing the final summary.
+When DONE, next_move must be SYNTHESIZE and worker_instruction should produce
+the final summary. Never emit next_move=SYNTHESIZE with status=CONTINUE —
+SYNTHESIZE is terminal and must be paired with status=DONE on the same step.
 
 ### Quality standards
 - Never report stats without context. Push toward "so what?"
@@ -165,6 +168,13 @@ When DONE, worker_instruction should be a SYNTHESIZE producing the final summary
         if decision.status == CoordinatorStatus.DONE and decision.next_move != MoveType.SYNTHESIZE:
             logger.warning("Coordinator returned DONE without SYNTHESIZE — correcting")
             decision.next_move = MoveType.SYNTHESIZE
+
+        if (
+            decision.next_move == MoveType.SYNTHESIZE
+            and decision.status == CoordinatorStatus.CONTINUE
+        ):
+            logger.warning("Coordinator returned SYNTHESIZE with CONTINUE — forcing DONE")
+            decision.status = CoordinatorStatus.DONE
 
         if decision.status == CoordinatorStatus.STUCK and not decision.question_for_human:
             logger.warning("Coordinator returned STUCK without question — adding default")

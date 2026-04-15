@@ -19,6 +19,30 @@ from latent_insights.models import StreamEvent, WorkerResult
 logger = logging.getLogger(__name__)
 
 
+def _extract_tool_sql(tool_calls: list[dict] | None) -> str:
+    """Join the SQL strings the model emitted across its tool_calls for a turn.
+
+    Used to populate the `response` field of an `llm_call` record when the
+    model only emitted tool_calls (empty content). Malformed JSON in a single
+    arg block is tolerated: that call is skipped but others still land.
+    """
+    if not tool_calls:
+        return ""
+    sqls: list[str] = []
+    for tc in tool_calls:
+        func = tc.get("function") or {}
+        if func.get("name") != "run_sql":
+            continue
+        try:
+            args = json.loads(func.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            continue
+        sql = args.get("sql")
+        if sql:
+            sqls.append(sql)
+    return "\n\n".join(sqls)
+
+
 class Worker(Agent):
     """Executes analytical steps via SQL tool-use loop."""
 
@@ -174,6 +198,13 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
         call_ms = round((time.monotonic() - t0) * 1000)
 
         has_tools = bool(response.tool_calls)
+        # `response` on an llm_call is the model's decision for this turn:
+        # either its text (JSON final answer or intermediate reasoning) or,
+        # when it's only emitting tool calls, the SQL it decided to run.
+        response_text = response.content or ""
+        if not response_text and has_tools:
+            response_text = _extract_tool_sql(response.tool_calls)
+
         self.queue.emit(StreamEvent(
             session_id=self.session_id,
             thread_id=self.thread_id,
@@ -186,7 +217,7 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
                 "output_tokens": response.output_tokens,
                 "duration_ms": call_ms,
                 "has_tool_calls": has_tools,
-                "response": response.content or "",
+                "response": response_text,
                 "step_number": self.step_number,
                 "move": self.current_move,
             },
@@ -204,7 +235,7 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
         """Worker returned a final text response (no tool calls)."""
         self.llm_calls.append({
             "agent": self.role,
-            "type": "response",
+            "type": "llm_call",
             "duration_ms": call_ms,
             "model": response.model,
             "input_tokens": response.input_tokens,
@@ -262,7 +293,30 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
         for tool_call in response.tool_calls:
             func = tool_call["function"]
             if func["name"] == "run_sql":
-                args = json.loads(func["arguments"])
+                try:
+                    args = json.loads(func["arguments"])
+                except json.JSONDecodeError as e:
+                    # Malformed tool_call arguments (e.g. unterminated string
+                    # from a truncated response). Don't crash — respond with a
+                    # `tool` message so the conversation stays balanced and
+                    # nudge the model to reissue with valid JSON.
+                    logger.warning(
+                        f"Worker tool_call arguments malformed JSON: {e} "
+                        f"(raw: {func['arguments'][:200]!r})"
+                    )
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": (
+                            f"TOOL CALL ERROR: your `run_sql` arguments were "
+                            f"malformed JSON ({e}). Reissue the tool call with "
+                            f"valid JSON of the form "
+                            f'{{"sql": "SELECT ..."}}. Keep the SQL on a single '
+                            f"line and properly escape any quotes."
+                        ),
+                    })
+                    self.consecutive_errors += 1
+                    continue
                 sql = args.get("sql", "")
                 logger.info(f"Worker executing SQL: {sql[:200]}")
                 t_sql = time.monotonic()
@@ -288,7 +342,7 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
                     "tool_call_id": tool_call["id"],
                     "content": result_text,
                 })
-                tool_results.append({"sql": sql, "result": result_text})
+                tool_results.append({"sql": sql, "result": result_text, "sql_ms": sql_ms})
                 if result_text.startswith("SQL ERROR:"):
                     self.consecutive_errors += 1
                 else:
@@ -300,16 +354,28 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
                     "content": f"Unknown tool: {func['name']}",
                 })
 
+        # One llm_call record per LLM turn (this function is invoked once per
+        # turn). Its `response` is the SQL the model decided to run, so the
+        # trace/REST shows the same content as the SSE llm_call event for this
+        # turn.
+        self.llm_calls.append({
+            "agent": self.role,
+            "type": "llm_call",
+            "duration_ms": call_ms,
+            "model": response.model,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "response": _extract_tool_sql(response.tool_calls),
+        })
+        # One tool_call record per executed SQL. Tool fields only — no LLM
+        # metadata; that lives on the sibling llm_call above.
         for tr in tool_results:
             self.llm_calls.append({
                 "agent": self.role,
                 "type": "tool_call",
-                "duration_ms": call_ms,
-                "model": response.model,
-                "input_tokens": response.input_tokens,
-                "output_tokens": response.output_tokens,
                 "sql": tr["sql"],
                 "tool_result": tr["result"],
+                "duration_ms": tr["sql_ms"],
             })
 
         # Error guardrails

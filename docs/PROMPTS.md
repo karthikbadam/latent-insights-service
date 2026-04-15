@@ -406,8 +406,9 @@ Suggested entry point: {entry_point}
 **INTERROGATE** — Stress-test the frame. Contradictions, subgroups,
   confounds, edge cases.
 
-**SYNTHESIZE** — Thread conclusion. Finding, confidence, limitations,
-  what would change your mind.
+**SYNTHESIZE** — Terminal move. Thread conclusion: finding, confidence,
+  limitations, what would change your mind. Always pair with status=DONE
+  on the same step.
 
 No fixed order. Forage twice before framing. Interrogate then reframe.
 Let data guide you.
@@ -444,7 +445,10 @@ Replace worker_instruction with:
 
 ### When DONE
 
-Worker instruction should be SYNTHESIZE producing final summary.
+next_move must be SYNTHESIZE and worker_instruction should produce the
+final summary. Never emit next_move=SYNTHESIZE with status=CONTINUE —
+SYNTHESIZE is terminal and must be paired with status=DONE on the same
+step.
 
 ### Quality standards
 
