@@ -4,6 +4,7 @@ API routes — thin HTTP layer over orchestration.
 
 import logging
 import os
+import time
 
 import json as json_mod
 
@@ -62,7 +63,10 @@ def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
         if span.end_time and span.start_time:
             duration_ms = round((span.end_time - span.start_time) * 1000)
 
-        # Build interleaved event timeline from span events
+        # Build interleaved event timeline from span events. Events include
+        # llm_call, tool_call, and human_message — the latter is how human
+        # interventions are recorded so they land in the step timeline
+        # alongside model calls and tool uses.
         step_events = []
         for event in span.events:
             event_attrs = event.get("attributes", {})
@@ -77,6 +81,8 @@ def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
                 sql=event_attrs.get("sql"),
                 tool_result=event_attrs.get("tool_result"),
                 response=event_attrs.get("response"),
+                content=event_attrs.get("content"),
+                target=event_attrs.get("target"),
             ))
         step_events.sort(key=lambda e: e.timestamp)
 
@@ -310,8 +316,10 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
         raise HTTPException(status_code=404, detail="Thread not found")
 
     if thread.status == ThreadStatus.RUNNING:
-        # Inject message into the running thread — picked up at next coordinator step
-        state.push_pending_message(thread_id, body.content)
+        # Inject message into the running thread — picked up at the next
+        # coordinator step, which will record it as a `human_message`
+        # event on that step's trace span.
+        state.push_pending_message(thread_id, body.content, target="thread")
         queue.emit(StreamEvent(
             session_id=thread.session_id,
             thread_id=thread_id,
@@ -339,7 +347,9 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
         thread=thread,
         schema_summary=session.schema_summary or "",
     )
-    runner.resume(human_messages=[body.content])
+    runner.resume(human_messages=[{
+        "content": body.content, "target": "thread", "timestamp": time.time(),
+    }])
 
     return {"status": "resumed", "thread_id": thread_id}
 
@@ -361,9 +371,11 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
     injected_ids = []
     resumed_ids = []
 
+    broadcast_ts = time.time()
+
     for t in threads:
         if t.status == ThreadStatus.RUNNING:
-            state.push_pending_message(t.id, body.content)
+            state.push_pending_message(t.id, body.content, target="session")
             injected_ids.append(t.id)
         elif t.status == ThreadStatus.WAITING:
             from latent_insights.orchestration.thread import ThreadRunner
@@ -373,7 +385,10 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
                 state=state, trace_store=trace_store, thread=t,
                 schema_summary=session.schema_summary or "",
             )
-            runner.resume(human_messages=[body.content])
+            runner.resume(human_messages=[{
+                "content": body.content, "target": "session",
+                "timestamp": broadcast_ts,
+            }])
             resumed_ids.append(t.id)
 
     queue.emit(StreamEvent(

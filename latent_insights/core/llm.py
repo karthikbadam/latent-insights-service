@@ -1,15 +1,23 @@
 """
 LLM client — OpenAI-compatible API integration (OpenRouter, Ollama, etc).
 
-All agent calls go through here.
+All agent calls go through here. Transient network errors (connection resets,
+rate limits, 5xx, timeouts) are retried transparently with exponential
+backoff. Callers only see exceptions once retries are exhausted or when the
+error is non-transient (auth, malformed request, etc).
 """
 
 import logging
+import time
 from dataclasses import dataclass
 
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 logger = logging.getLogger(__name__)
+
+
+# HTTP statuses we treat as transient (worth retrying).
+_RETRYABLE_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
 @dataclass
@@ -24,13 +32,35 @@ class LLMResponse:
     tool_calls: list | None = None
 
 
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """True if the exception is a retryable network/server-side failure.
+
+    Callers that catch exceptions raised from LLMClient.call can use this
+    to tell retry-exhausted transient failures apart from other bugs.
+    """
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
+        return status in _RETRYABLE_STATUSES
+    return False
+
+
+# Internal alias kept terse for use inside this module.
+_is_transient = is_transient_llm_error
+
+
 class LLMClient:
     """
     LLM client for OpenAI-compatible APIs (OpenRouter, Ollama, etc).
 
+    `call()` retries transient errors (connection resets, rate limits, 5xx,
+    timeouts) with exponential backoff. If all retries fail, the last
+    exception is re-raised so the caller can classify it as retry-exhausted.
+
     Usage:
         client = LLMClient(api_key, base_url)
-        response = await client.call(
+        response = client.call(
             model="anthropic/claude-3.5-haiku",
             messages=[{"role": "user", "content": "hello"}],
             role="worker",
@@ -38,7 +68,16 @@ class LLMClient:
         )
     """
 
-    def __init__(self, api_key: str, base_url: str, app_name: str = "", app_url: str = "", think: bool = True):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        app_name: str = "",
+        app_url: str = "",
+        think: bool = True,
+        max_transient_retries: int = 3,
+        transient_backoff_base: float = 1.0,
+    ):
         self._client = OpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -46,6 +85,8 @@ class LLMClient:
         self._app_name = app_name
         self._app_url = app_url
         self._think = think
+        self._max_transient_retries = max_transient_retries
+        self._transient_backoff_base = transient_backoff_base
 
     def call(
         self,
@@ -58,15 +99,9 @@ class LLMClient:
         timeout: float = 120.0,
     ) -> LLMResponse:
         """
-        Make an LLM call through OpenRouter.
-
-        Args:
-            model: OpenRouter model ID (e.g., "anthropic/claude-3.5-haiku")
-            messages: Chat messages array
-            role: Agent role name (for logging)
-            temperature: Sampling temperature
-            tools: Optional tool definitions
-            max_tokens: Max output tokens
+        Make an LLM call. Retries transient failures with exponential
+        backoff; non-transient errors (auth, 4xx other than the retryable
+        set) raise immediately.
         """
         kwargs = {
             "model": model,
@@ -86,7 +121,26 @@ class LLMClient:
             kwargs["extra_body"] = {"think": False}
 
         logger.info(f"LLM call: model={model} role={role} temp={temperature}")
-        completion = self._client.chat.completions.create(**kwargs)
+
+        max_attempts = self._max_transient_retries + 1
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                completion = self._client.chat.completions.create(**kwargs)
+                break
+            except Exception as exc:
+                if not _is_transient(exc) or attempt == max_attempts:
+                    raise
+                last_exc = exc
+                backoff = self._transient_backoff_base * (2 ** (attempt - 1))
+                logger.warning(
+                    f"LLM transient error on attempt {attempt}/{max_attempts} "
+                    f"({type(exc).__name__}): retrying in {backoff:.1f}s"
+                )
+                time.sleep(backoff)
+        else:  # pragma: no cover — the for-else runs only if loop completes without break
+            assert last_exc is not None
+            raise last_exc
 
         choice = completion.choices[0]
         content = choice.message.content or ""
@@ -120,34 +174,3 @@ class LLMClient:
             f"{response.output_tokens} out"
         )
         return response
-
-    def call_with_retry(
-        self,
-        model: str,
-        fallback_model: str,
-        messages: list[dict],
-        role: str = "default",
-        temperature: float = 0.0,
-        tools: list[dict] | None = None,
-        max_retries: int = 3,
-    ) -> LLMResponse:
-        """Call with retry, escalating to fallback model on failure."""
-        last_error = None
-
-        for attempt in range(max_retries):
-            try:
-                current_model = model if attempt < max_retries - 1 else fallback_model
-                return self.call(
-                    model=current_model,
-                    messages=messages,
-                    role=role,
-                    temperature=temperature,
-                    tools=tools,
-                )
-            except Exception as e:
-                last_error = e
-                logger.warning(
-                    f"LLM call failed (attempt {attempt + 1}/{max_retries}): {e}"
-                )
-
-        raise last_error

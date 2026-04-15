@@ -9,6 +9,7 @@ completion and app shutdown.
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import asdict
 from datetime import datetime
@@ -112,15 +113,40 @@ class StateStore:
             thread.running_summary = running_summary
 
     # --- Pending messages (for interrupting running threads) ---
+    #
+    # A pending message is queued from the /messages routes and consumed
+    # by the next coordinator step, which records it as a `human_message`
+    # event on the step's trace span. That span event IS the persistent
+    # audit record — no separate ledger on Thread or Session is needed,
+    # because step events already flow through the snapshot via
+    # `_steps_from_trace` and through SSE via `step_complete.result`.
 
-    def push_pending_message(self, thread_id: str, message: str):
-        """Queue a message for a running thread. Picked up at the next coordinator step."""
+    def push_pending_message(
+        self, thread_id: str, content: str, target: str = "thread",
+    ):
+        """Queue a human message for a thread.
+
+        Picked up at the next coordinator step, which records it as a
+        ``human_message`` span event with the caller-supplied target and
+        the wall-clock timestamp set here. The timestamp is preserved so
+        the event sorts to the moment the user posted the message, not
+        to the moment the coordinator got around to draining the queue.
+        """
         if thread_id not in self._pending_messages:
             self._pending_messages[thread_id] = []
-        self._pending_messages[thread_id].append(message)
+        self._pending_messages[thread_id].append({
+            "content": content,
+            "target": target,
+            "timestamp": time.time(),
+        })
 
-    def drain_pending_messages(self, thread_id: str) -> list[str]:
-        """Retrieve and clear all pending messages for a thread."""
+    def drain_pending_messages(self, thread_id: str) -> list[dict]:
+        """Retrieve and clear all pending messages for a thread.
+
+        Each entry: ``{"content": str, "target": str, "timestamp": float}``
+        where ``timestamp`` is a UNIX epoch float matching span-event
+        timestamp semantics.
+        """
         return self._pending_messages.pop(thread_id, [])
 
     # --- Persistence ---

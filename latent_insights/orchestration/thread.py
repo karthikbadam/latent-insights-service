@@ -163,27 +163,49 @@ class ThreadRunner:
         self._graph.invoke(self._initial_state)
 
     def _on_graph_done(self, future):
-        """Handle graph completion or failure."""
+        """Handle graph completion or failure.
+
+        An exception here means LLMClient's transient-retry already ran and
+        either exhausted or the error was non-transient. Classify it so the
+        UI can show the right message; route through the shared
+        ``emit_thread_waiting`` helper so the payload matches the in-graph
+        stuck path.
+        """
         try:
             future.result()
         except Exception as e:
-            error_msg = f"{type(e).__name__}: {e}"
-            logger.error(f"Thread {self.thread.id} graph error: {error_msg}", exc_info=True)
+            from latent_insights.core.llm import is_transient_llm_error
+            from latent_insights.orchestration.graph import emit_thread_waiting
 
-            # Finalize as error if the graph itself raised
+            reason = "retry_exhausted" if is_transient_llm_error(e) else "unexpected_error"
+            error_msg = f"{type(e).__name__}: {e}"
+            logger.error(
+                f"Thread {self.thread.id} graph error ({reason}): {error_msg}",
+                exc_info=True,
+            )
+
             try:
-                self.state.update_thread_status(self.thread.id, ThreadStatus.WAITING)
-                self.state.dump_session(self.thread.session_id)
-                from latent_insights.models import StreamEvent
-                self.queue.emit(StreamEvent(
+                question = (
+                    "The LLM provider was unreachable after multiple retries. "
+                    "Send a message when you want the thread to try again."
+                    if reason == "retry_exhausted"
+                    else f"Thread encountered an error: {error_msg}"
+                )
+                emit_thread_waiting(
+                    self.state, self.trace_store, self.queue,
                     session_id=self.thread.session_id,
                     thread_id=self.thread.id,
-                    event_type="thread_waiting",
-                    message=f"Thread encountered an error: {error_msg}",
-                    data={"question": f"Error: {error_msg}", "context": error_msg},
-                ))
+                    reason=reason,
+                    question=question,
+                    context=error_msg,
+                    error=error_msg,
+                    span_status="error",
+                )
             except Exception:
-                logger.error(f"Thread {self.thread.id} failed to finalize after graph error", exc_info=True)
+                logger.error(
+                    f"Thread {self.thread.id} failed to finalize after graph error",
+                    exc_info=True,
+                )
         finally:
             try:
                 self.session_db.close()

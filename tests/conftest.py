@@ -52,7 +52,6 @@ def make_mock_llm(fixture_name: str) -> MagicMock:
 
     mock = MagicMock(spec=LLMClient)
     mock.call.return_value = response
-    mock.call_with_retry.return_value = response
     return mock
 
 
