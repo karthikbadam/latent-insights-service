@@ -182,13 +182,35 @@ def make_coordinator_node(
                 f"Try a different exploratory approach to answer: {state['seed_question']}"
             )
 
+        # Emit the coordinator llm_call SSE *after* the early-stuck override so
+        # the event's `move` matches the step's final move (what step_start
+        # emits below). Every thread-scoped event carries step_number + move so
+        # the UI can group events by step without maintaining state.
+        final_move = decision.next_move.value
+        queue.emit(StreamEvent(
+            session_id=session_id,
+            thread_id=thread_id,
+            event_type="llm_call",
+            message=f"Coordinator deciding next move ({coordinator_ms}ms)",
+            data={
+                "agent": "coordinator",
+                "model": coord_log["model"],
+                "input_tokens": coord_log.get("input_tokens"),
+                "output_tokens": coord_log.get("output_tokens"),
+                "duration_ms": coordinator_ms,
+                "response": coord_log.get("response", ""),
+                "step_number": step_number,
+                "move": final_move,
+            },
+        ))
+
         queue.emit(StreamEvent(
             session_id=session_id,
             thread_id=thread_id,
             event_type="step_start",
             message=decision.worker_instruction or "",
             data={
-                "move": decision.next_move.value,
+                "move": final_move,
                 "step_number": step_number,
                 "instruction": decision.worker_instruction or "",
                 # The coordinator has already committed to this move (including
@@ -245,10 +267,14 @@ def make_worker_node(
 
         thread_views = _get_thread_views(thread_id)
 
-        # Initialize worker for this step
+        # Initialize worker for this step — step_number and move are stamped
+        # onto every SSE event the worker emits so each event is
+        # self-contained (no client-side stitching required).
         worker.start(
             instruction=decision.worker_instruction or "",
             thread_views=thread_views,
+            step_number=step_number,
+            move=decision.next_move.value,
         )
 
         # Worker tool-use loop. Transient LLM errors (connection, 429, 5xx,

@@ -127,10 +127,47 @@ them to match snapshot fidelity.
 | `step_complete`   | `instruction`       | The coordinator's instruction to the worker for this step.|
 | `step_complete`   | `duration_ms`       | Integer milliseconds, matches `StepResponse.duration_ms`. |
 | `llm_call`        | `response`          | Full response text (matches `StepEvent.response`).        |
+| `llm_call`        | `step_number`       | Which step this call belongs to.                          |
+| `llm_call`        | `move`              | The step's move (e.g. `FORAGE`). Same value as `step_start.move`. |
 | `tool_call`       | `agent: "worker"`   | Always set.                                               |
+| `tool_call`       | `step_number`       | Which step this call belongs to.                          |
+| `tool_call`       | `move`              | The step's move.                                          |
 | `thread_waiting`  | `running_summary`   | Thread's accumulated findings so far (or `null`).         |
 | `thread_waiting`  | `error`             | Non-null only on the error path.                          |
 | `thread_complete` | `total_ms`          | Integer ms. `total_seconds` (float) still present for bwc.|
+
+### Why `step_number` and `move` on every event
+
+Previously the UI had to remember "the last `step_start` said step 3,
+move FORAGE" and attribute any subsequent `llm_call` / `tool_call` to that
+step. That stitching breaks under SSE reconnects, out-of-order delivery, or
+when the UI mounts mid-stream.
+
+With `step_number` and `move` on every thread-scoped event, each event is
+self-contained:
+
+```json
+{
+  "event": "tool_call",
+  "data": {
+    "thread_id": "t-abc",
+    "step_number": 3,
+    "move": "FORAGE",
+    "agent": "worker",
+    "sql": "SELECT ...",
+    "tool_result": "...",
+    "duration_ms": 234
+  }
+}
+```
+
+The UI can key events by `(thread_id, step_number)` directly and drop any
+per-thread "current step" tracker.
+
+**Consistency guarantee:** the `move` on a coordinator `llm_call` always
+matches the `step_start.move` that follows it, even when the early-stuck
+override fires on steps 1–2. The emission is deferred until after the
+override runs, so both events see the same final move.
 
 ---
 
@@ -196,6 +233,7 @@ streaming equivalent:
 | `step.events[].sql`                         | `tool_call.sql`                                                  |
 | `step.events[].tool_result`                 | `tool_call.tool_result`                                          |
 | `step.events[].response`                    | `llm_call.response`                                              |
+| (grouping key) `step.step_number` / `step.move` | every thread-scoped event carries `step_number` + `move`     |
 
 ---
 
@@ -211,6 +249,9 @@ streaming equivalent:
 - [ ] Populate `step.instruction` from either `step_start` or
       `step_complete` (both carry it now).
 - [ ] Populate `step.duration_ms` from `step_complete.duration_ms`.
+- [ ] Group `llm_call` / `tool_call` events by `(thread_id, step_number)`
+      directly — drop any "current step per thread" tracker that inferred
+      the step from the most recent `step_start`.
 - [ ] Handle the new `schema_summary_ready` event and remove the
       post-refresh schema fetch.
 - [ ] Read `thread.running_summary` from `thread_waiting.running_summary`

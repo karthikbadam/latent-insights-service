@@ -13,7 +13,7 @@ from latent_insights.agents.base import Agent
 from latent_insights.core.llm import LLMClient
 from latent_insights.core.parsing import parse_coordinator_response
 from latent_insights.core.queue import Queue
-from latent_insights.models import CoordinatorDecision, CoordinatorStatus, MoveType, StreamEvent
+from latent_insights.models import CoordinatorDecision, CoordinatorStatus, MoveType
 
 logger = logging.getLogger(__name__)
 
@@ -124,20 +124,10 @@ When DONE, worker_instruction should be a SYNTHESIZE producing the final summary
         )
         call_ms = round((time.monotonic() - t0) * 1000)
 
-        if self.queue:
-            self.queue.emit(StreamEvent(
-                session_id=self.session_id, thread_id=self.thread_id,
-                event_type="llm_call",
-                message=f"Coordinator deciding next move ({call_ms}ms)",
-                data={
-                    "agent": self.role,
-                    "model": self.model,
-                    "input_tokens": response.input_tokens,
-                    "output_tokens": response.output_tokens,
-                    "duration_ms": call_ms,
-                    "response": response.content or "",
-                },
-            ))
+        # Note: the SSE llm_call event for this call is emitted from
+        # graph.py::coordinator_node after the decision is parsed and the
+        # early-stuck override runs, so the event's `move` matches the
+        # final `step_start.move`. Do not emit from here.
 
         if not response.content or not response.content.strip():
             logger.warning("Coordinator returned empty response, retrying once")

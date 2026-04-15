@@ -117,18 +117,31 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
         self.consecutive_errors: int = 0
         self.attempts: int = 0
         self.llm_calls: list[dict] = []
+        # Step context — stamped onto every SSE event this worker emits so
+        # each event is self-contained and the UI can group by step without
+        # tracking cross-event state.
+        self.step_number: int = 0
+        self.current_move: str = ""
 
     @property
     def role(self) -> str:
         return "worker"
 
-    def start(self, instruction: str, thread_views: str = "(none)"):
+    def start(
+        self,
+        instruction: str,
+        thread_views: str = "(none)",
+        step_number: int = 0,
+        move: str = "",
+    ):
         """Initialize worker state for a new step."""
         self.instruction = instruction
         self.current_model = self.model
         self.consecutive_errors = 0
         self.attempts = 0
         self.llm_calls = []
+        self.step_number = step_number
+        self.current_move = move
 
         prompt = self.SYSTEM_PROMPT.format(
             schema_summary=self.schema_summary,
@@ -174,6 +187,8 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
                 "duration_ms": call_ms,
                 "has_tool_calls": has_tools,
                 "response": response.content or "",
+                "step_number": self.step_number,
+                "move": self.current_move,
             },
         ))
 
@@ -264,6 +279,8 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
                         "sql": sql,
                         "tool_result": result_text,
                         "duration_ms": sql_ms,
+                        "step_number": self.step_number,
+                        "move": self.current_move,
                     },
                 ))
                 self.messages.append({

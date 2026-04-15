@@ -167,14 +167,20 @@ client-side view model.
 | `message_injected`     | session/thread | `content`, `target`, `injected_threads`, `resumed_threads`        |
 | `thread_start`         | thread   | `seed_question`, `motivation`, `entry_point`                            |
 | `step_start`           | thread   | `move`, `step_number`, `instruction`, `provisional: false`              |
-| `llm_call`             | thread   | `agent`, `model`, `input_tokens`, `output_tokens`, `duration_ms`, `response` |
-| `tool_call`            | thread   | `agent`, `sql`, `tool_result`, `duration_ms`                            |
+| `llm_call`             | thread   | `agent`, `model`, `input_tokens`, `output_tokens`, `duration_ms`, `response`, `step_number`, `move` |
+| `tool_call`            | thread   | `agent`, `sql`, `tool_result`, `duration_ms`, `step_number`, `move`     |
 | `step_complete`        | thread   | `step_number`, `move`, `instruction`, `result`, `duration_ms`           |
 | `thread_complete`      | thread   | `summary`, `total_ms`, `total_seconds`, `step_count`                    |
 | `thread_waiting`       | thread   | `question`, `context`, `running_summary`, `error`                       |
 
 All `duration_ms` and `total_ms` values are integer milliseconds.
 Session-scoped events use `thread_id: ""`.
+
+Every thread-scoped event carries `step_number` and `move` (the same values
+that appear on `step_start` / `step_complete`), so each event is
+self-contained and the UI can group events into steps without maintaining
+cross-event state. Exceptions: `thread_start` (no step context yet) and
+`thread_complete` / `thread_waiting` (step-independent terminal events).
 
 Frontend migrating from the previous SSE schema: see
 [docs/sse-migration-v2.md](docs/sse-migration-v2.md) for a field-by-field
