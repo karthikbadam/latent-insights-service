@@ -86,7 +86,8 @@ class TestPendingMessages:
         state.push_pending_message("t1", "World")
 
         msgs = state.drain_pending_messages("t1")
-        assert msgs == ["Hello", "World"]
+        assert [m["content"] for m in msgs] == ["Hello", "World"]
+        assert all(m["target"] == "thread" for m in msgs)
 
     def test_drain_clears(self, setup):
         state = setup["state"]
@@ -104,8 +105,8 @@ class TestPendingMessages:
         state.push_pending_message("t1", "for-t1")
         state.push_pending_message("t2", "for-t2")
 
-        assert state.drain_pending_messages("t1") == ["for-t1"]
-        assert state.drain_pending_messages("t2") == ["for-t2"]
+        assert [m["content"] for m in state.drain_pending_messages("t1")] == ["for-t1"]
+        assert [m["content"] for m in state.drain_pending_messages("t2")] == ["for-t2"]
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +164,8 @@ class TestThreadInterrupt:
 
         # Simulate what the coordinator node does
         drained = state.drain_pending_messages("t1")
-        assert drained == ["msg1"]
+        assert len(drained) == 1
+        assert drained[0]["content"] == "msg1"
         assert state.drain_pending_messages("t1") == []
 
 

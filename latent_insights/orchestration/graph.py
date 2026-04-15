@@ -64,6 +64,12 @@ class ThreadState(TypedDict, total=False):
     error: str | None
     error_count: int
     thread_start: float
+    # Why the thread is entering a terminal waiting state. One of:
+    #   "coordinator_stuck"  — coordinator returned STUCK (genuine human-needed)
+    #   "repeated_moves"     — move repetition guard tripped
+    #   "retry_exhausted"    — transient LLM error survived all retries
+    #   "unexpected_error"   — any other raised exception
+    wait_reason: str
 
     # Config
     max_repeated_moves: int
@@ -119,6 +125,28 @@ def make_coordinator_node(
         span = trace_store.start_span(
             trace_id=thread_id, name=f"step_{step_number}", kind="step",
         )
+
+        # Record any human messages consumed by this step as span events so
+        # they appear in the step's `events` timeline alongside llm_call
+        # and tool_call. Entries carry their own timestamp (captured when
+        # the user posted the message) so they sort before the coordinator
+        # LLM call that was influenced by them.
+        for msg in human_messages:
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                target = msg.get("target", "thread")
+                ts = msg.get("timestamp")
+            else:
+                # Legacy bare-string entries from older persisted state.
+                content = str(msg)
+                target = "thread"
+                ts = None
+            trace_store.add_event(
+                span,
+                "human_message",
+                {"content": content, "target": target},
+                timestamp=ts,
+            )
 
         t0 = time.monotonic()
         decision, coord_log = coordinator.call(
@@ -219,17 +247,16 @@ def make_worker_node(
             thread_views=thread_views,
         )
 
-        # Worker tool-use loop
+        # Worker tool-use loop. Transient LLM errors (connection, 429, 5xx,
+        # timeouts) are retried inside LLMClient.call with exponential
+        # backoff. If an exception propagates here, retries were exhausted
+        # or the error is non-transient — let it bubble up to the graph-
+        # level handler in thread.py, which emits thread_waiting with a
+        # reason derived from the exception type.
         step_start = time.monotonic()
         result = None
         while result is None:
-            try:
-                response, call_ms = worker.call()
-            except Exception as e:
-                if "timeout" in str(type(e).__name__).lower():
-                    worker.handle_timeout()
-                    continue
-                raise
+            response, call_ms = worker.call()
             result = worker.handle_response(response, call_ms)
 
         worker_ms = round((time.monotonic() - step_start) * 1000)
@@ -320,94 +347,91 @@ def make_finalize_complete_node(
     return finalize_complete_node
 
 
+def emit_thread_waiting(
+    state_store: StateStore,
+    trace_store: TraceStore,
+    queue: Queue,
+    *,
+    session_id: str,
+    thread_id: str,
+    reason: str,
+    question: str,
+    context: str | None = None,
+    error: str | None = None,
+    span_status: str = "stuck",
+) -> None:
+    """Shared path for moving a thread into WAITING and emitting the SSE.
+
+    Used by both the in-graph ``finalize_stuck`` node and the top-level
+    error handler in ``thread.py``. Centralising it guarantees the payload
+    shape is identical whichever path the thread took to get here.
+    """
+    # End current span if still open
+    spans = trace_store.get_step_spans(thread_id)
+    if spans and spans[-1].end_time is None:
+        span = spans[-1]
+        span.attributes.setdefault("result", f"{reason}: {context or error or ''}")
+        if error:
+            span.attributes["error"] = error
+        trace_store.end_span(span, status=span_status)
+
+    trace_store.flush_to_file(thread_id, session_id)
+    trace_store.clear_trace(thread_id)
+
+    state_store.update_thread_status(
+        thread_id, ThreadStatus.WAITING, error=error or reason,
+    )
+    state_store.dump_session(session_id)
+
+    thread = state_store.get_thread(thread_id)
+    running_summary = thread.running_summary if thread else None
+
+    queue.emit(StreamEvent(
+        session_id=session_id,
+        thread_id=thread_id,
+        event_type="thread_waiting",
+        message=question,
+        data={
+            "reason": reason,
+            "question": question,
+            "context": context,
+            "error": error,
+            "running_summary": running_summary,
+        },
+    ))
+
+
 def make_finalize_stuck_node(
     state_store: StateStore,
     trace_store: TraceStore,
     queue: Queue,
 ):
-    """Create the finalize-stuck node."""
+    """Create the finalize-stuck node — reached when the coordinator
+    returns STUCK (post-step-2) or the move-repetition guard trips.
+    """
 
     def finalize_stuck_node(state: ThreadState) -> dict:
         thread_id = state["thread_id"]
         session_id = state["session_id"]
         decision = state.get("decision") or {}
+        reason = state.get("wait_reason") or "coordinator_stuck"
 
-        # End current span if open
-        spans = trace_store.get_step_spans(thread_id)
-        if spans:
-            span = spans[-1]
-            if span.end_time is None:
-                span.attributes.update({
-                    "move": decision.get("next_move", "STUCK"),
-                    "instruction": decision.get("question_for_human", ""),
-                    "result": f"STUCK: {decision.get('context', '')}",
-                })
-                trace_store.end_span(span, status="stuck")
-
-        trace_store.flush_to_file(thread_id, session_id)
-        trace_store.clear_trace(thread_id)
-        state_store.update_thread_status(thread_id, ThreadStatus.WAITING)
-        state_store.dump_session(session_id)
-
-        question = decision.get("question_for_human", "Thread needs guidance.")
-        queue.emit(StreamEvent(
+        question = decision.get("question_for_human") or (
+            "Thread repeated the same move too many times — needs guidance."
+            if reason == "repeated_moves"
+            else "Thread needs guidance."
+        )
+        emit_thread_waiting(
+            state_store, trace_store, queue,
             session_id=session_id,
             thread_id=thread_id,
-            event_type="thread_waiting",
-            message=question,
-            data={
-                "question": decision.get("question_for_human"),
-                "context": decision.get("context"),
-            },
-        ))
+            reason=reason,
+            question=question,
+            context=decision.get("context"),
+        )
         return {"status": "stuck"}
 
     return finalize_stuck_node
-
-
-def make_finalize_error_node(
-    state_store: StateStore,
-    trace_store: TraceStore,
-    queue: Queue,
-):
-    """Create the finalize-error node."""
-
-    def finalize_error_node(state: ThreadState) -> dict:
-        thread_id = state["thread_id"]
-        session_id = state["session_id"]
-        error_msg = state.get("error", "Unknown error")
-
-        logger.error(f"Thread {thread_id} error: {error_msg}")
-
-        try:
-            spans = trace_store.get_step_spans(thread_id)
-            if spans:
-                span = spans[-1]
-                if span.end_time is None:
-                    span.attributes.update({
-                        "move": "ERROR",
-                        "result": f"Error: {error_msg}",
-                        "error": error_msg,
-                    })
-                    trace_store.end_span(span, status="error")
-            trace_store.flush_to_file(thread_id, session_id)
-            trace_store.clear_trace(thread_id)
-        except Exception:
-            pass
-
-        state_store.update_thread_status(thread_id, ThreadStatus.WAITING)
-        state_store.dump_session(session_id)
-
-        queue.emit(StreamEvent(
-            session_id=session_id,
-            thread_id=thread_id,
-            event_type="thread_waiting",
-            message=f"Thread encountered an error: {error_msg}. How should it proceed?",
-            data={"question": f"Error: {error_msg}", "context": error_msg},
-        ))
-        return {"status": "error", "error": error_msg}
-
-    return finalize_error_node
 
 
 def make_summarize_node(
@@ -444,20 +468,29 @@ def make_summarize_node(
 # ---------------------------------------------------------------------------
 
 def route_after_coordinator(state: ThreadState) -> str:
-    """Route coordinator output to worker, stuck, or error."""
+    """Route coordinator output to worker or finalize_stuck."""
     decision = state.get("decision") or {}
     status = decision.get("status", "CONTINUE")
 
     if status == "STUCK":
-        # Early stuck was already overridden in the node for step <= 2
-        # If we get here with STUCK, it means step > 2
+        # Early stuck was already overridden in the node for step <= 2.
+        # Reaching here with STUCK means step > 2 — the coordinator genuinely
+        # decided it needs human input.
+        state["wait_reason"] = "coordinator_stuck"
         return "finalize_stuck"
 
     return "worker"
 
 
 def route_after_worker(state: ThreadState) -> str:
-    """Route worker output: loop back, complete, stuck, or summarize."""
+    """Route worker output: loop back, complete, stuck, or summarize.
+
+    Side effect: mutates ``state["wait_reason"]`` when routing to
+    ``finalize_stuck`` so the finalize node knows which reason to emit.
+    This is a pragmatic shortcut — LangGraph routing functions are
+    supposed to be pure, but the alternative (adding a separate node
+    just to set the reason) adds more code than it saves.
+    """
     decision = state.get("decision") or {}
     move_history = state.get("move_history", [])
     max_same = state.get("max_repeated_moves", 10)
@@ -473,6 +506,7 @@ def route_after_worker(state: ThreadState) -> str:
         logger.warning(
             f"Thread {state['thread_id']} repeated {move_name} {max_same} times — forcing STUCK"
         )
+        state["wait_reason"] = "repeated_moves"
         return "finalize_stuck"
 
     if decision.get("status") == "DONE":
@@ -508,7 +542,10 @@ def build_thread_graph(
         summarize → coordinator
         finalize_complete → END
         finalize_stuck → END
-        finalize_error → END
+
+    Unhandled exceptions raised from any node propagate to
+    ``ThreadRunner._on_graph_done`` which emits ``thread_waiting`` via the
+    same shared helper the stuck path uses.
     """
     graph = StateGraph(ThreadState)
 
@@ -517,7 +554,6 @@ def build_thread_graph(
     graph.add_node("worker", make_worker_node(worker, trace_store, queue, session_db))
     graph.add_node("finalize_complete", make_finalize_complete_node(state_store, trace_store, queue))
     graph.add_node("finalize_stuck", make_finalize_stuck_node(state_store, trace_store, queue))
-    graph.add_node("finalize_error", make_finalize_error_node(state_store, trace_store, queue))
     graph.add_node("summarize", make_summarize_node(state_store, trace_store, llm, config))
 
     # Entry point
@@ -537,6 +573,5 @@ def build_thread_graph(
     graph.add_edge("summarize", "coordinator")
     graph.add_edge("finalize_complete", END)
     graph.add_edge("finalize_stuck", END)
-    graph.add_edge("finalize_error", END)
 
     return graph

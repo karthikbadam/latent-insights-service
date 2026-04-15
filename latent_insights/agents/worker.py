@@ -178,14 +178,6 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
 
         return response, call_ms
 
-    def handle_timeout(self):
-        """Handle an APITimeoutError by appending a retry message."""
-        self.consecutive_errors += 1
-        self.messages.append({
-            "role": "user",
-            "content": "Your previous response timed out. Simplify your approach and respond more concisely.",
-        })
-
     def handle_response(self, response, call_ms: int) -> WorkerResult | None:
         """Process worker LLM response. Returns WorkerResult when done, None if another call needed."""
         if response.tool_calls:

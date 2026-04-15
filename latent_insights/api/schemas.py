@@ -52,7 +52,7 @@ class PostMessageRequest(BaseModel):
 
 
 class StepEvent(BaseModel):
-    type: str
+    type: str  # "llm_call" | "tool_call" | "human_message"
     timestamp: float
     agent: str | None = None
     model: str | None = None
@@ -62,6 +62,9 @@ class StepEvent(BaseModel):
     sql: str | None = None
     tool_result: str | None = None
     response: str | None = None
+    # Populated when type == "human_message":
+    content: str | None = None
+    target: str | None = None  # "thread" | "session"
 
 
 class StepResponse(BaseModel):

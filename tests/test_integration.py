@@ -490,3 +490,184 @@ def test_thread_error_becomes_waiting(integration_setup):
 
     t = state.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
+
+
+def test_thread_unexpected_error_sets_reason(integration_setup):
+    """Non-transient errors produce reason=unexpected_error on thread_waiting."""
+    import httpx
+
+    setup = integration_setup
+    state = setup["state"]
+    queue = setup["queue"]
+
+    session = state.create_session("test.csv")
+    thread = state.create_thread(session.id, "Will error?", "Test", "Start")
+    event_queue = queue.subscribe(session.id)
+
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+        raise RuntimeError("synthetic bug")
+
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
+
+    waiting_events = []
+    while not event_queue.empty():
+        ev = event_queue.get_nowait()
+        if ev.event_type == "thread_waiting":
+            waiting_events.append(ev)
+
+    assert waiting_events, "expected a thread_waiting event"
+    assert waiting_events[-1].data["reason"] == "unexpected_error"
+    t = state.get_thread(thread.id)
+    assert t.error  # error text recorded on the thread
+    assert httpx  # imported only to confirm dev dep is present
+
+
+def test_thread_transient_error_sets_retry_exhausted_reason(integration_setup):
+    """APIConnectionError surviving retries → reason=retry_exhausted."""
+    import httpx
+    from openai import APIConnectionError
+
+    setup = integration_setup
+    state = setup["state"]
+    queue = setup["queue"]
+
+    session = state.create_session("test.csv")
+    thread = state.create_thread(session.id, "Net flaky?", "Test", "Start")
+    event_queue = queue.subscribe(session.id)
+
+    request = httpx.Request("POST", "http://test")
+
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+        raise APIConnectionError(request=request)
+
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
+
+    reasons = []
+    while not event_queue.empty():
+        ev = event_queue.get_nowait()
+        if ev.event_type == "thread_waiting":
+            reasons.append(ev.data.get("reason"))
+
+    assert reasons == ["retry_exhausted"]
+
+
+def test_thread_coordinator_stuck_reason(integration_setup):
+    """Coordinator returning STUCK at step > 2 → reason=coordinator_stuck."""
+    setup = integration_setup
+    state = setup["state"]
+    queue = setup["queue"]
+
+    session = state.create_session("test.csv")
+    thread = state.create_thread(session.id, "Stuck test?", "Test", "Start")
+    event_queue = queue.subscribe(session.id)
+
+    step = [0]
+
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+        if role == "coordinator":
+            step[0] += 1
+            if step[0] <= 2:
+                return LLMResponse(
+                    content=_make_coordinator_response("CONTINUE", "FORAGE", "Explore"),
+                    model=model,
+                )
+            return LLMResponse(
+                content=_make_coordinator_response(
+                    "STUCK", "STUCK", question="Need help", context="Lost",
+                ),
+                model=model,
+            )
+        return LLMResponse(
+            content=_make_worker_response("result"), model=model, tool_calls=None,
+        )
+
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
+
+    reasons = []
+    while not event_queue.empty():
+        ev = event_queue.get_nowait()
+        if ev.event_type == "thread_waiting":
+            reasons.append(ev.data.get("reason"))
+
+    assert reasons == ["coordinator_stuck"]
+
+
+def test_pending_message_carries_target_and_timestamp(tmp_path):
+    """push_pending_message stores target and a wall-clock timestamp."""
+    state = StateStore(data_dir=str(tmp_path))
+    session = state.create_session("test.csv")
+    thread = state.create_thread(session.id, "Q?", "m", "e")
+
+    state.push_pending_message(thread.id, "try a different angle", target="thread")
+    state.push_pending_message(thread.id, "focus on cohort A", target="session")
+
+    drained = state.drain_pending_messages(thread.id)
+    assert len(drained) == 2
+    assert drained[0]["content"] == "try a different angle"
+    assert drained[0]["target"] == "thread"
+    assert isinstance(drained[0]["timestamp"], float)
+    assert drained[1]["target"] == "session"
+
+
+def test_human_message_appears_in_step_event_timeline(integration_setup):
+    """A message pushed before a step shows up as a human_message span event."""
+    setup = integration_setup
+    state = setup["state"]
+    trace_store = setup["trace_store"]
+
+    session = state.create_session("test.csv")
+    thread = state.create_thread(session.id, "Q?", "m", "e")
+
+    # Simulate user posting before any step has run.
+    state.push_pending_message(thread.id, "look at cohort A", target="thread")
+
+    coordinator_calls = [0]
+
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+        if role == "coordinator":
+            coordinator_calls[0] += 1
+            if coordinator_calls[0] == 1:
+                return LLMResponse(
+                    content=_make_coordinator_response("CONTINUE", "FORAGE", "Explore"),
+                    model=model,
+                )
+            return LLMResponse(
+                content=_make_coordinator_response("DONE", "SYNTHESIZE", "Wrap"),
+                model=model,
+            )
+        return LLMResponse(
+            content=_make_worker_response("result"), model=model, tool_calls=None,
+        )
+
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
+
+    # Trace is flushed to disk and cleared from memory on completion.
+    trace_store.load_trace(thread.id, session.id)
+    spans = trace_store.get_step_spans(thread.id)
+    assert spans, "expected at least one step span"
+
+    human_events = [
+        e for e in spans[0].events if e["name"] == "human_message"
+    ]
+    assert len(human_events) == 1
+    assert human_events[0]["attributes"]["content"] == "look at cohort A"
+    assert human_events[0]["attributes"]["target"] == "thread"
+
+    # Timestamp set at push time, preserved on the span event.
+    assert human_events[0]["timestamp"] > 0

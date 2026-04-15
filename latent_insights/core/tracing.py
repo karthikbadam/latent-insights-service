@@ -69,10 +69,16 @@ class TraceStore:
         span.status = status
         span.status_message = status_message
 
-    def add_event(self, span: Span, name: str, attributes: dict | None = None):
+    def add_event(
+        self,
+        span: Span,
+        name: str,
+        attributes: dict | None = None,
+        timestamp: float | None = None,
+    ):
         span.events.append({
             "name": name,
-            "timestamp": time.time(),
+            "timestamp": timestamp if timestamp is not None else time.time(),
             "attributes": attributes or {},
         })
 
@@ -85,7 +91,7 @@ class TraceStore:
     def format_thread_history(
         self,
         trace_id: str,
-        human_messages: list[str] | None = None,
+        human_messages: list[dict] | list[str] | None = None,
         running_summary: str | None = None,
         full_window: int = 3,
     ) -> str:
@@ -96,12 +102,18 @@ class TraceStore:
         - Middle steps: condensed (move + first sentence of result)
         - Last `full_window` steps: full detail
         - Human messages at end
+
+        `human_messages` may be a list of strings (legacy) or a list of
+        dicts with a ``content`` key (current shape).
         """
+        def _content(m) -> str:
+            return m.get("content", "") if isinstance(m, dict) else str(m)
+
         steps = self.get_step_spans(trace_id)
         if not steps:
             preamble = f"Summary so far: {running_summary}\n\n" if running_summary else ""
             if human_messages:
-                parts = [f'[Human input]: "{msg}"' for msg in human_messages]
+                parts = [f'[Human input]: "{_content(msg)}"' for msg in human_messages]
                 return preamble + "\n\n".join(parts) if preamble else "\n\n".join(parts)
             return preamble + "(No steps yet — this is the first move)"
 
@@ -132,7 +144,7 @@ class TraceStore:
 
         if human_messages:
             for msg in human_messages:
-                parts.append(f'[Human input]: "{msg}"')
+                parts.append(f'[Human input]: "{_content(msg)}"')
 
         return "\n\n".join(parts)
 
