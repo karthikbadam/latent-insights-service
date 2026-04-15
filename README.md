@@ -246,6 +246,4 @@ uv publish --publish-url https://test.pypi.org/legacy/
 
 - [docs/SPEC.md](docs/SPEC.md) — architecture spec
 - [docs/PROMPTS.md](docs/PROMPTS.md) — agent prompt designs
-- [docs/sse-migration-v2.md](docs/sse-migration-v2.md) — SSE v2 field reference and frontend migration guide
-- [docs/error-handling-changes.md](docs/error-handling-changes.md) — transient LLM retry, `thread_waiting.reason`, and interleaved `human_message` step events
 
