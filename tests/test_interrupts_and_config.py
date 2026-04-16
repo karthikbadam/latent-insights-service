@@ -12,7 +12,7 @@ from latent_insights.core.llm import LLMResponse
 from latent_insights.core.queue import Queue
 from latent_insights.core.store import InvestigationStore
 from latent_insights.models import StreamEvent, ThreadStatus
-from latent_insights.orchestration.loop import ThreadLoop
+from latent_insights.orchestration.runner import ThreadRunner
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +57,8 @@ def _make_worker_response(summary):
     return json.dumps({"summary": summary, "view_requested": None})
 
 
-def _build_loop(setup_dict, thread, human_messages=None):
-    return ThreadLoop(
+def _build_runner(setup_dict, thread, human_messages=None):
+    return ThreadRunner(
         config=setup_dict["config"],
         llm=MagicMock(),
         session_db=setup_dict["session_db"],
@@ -142,12 +142,12 @@ class TestThreadInterrupt:
                 )
             return LLMResponse(content="{}", model=model)
 
-        loop = _build_loop(setup, thread)
-        loop.coordinator.llm.call = mock_call
-        loop.worker.llm.call = mock_call
+        runner = _build_runner(setup, thread)
+        runner.coordinator.llm.call = mock_call
+        runner.worker.llm.call = mock_call
 
-        loop.start()
-        loop.done_event.wait(timeout=10)
+        runner.start()
+        runner.done_event.wait(timeout=10)
 
         assert coordinator_calls[0] >= 2
 

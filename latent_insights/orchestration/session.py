@@ -12,7 +12,7 @@ from latent_insights.core.queue import Queue
 from latent_insights.core.store import InvestigationStore
 from latent_insights.db.connection import Database
 from latent_insights.models import ScoutQuestion, StreamEvent, ThreadStatus
-from latent_insights.orchestration.loop import LoopMode, ThreadLoop
+from latent_insights.orchestration.runner import RunnerMode, ThreadRunner
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ class SessionFlow:
                 else "The previous analysis is complete. Dig deeper — are there follow-up questions, edge cases, or subgroups worth investigating?"
             )
             thread_db = self.db.open_session_connection(session_id)
-            loop = ThreadLoop(
+            runner = ThreadRunner(
                 config=self.config,
                 llm=self.llm,
                 session_db=thread_db,
@@ -199,7 +199,7 @@ class SessionFlow:
                 schema_summary=schema_summary,
                 human_messages=[message],
             )
-            loop.resume()
+            runner.resume()
 
         logger.info(f"Session {session_id} resumed {len(resumable)} threads")
 
@@ -282,7 +282,7 @@ class SessionFlow:
         """Create and start threads for a list of questions.
 
         Pattern dispatch:
-        - "coordinator_worker" (default): one ThreadLoop per question
+        - "coordinator_worker" (default): one ThreadRunner per question
         - "fan_out": spawn all questions as fan-out with post-hoc synthesis
         - "human_in_the_loop": each thread pauses after every step
         """
@@ -306,9 +306,9 @@ class SessionFlow:
             return
 
         mode = (
-            LoopMode.STEP_AND_PAUSE
+            RunnerMode.STEP_AND_PAUSE
             if pattern == "human_in_the_loop"
-            else LoopMode.LOOP_UNTIL_DONE
+            else RunnerMode.LOOP_UNTIL_DONE
         )
 
         for q in questions:
@@ -316,7 +316,7 @@ class SessionFlow:
                 session_id, q.question, q.motivation, q.entry_point,
             )
             thread_db = self.db.open_session_connection(session_id)
-            loop = ThreadLoop(
+            runner = ThreadRunner(
                 config=self.config,
                 llm=self.llm,
                 session_db=thread_db,
@@ -326,4 +326,4 @@ class SessionFlow:
                 schema_summary=schema_summary,
                 mode=mode,
             )
-            loop.start()
+            runner.start()

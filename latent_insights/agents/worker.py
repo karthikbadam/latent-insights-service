@@ -226,9 +226,160 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
         return response, call_ms
 
     def handle_response(self, response, call_ms: int) -> WorkerResult | None:
-        """Process worker LLM response. Returns WorkerResult when done, None if another call needed."""
+        """Process worker LLM response. Returns WorkerResult when done, None if another call needed.
+
+        Convenience method that runs tool calls inline on the current thread.
+        For continuation-passing execution where each SQL runs as its own
+        pool task, use ``prepare_tool_calls`` / ``record_tool_result`` /
+        ``apply_error_guardrails`` / ``handle_final`` directly.
+        """
         if response.tool_calls:
             return self._handle_tool_calls(response, call_ms)
+        return self._handle_final(response, call_ms)
+
+    # ------------------------------------------------------------------
+    # Granular API for continuation-passing scheduling.
+    # Split the three responsibilities of ``_handle_tool_calls`` so the
+    # caller can schedule each SQL execution on the pool independently,
+    # releasing the pool slot between calls.
+    # ------------------------------------------------------------------
+
+    def prepare_tool_calls(self, response, call_ms: int) -> list[dict]:
+        """Record the LLM turn and return SQL tasks to execute.
+
+        Appends the assistant message with tool_calls, records the
+        ``llm_call`` log entry, and extracts runnable SQL. Malformed
+        ``run_sql`` arguments or unknown tool names are handled inline
+        (tool message appended, error counter bumped) and omitted from
+        the returned task list. Does NOT execute any SQL.
+
+        Returns: list of ``{"tool_call_id": str, "sql": str}`` to be run.
+        """
+        assistant_msg = {"role": "assistant", "content": response.content or None}
+        assistant_msg["tool_calls"] = response.tool_calls
+        self.messages.append(assistant_msg)
+
+        # One llm_call record per LLM turn (this method is invoked once per turn).
+        self.llm_calls.append({
+            "agent": self.role,
+            "type": "llm_call",
+            "duration_ms": call_ms,
+            "model": response.model,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "response": _extract_tool_sql(response.tool_calls),
+        })
+
+        tasks: list[dict] = []
+        for tool_call in response.tool_calls:
+            func = tool_call["function"]
+            if func["name"] != "run_sql":
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": f"Unknown tool: {func['name']}",
+                })
+                continue
+            try:
+                args = json.loads(func["arguments"])
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    f"Worker tool_call arguments malformed JSON: {e} "
+                    f"(raw: {func['arguments'][:200]!r})"
+                )
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": (
+                        f"TOOL CALL ERROR: your `run_sql` arguments were "
+                        f"malformed JSON ({e}). Reissue the tool call with "
+                        f"valid JSON of the form "
+                        f'{{"sql": "SELECT ..."}}. Keep the SQL on a single '
+                        f"line and properly escape any quotes."
+                    ),
+                })
+                self.consecutive_errors += 1
+                continue
+
+            sql = args.get("sql", "")
+            tasks.append({"tool_call_id": tool_call["id"], "sql": sql})
+
+        return tasks
+
+    def record_tool_result(
+        self,
+        tool_call_id: str,
+        sql: str,
+        tool_result: str,
+        sql_ms: int,
+    ):
+        """Record the outcome of a single SQL execution.
+
+        Appends the ``tool`` message with the result, emits the
+        ``tool_call`` SSE event, records the ``tool_call`` log entry, and
+        updates the consecutive-error counter based on whether the result
+        was an error.
+        """
+        logger.info(f"Worker executing SQL: {sql[:200]}")
+        self.queue.emit(StreamEvent(
+            session_id=self.session_id,
+            thread_id=self.thread_id,
+            event_type="tool_call",
+            message=sql,
+            data={
+                "agent": self.role,
+                "sql": sql,
+                "tool_result": tool_result,
+                "duration_ms": sql_ms,
+                "step_number": self.step_number,
+                "move": self.current_move,
+            },
+        ))
+        self.messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": tool_result,
+        })
+        self.llm_calls.append({
+            "agent": self.role,
+            "type": "tool_call",
+            "sql": sql,
+            "tool_result": tool_result,
+            "duration_ms": sql_ms,
+        })
+        if tool_result.startswith("SQL ERROR:"):
+            self.consecutive_errors += 1
+        else:
+            self.consecutive_errors = 0
+
+    def apply_error_guardrails(self):
+        """After all tool results for a turn, append nudge messages if
+        consecutive-error thresholds are exceeded. Mirrors the error
+        handling that lived at the bottom of ``_handle_tool_calls``.
+        """
+        if self.consecutive_errors >= self.config.max_consecutive_errors:
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    f"You have hit {self.consecutive_errors} consecutive SQL errors. "
+                    "Stop trying SQL and return your final JSON answer NOW "
+                    "with whatever findings you have so far. If you have no findings, "
+                    "state that the analysis could not be completed and explain why."
+                ),
+            })
+        elif self.consecutive_errors >= 2:
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    f"You have hit {self.consecutive_errors} consecutive SQL errors. "
+                    "The function you are trying likely does not exist in DuckDB. "
+                    "STOP retrying the same approach. Rewrite your analysis using "
+                    "only basic SQL math and aggregates (AVG, STDDEV_POP, CORR, etc)."
+                ),
+            })
+
+    def handle_final(self, response, call_ms: int) -> WorkerResult | None:
+        """Final-answer path (no tool_calls). Public alias of ``_handle_final``."""
         return self._handle_final(response, call_ms)
 
     def _handle_final(self, response, call_ms: int) -> WorkerResult | None:

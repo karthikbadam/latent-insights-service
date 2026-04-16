@@ -36,7 +36,7 @@ def fan_out_with_synthesis(
 
     Returns list of thread IDs (analysis threads + synthesis thread).
     """
-    from latent_insights.orchestration.loop import ThreadLoop
+    from latent_insights.orchestration.runner import ThreadRunner
 
     # Spawn analysis threads
     runners = []
@@ -44,13 +44,13 @@ def fan_out_with_synthesis(
     for q in questions:
         thread = store.create_thread(session_id, q, "", "")
         thread_db = db.open_session_connection(session_id)
-        loop = ThreadLoop(
+        runner = ThreadRunner(
             config=config, llm=llm, session_db=thread_db, queue=queue,
             store=store, thread=thread,
             schema_summary=schema_summary,
         )
-        loop.start()
-        runners.append(loop)
+        runner.start()
+        runners.append(runner)
         thread_ids.append(thread.id)
 
     # Schedule synthesis after all threads complete
@@ -78,12 +78,12 @@ def fan_out_with_synthesis(
             session_id, synthesis_question, "Fan-out synthesis", "",
         )
         synth_db = db.open_session_connection(session_id)
-        synth_loop = ThreadLoop(
+        synth_runner = ThreadRunner(
             config=config, llm=llm, session_db=synth_db, queue=queue,
             store=store, thread=synth_thread,
             schema_summary=schema_summary,
         )
-        synth_loop.start()
+        synth_runner.start()
         thread_ids.append(synth_thread.id)
 
         queue.emit(StreamEvent(

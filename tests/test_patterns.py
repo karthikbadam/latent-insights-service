@@ -95,9 +95,9 @@ class TestFanOutWithSynthesis:
         session_db.close()
         store.update_session_schema(session.id, "test schema")
 
-        # Patch ThreadLoop.start to be a no-op, AND patch queue.schedule
+        # Patch ThreadRunner.start to be a no-op, AND patch queue.schedule
         # so the synthesis wait task never runs
-        with patch("latent_insights.orchestration.loop.ThreadLoop.start"), \
+        with patch("latent_insights.orchestration.runner.ThreadRunner.start"), \
              patch.object(queue, "schedule") as mock_schedule:
             thread_ids = fan_out_with_synthesis(
                 questions=["Q1?", "Q2?", "Q3?"],
@@ -141,7 +141,7 @@ class TestFanOutWithSynthesis:
 
 
 # ---------------------------------------------------------------------------
-# human_in_the_loop (via LoopMode.STEP_AND_PAUSE)
+# human_in_the_loop (via RunnerMode.STEP_AND_PAUSE)
 # ---------------------------------------------------------------------------
 
 
@@ -149,7 +149,7 @@ class TestHumanInTheLoop:
     def test_hitl_pauses_after_one_step(self, pattern_setup, tmp_path):
         """human_in_the_loop runs one step then sets thread to WAITING."""
         from latent_insights.db.connection import Database
-        from latent_insights.orchestration.loop import LoopMode, ThreadLoop
+        from latent_insights.orchestration.runner import RunnerMode, ThreadRunner
 
         setup = pattern_setup
         store = setup["store"]
@@ -186,17 +186,17 @@ class TestHumanInTheLoop:
             return LLMResponse(content="{}", model=model)
 
         thread_db = db.open_session_connection(session.id)
-        loop = ThreadLoop(
+        runner = ThreadRunner(
             config=config, llm=MagicMock(), session_db=thread_db,
             queue=queue, store=store,
             thread=thread, schema_summary="test schema",
-            mode=LoopMode.STEP_AND_PAUSE,
+            mode=RunnerMode.STEP_AND_PAUSE,
         )
-        loop.coordinator.llm.call = mock_call
-        loop.worker.llm.call = mock_call
+        runner.coordinator.llm.call = mock_call
+        runner.worker.llm.call = mock_call
 
-        loop.start()
-        loop.done_event.wait(timeout=10)
+        runner.start()
+        runner.done_event.wait(timeout=10)
 
         # Thread should be WAITING, not COMPLETE or RUNNING
         final = store.get_thread(thread.id)
@@ -279,7 +279,7 @@ class TestPatternRegistry:
 
 class TestSessionFlowPatternDispatch:
     def test_default_pattern_coordinator_worker(self, pattern_setup, tmp_path):
-        """default_pattern='coordinator_worker' uses ThreadLoop per question."""
+        """default_pattern='coordinator_worker' uses ThreadRunner per question."""
         from latent_insights.db.connection import Database
         from latent_insights.models import ScoutQuestion
         from latent_insights.orchestration.session import SessionFlow
@@ -304,9 +304,9 @@ class TestSessionFlowPatternDispatch:
             ScoutQuestion(question="Q2?", motivation="", entry_point="", difficulty="moderate"),
         ]
 
-        with patch("latent_insights.orchestration.loop.ThreadLoop.start") as mock_start:
+        with patch("latent_insights.orchestration.runner.ThreadRunner.start") as mock_start:
             flow._spawn_threads(session.id, questions, "test schema")
-            # coordinator_worker: one ThreadLoop.start() per question
+            # coordinator_worker: one ThreadRunner.start() per question
             assert mock_start.call_count == 2
 
         # Two threads created
@@ -350,7 +350,7 @@ class TestSessionFlowPatternDispatch:
             assert call_kwargs["session_id"] == session.id
 
     def test_default_pattern_human_in_the_loop(self, pattern_setup, tmp_path):
-        """default_pattern='human_in_the_loop' uses ThreadLoop with STEP_AND_PAUSE."""
+        """default_pattern='human_in_the_loop' uses ThreadRunner with STEP_AND_PAUSE."""
         from latent_insights.db.connection import Database
         from latent_insights.models import ScoutQuestion
         from latent_insights.orchestration.session import SessionFlow
@@ -374,7 +374,7 @@ class TestSessionFlowPatternDispatch:
             ScoutQuestion(question="Q2?", motivation="", entry_point="", difficulty="moderate"),
         ]
 
-        with patch("latent_insights.orchestration.loop.ThreadLoop.start") as mock_start:
+        with patch("latent_insights.orchestration.runner.ThreadRunner.start") as mock_start:
             flow._spawn_threads(session.id, questions, "test schema")
             assert mock_start.call_count == 2
 

@@ -227,7 +227,7 @@ def get_session(session_id: str, request: Request):
 def create_thread(session_id: str, request: Request, body: CreateThreadRequest):
     """Create a user-initiated thread with a custom question."""
     config, llm, db, queue, store = _get_state(request)
-    from latent_insights.orchestration.loop import ThreadLoop
+    from latent_insights.orchestration.runner import ThreadRunner
 
     session = store.get_session(session_id)
     if session is None:
@@ -241,7 +241,7 @@ def create_thread(session_id: str, request: Request, body: CreateThreadRequest):
 
     thread_db = db.open_session_connection(session_id)
 
-    loop = ThreadLoop(
+    runner = ThreadRunner(
         config=config,
         llm=llm,
         session_db=thread_db,
@@ -250,7 +250,7 @@ def create_thread(session_id: str, request: Request, body: CreateThreadRequest):
         thread=thread,
         schema_summary=session.schema_summary,
     )
-    loop.start()
+    runner.start()
 
     return ThreadResponse(
         id=thread.id,
@@ -320,12 +320,12 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     if thread.status.value not in ("waiting", "complete"):
         raise HTTPException(status_code=400, detail=f"Thread status '{thread.status.value}' does not accept messages")
 
-    from latent_insights.orchestration.loop import ThreadLoop
+    from latent_insights.orchestration.runner import ThreadRunner
 
     session = store.get_session(thread.session_id)
     thread_db = db.open_session_connection(thread.session_id)
 
-    loop = ThreadLoop(
+    runner = ThreadRunner(
         config=config,
         llm=llm,
         session_db=thread_db,
@@ -334,7 +334,7 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
         thread=thread,
         schema_summary=session.schema_summary or "",
     )
-    loop.resume(human_messages=[{
+    runner.resume(human_messages=[{
         "content": body.content, "target": "thread", "timestamp": time.time(),
     }])
 
@@ -361,14 +361,14 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
             store.push_pending_message(t.id, body.content, target="session")
             injected_ids.append(t.id)
         elif t.status == ThreadStatus.WAITING:
-            from latent_insights.orchestration.loop import ThreadLoop
+            from latent_insights.orchestration.runner import ThreadRunner
             thread_db = db.open_session_connection(session_id)
-            loop = ThreadLoop(
+            runner = ThreadRunner(
                 config=config, llm=llm, session_db=thread_db, queue=queue,
                 store=store, thread=t,
                 schema_summary=session.schema_summary or "",
             )
-            loop.resume(human_messages=[{
+            runner.resume(human_messages=[{
                 "content": body.content, "target": "session",
                 "timestamp": broadcast_ts,
             }])
@@ -492,18 +492,18 @@ def run_pattern(
         question = inputs.get("question", "")
         if not question:
             raise HTTPException(status_code=400, detail="'question' is required")
-        from latent_insights.orchestration.loop import ThreadLoop
+        from latent_insights.orchestration.runner import ThreadRunner
 
         thread = store.create_thread(
             session_id, question, inputs.get("motivation", ""), "",
         )
         thread_db = db.open_session_connection(session_id)
-        loop = ThreadLoop(
+        runner = ThreadRunner(
             config=config, llm=llm, session_db=thread_db, queue=queue,
             store=store, thread=thread,
             schema_summary=session.schema_summary,
         )
-        loop.start()
+        runner.start()
         return RunPatternResponse(
             thread_id=thread.id, pattern=pattern_name, status="running",
         )
@@ -532,17 +532,17 @@ def run_pattern(
         question = inputs.get("question", "")
         if not question:
             raise HTTPException(status_code=400, detail="'question' is required")
-        from latent_insights.orchestration.loop import LoopMode, ThreadLoop
+        from latent_insights.orchestration.runner import RunnerMode, ThreadRunner
 
         thread = store.create_thread(session_id, question, inputs.get("motivation", ""), "")
         thread_db = db.open_session_connection(session_id)
-        loop = ThreadLoop(
+        runner = ThreadRunner(
             config=config, llm=llm, session_db=thread_db, queue=queue,
             store=store, thread=thread,
             schema_summary=session.schema_summary,
-            mode=LoopMode.STEP_AND_PAUSE,
+            mode=RunnerMode.STEP_AND_PAUSE,
         )
-        loop.start()
+        runner.start()
         return RunPatternResponse(
             thread_id=thread.id, pattern=pattern_name, status="running",
         )

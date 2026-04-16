@@ -11,7 +11,7 @@ from latent_insights.core.llm import LLMResponse
 from latent_insights.core.queue import Queue
 from latent_insights.core.store import InvestigationStore, generate_id
 from latent_insights.models import ThreadStatus
-from latent_insights.orchestration.loop import ThreadLoop
+from latent_insights.orchestration.runner import ThreadRunner
 
 
 # --- InvestigationStore unit tests ---
@@ -216,7 +216,7 @@ def test_trace_save_and_load(tmp_path):
     assert loaded_spans[0].attributes["move"] == "SCOPE"
 
 
-# --- Thread loop integration tests ---
+# --- ThreadRunner integration tests ---
 
 
 @pytest.fixture
@@ -262,9 +262,9 @@ def _make_worker_response(summary):
     })
 
 
-def _build_loop(setup, thread, session_db=None, human_messages=None):
-    """Build a ThreadLoop for testing."""
-    return ThreadLoop(
+def _build_runner(setup, thread, session_db=None, human_messages=None):
+    """Build a ThreadRunner for testing."""
+    return ThreadRunner(
         config=setup["config"],
         llm=MagicMock(),
         session_db=session_db or setup["session_db"],
@@ -276,7 +276,7 @@ def _build_loop(setup, thread, session_db=None, human_messages=None):
     )
 
 
-def test_thread_loop_three_steps_done(integration_setup):
+def test_thread_runner_three_steps_done(integration_setup):
     """Thread runs 3 steps then completes."""
     setup = integration_setup
     store = setup["store"]
@@ -301,19 +301,19 @@ def test_thread_loop_three_steps_done(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     final_thread = store.get_thread(thread.id)
     assert final_thread.status == ThreadStatus.COMPLETE
     assert final_thread.summary is not None
 
 
-def test_thread_loop_stuck_then_resume(integration_setup):
+def test_thread_runner_stuck_then_resume(integration_setup):
     """Thread gets stuck, human replies, thread resumes and completes."""
     setup = integration_setup
     store = setup["store"]
@@ -361,12 +361,12 @@ def test_thread_loop_stuck_then_resume(integration_setup):
         return LLMResponse(content="{}", model=model)
 
     # Run until stuck
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     t = store.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
@@ -379,12 +379,12 @@ def test_thread_loop_stuck_then_resume(integration_setup):
         "CREATE TABLE dataset AS SELECT * FROM read_csv_auto('tests/fixtures/sample_dataset.csv')"
     )
 
-    loop2 = _build_loop(setup, thread, session_db=session_db2, human_messages=["Yes, this is a known effect"])
-    loop2.coordinator.llm.call = mock_call
-    loop2.worker.llm.call = mock_call
+    runner2 = _build_runner(setup, thread, session_db=session_db2, human_messages=["Yes, this is a known effect"])
+    runner2.coordinator.llm.call = mock_call
+    runner2.worker.llm.call = mock_call
 
-    loop2.resume()
-    loop2.done_event.wait(timeout=10)
+    runner2.resume()
+    runner2.done_event.wait(timeout=10)
 
     t = store.get_thread(thread.id)
     assert t.status == ThreadStatus.COMPLETE
@@ -414,12 +414,12 @@ def test_thread_emits_events(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     events = []
     while not event_queue.empty():
@@ -453,12 +453,12 @@ def test_thread_move_repetition_guard(integration_setup):
             )
         return LLMResponse(content="{}", model=model)
 
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     t = store.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
@@ -480,12 +480,12 @@ def test_thread_error_becomes_waiting(integration_setup):
             raise RuntimeError("Simulated LLM failure")
         return LLMResponse(content="{}", model=model)
 
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
 
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     t = store.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
@@ -506,11 +506,11 @@ def test_thread_unexpected_error_sets_reason(integration_setup):
     def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         raise RuntimeError("synthetic bug")
 
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     waiting_events = []
     while not event_queue.empty():
@@ -543,11 +543,11 @@ def test_thread_transient_error_sets_retry_exhausted_reason(integration_setup):
     def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         raise APIConnectionError(request=request)
 
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     reasons = []
     while not event_queue.empty():
@@ -588,11 +588,11 @@ def test_thread_coordinator_stuck_reason(integration_setup):
             content=_make_worker_response("result"), model=model, tool_calls=None,
         )
 
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     reasons = []
     while not event_queue.empty():
@@ -649,11 +649,11 @@ def test_human_message_appears_in_step_event_timeline(integration_setup):
             content=_make_worker_response("result"), model=model, tool_calls=None,
         )
 
-    loop = _build_loop(setup, thread)
-    loop.coordinator.llm.call = mock_call
-    loop.worker.llm.call = mock_call
-    loop.start()
-    loop.done_event.wait(timeout=10)
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
 
     # After completion, spans are cleared from memory but saved to disk.
     # Reload to inspect.
