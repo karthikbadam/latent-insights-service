@@ -6,6 +6,7 @@ Pre-built flow patterns — factory functions for different thread topologies.
 """
 
 import logging
+from threading import Lock
 from typing import Any
 
 from latent_insights.config import AppConfig
@@ -30,35 +31,37 @@ def fan_out_with_synthesis(
     """
     Run N independent analysis threads, then synthesize their findings.
 
-    1. Spawns N coordinator-worker threads (one per question).
-    2. Waits for all to complete.
-    3. Creates a synthesis thread that combines all findings.
+    The synthesis kicks off from the last-to-finish analysis runner's
+    ``on_done`` callback — no pool worker is held blocked on a wait.
+    Each analysis runner decrements a shared counter when it terminates
+    (complete / waiting / error); whichever one takes the counter to
+    zero is responsible for scheduling the synthesis.
 
-    Returns list of thread IDs (analysis threads + synthesis thread).
+    Returns list of thread IDs (analysis threads only; the synthesis
+    thread is created later inside the callback).
     """
     from latent_insights.orchestration.runner import ThreadRunner
 
-    # Spawn analysis threads
-    runners = []
-    thread_ids = []
-    for q in questions:
-        thread = store.create_thread(session_id, q, "", "")
-        thread_db = db.open_session_connection(session_id)
-        runner = ThreadRunner(
-            config=config, llm=llm, session_db=thread_db, queue=queue,
-            store=store, thread=thread,
-            schema_summary=schema_summary,
-        )
-        runner.start()
-        runners.append(runner)
-        thread_ids.append(thread.id)
+    thread_ids: list[str] = []
+    runners: list[ThreadRunner] = []
 
-    # Schedule synthesis after all threads complete
-    def _wait_and_synthesize():
-        for runner in runners:
-            runner.done_event.wait(timeout=config.llm_timeout * 60)
+    # Shared counter + lock so the last-to-finish runner triggers the
+    # synthesis exactly once. The counter lives in a list so the
+    # callback can mutate it from the pool thread that fires it.
+    remaining = [len(questions)]
+    remaining_lock = Lock()
+    synthesis_started = [False]
 
-        # Collect findings from completed threads
+    def _on_analysis_done():
+        with remaining_lock:
+            remaining[0] -= 1
+            is_last = remaining[0] == 0 and not synthesis_started[0]
+            if is_last:
+                synthesis_started[0] = True
+        if is_last:
+            _start_synthesis()
+
+    def _start_synthesis():
         findings = []
         for tid in thread_ids:
             t = store.get_thread(tid)
@@ -66,7 +69,9 @@ def fan_out_with_synthesis(
                 findings.append(f"**{t.seed_question}**\n{t.summary}")
 
         if not findings:
-            logger.warning(f"Fan-out synthesis: no findings from {len(thread_ids)} threads")
+            logger.warning(
+                f"Fan-out synthesis: no findings from {len(thread_ids)} threads"
+            )
             return
 
         synthesis_question = (
@@ -84,7 +89,6 @@ def fan_out_with_synthesis(
             schema_summary=schema_summary,
         )
         synth_runner.start()
-        thread_ids.append(synth_thread.id)
 
         queue.emit(StreamEvent(
             session_id=session_id,
@@ -92,18 +96,24 @@ def fan_out_with_synthesis(
             event_type="synthesis_start",
             message=f"Synthesizing {len(findings)} thread findings",
             data={
-                "source_threads": thread_ids[:-1],
+                "source_threads": list(thread_ids),
                 "synthesis_thread": synth_thread.id,
             },
         ))
 
-    queue.schedule(
-        fn=_wait_and_synthesize,
-        args=(),
-        task_id=f"fanout-synth-{session_id[:8]}",
-        session_id=session_id,
-        description=f"Fan-out synthesis: {len(questions)} threads",
-    )
+    # Spawn analysis threads with the on_done hook wired up.
+    for q in questions:
+        thread = store.create_thread(session_id, q, "", "")
+        thread_db = db.open_session_connection(session_id)
+        runner = ThreadRunner(
+            config=config, llm=llm, session_db=thread_db, queue=queue,
+            store=store, thread=thread,
+            schema_summary=schema_summary,
+            on_done=_on_analysis_done,
+        )
+        runner.start()
+        runners.append(runner)
+        thread_ids.append(thread.id)
 
     return thread_ids
 

@@ -75,8 +75,13 @@ def _make_mock_call(done_on_step=2):
 
 
 class TestFanOutWithSynthesis:
-    def test_spawns_multiple_threads_plus_synthesis(self, pattern_setup, tmp_path):
-        """fan_out creates N analysis threads + schedules a synthesis."""
+    def test_spawns_multiple_threads_and_fires_synthesis_on_last_done(
+        self, pattern_setup, tmp_path,
+    ):
+        """fan_out creates N analysis threads and triggers synthesis from
+        the last-to-finish runner's ``on_done`` callback — no blocking
+        pool worker held on a wait.
+        """
         from latent_insights.db.connection import Database
         from latent_insights.orchestration.patterns import fan_out_with_synthesis
 
@@ -85,7 +90,6 @@ class TestFanOutWithSynthesis:
         config = setup["config"]
         queue = setup["queue"]
 
-        # Create a real DB for thread loops
         db = Database(data_dir=str(tmp_path))
         csv_path = str(tmp_path / "test.csv")
         with open(csv_path, "w") as f:
@@ -95,10 +99,24 @@ class TestFanOutWithSynthesis:
         session_db.close()
         store.update_session_schema(session.id, "test schema")
 
-        # Patch ThreadRunner.start to be a no-op, AND patch queue.schedule
-        # so the synthesis wait task never runs
-        with patch("latent_insights.orchestration.runner.ThreadRunner.start"), \
-             patch.object(queue, "schedule") as mock_schedule:
+        # Capture on_done callbacks off each ThreadRunner so we can
+        # simulate analysis threads finishing (without actually running
+        # them). ThreadRunner.start is a no-op in this test.
+        captured_callbacks: list = []
+        original_init = None
+
+        from latent_insights.orchestration.runner import ThreadRunner
+
+        def capture_init(self, **kwargs):
+            captured_callbacks.append(kwargs.get("on_done"))
+            # Assign the minimum attrs start()/no-op needs; skip the
+            # heavyweight real __init__ that opens DB connections etc.
+            self.thread = kwargs["thread"]
+            self.on_done = kwargs.get("on_done")
+            self.done_event = __import__("threading").Event()
+
+        with patch.object(ThreadRunner, "__init__", capture_init), \
+             patch.object(ThreadRunner, "start", lambda self: None):
             thread_ids = fan_out_with_synthesis(
                 questions=["Q1?", "Q2?", "Q3?"],
                 session_id=session.id,
@@ -106,18 +124,38 @@ class TestFanOutWithSynthesis:
                 store=store,
                 schema_summary="test schema",
             )
-            # Verify synthesis task was scheduled
-            assert mock_schedule.called
-            scheduled_task = mock_schedule.call_args.kwargs.get("task_id", "")
-            assert "fanout-synth" in scheduled_task
 
-        # Should have created 3 analysis threads
-        assert len(thread_ids) == 3
-        threads = store.get_threads(session.id)
-        assert len(threads) == 3
-        assert threads[0].seed_question == "Q1?"
-        assert threads[1].seed_question == "Q2?"
-        assert threads[2].seed_question == "Q3?"
+            # 3 analysis threads created, each handed an on_done callback.
+            assert len(thread_ids) == 3
+            threads = store.get_threads(session.id)
+            assert [t.seed_question for t in threads] == ["Q1?", "Q2?", "Q3?"]
+            assert len(captured_callbacks) == 3
+            assert all(cb is not None for cb in captured_callbacks)
+
+            # Simulate finish-callback firing from the first two runners —
+            # the counter has not yet reached zero, so synthesis must NOT
+            # have started (no 4th thread).
+            captured_callbacks[0]()
+            captured_callbacks[1]()
+            assert len(store.get_threads(session.id)) == 3
+
+            # Give the analysis threads finished-looking summaries so the
+            # synthesizer has something to work with, then fire the last
+            # callback. The synthesis thread is created from within it.
+            for tid in thread_ids:
+                store.update_thread_status(
+                    tid,
+                    store.get_thread(tid).status,  # keep status
+                    summary=f"Summary for {tid[:4]}",
+                )
+            captured_callbacks[2]()
+
+            # A 4th thread (the synthesis thread) now exists.
+            all_threads = store.get_threads(session.id)
+            assert len(all_threads) == 4
+            synth = all_threads[-1]
+            assert synth.motivation == "Fan-out synthesis"
+            assert "Summary for" in synth.seed_question
 
     def test_fan_out_differs_from_coordinator_worker(self, pattern_setup, tmp_path):
         """fan_out creates threads with different questions; coordinator_worker is single-question."""

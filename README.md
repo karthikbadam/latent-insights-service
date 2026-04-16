@@ -193,7 +193,7 @@ client-side view model.
 | `message_injected`     | session/thread | `content`, `target`, `injected_threads`, `resumed_threads`        |
 | `thread_start`         | thread   | `seed_question`, `motivation`, `entry_point`, `step_number: 0`          |
 | `thread_resumed`       | thread   | `from_step`, `human_messages`                                           |
-| `step_start`           | thread   | `move`, `step_number`, `instruction`, `provisional: false`              |
+| `step_start`           | thread   | `move`, `step_number`, `instruction`, `assessment`, `rationale`, `status`, `provisional: false` |
 | `llm_call`             | thread   | `agent`, `model`, `input_tokens`, `output_tokens`, `duration_ms`, `response`, `step_number`, `move` |
 | `tool_call`            | thread   | `agent`, `sql`, `tool_result`, `duration_ms`, `step_number`, `move`     |
 | `human_message`        | thread   | `content`, `target`, `step_number`, `move`                              |

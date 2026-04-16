@@ -71,6 +71,7 @@ class ThreadRunner:
         schema_summary: str,
         human_messages: list | None = None,
         mode: RunnerMode = RunnerMode.LOOP_UNTIL_DONE,
+        on_done: "callable | None" = None,
     ):
         self.config = config
         self.queue = queue
@@ -80,6 +81,12 @@ class ThreadRunner:
         self.schema_summary = schema_summary
         self.human_messages: list = list(human_messages or [])
         self.mode = mode
+        # One-shot completion hook, invoked once from ``_finish`` after
+        # any terminal path (complete / waiting / error). Patterns that
+        # coordinate across multiple threads (e.g. fan-out synthesis)
+        # register a callback here so they don't have to hold a pool
+        # worker blocked on ``done_event.wait``.
+        self.on_done = on_done
 
         self.recorder = Recorder(store, queue, thread.session_id, thread.id)
         self.done_event: Event = Event()
@@ -288,7 +295,12 @@ class ThreadRunner:
             response=coord_log.get("response", ""),
         )
         self.recorder.step_start(
-            self.step_number, final_move, decision.worker_instruction or "",
+            self.step_number,
+            final_move,
+            decision.worker_instruction or "",
+            assessment=decision.assessment or "",
+            rationale=decision.rationale or "",
+            status=decision.status.value,
         )
 
         # Genuinely STUCK (post step 2)
@@ -681,7 +693,7 @@ class ThreadRunner:
         self._start_step()
 
     def _finish(self):
-        """Release DB, set done_event. Idempotent."""
+        """Release DB, set done_event, fire on_done. Idempotent."""
         if self.done_event.is_set():
             return
         try:
@@ -689,6 +701,14 @@ class ThreadRunner:
         except Exception:
             pass
         self.done_event.set()
+        if self.on_done is not None:
+            try:
+                self.on_done()
+            except Exception:
+                logger.exception(
+                    f"Thread {self.thread.id} on_done callback raised; "
+                    "continuing"
+                )
 
     def _get_thread_views(self) -> str:
         try:

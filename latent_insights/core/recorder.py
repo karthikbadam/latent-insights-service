@@ -137,7 +137,25 @@ class Recorder:
     # --- Step lifecycle (SSE only — step rows are managed directly on
     # the store by the runner) ---
 
-    def step_start(self, step_number: int, move: str, instruction: str):
+    def step_start(
+        self,
+        step_number: int,
+        move: str,
+        instruction: str,
+        *,
+        assessment: str = "",
+        rationale: str = "",
+        status: str = "",
+    ):
+        """Emit ``step_start`` with the coordinator's full decision.
+
+        ``assessment`` (what the coordinator thinks of the investigation
+        state), ``rationale`` (why this move now), and ``status``
+        (``CONTINUE`` / ``STUCK`` / ``DONE``) are the structured
+        decision fields the UI needs to render "Coordinator decided X
+        because Y" without parsing the raw LLM JSON out of the sibling
+        ``llm_call`` event's ``response`` text.
+        """
         self.queue.emit(StreamEvent(
             session_id=self.session_id,
             thread_id=self.thread_id,
@@ -148,6 +166,9 @@ class Recorder:
                 "step_number": step_number,
                 "instruction": instruction,
                 "provisional": False,
+                "assessment": assessment,
+                "rationale": rationale,
+                "status": status,
             },
         ))
 
