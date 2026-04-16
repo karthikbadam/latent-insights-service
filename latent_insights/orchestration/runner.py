@@ -121,11 +121,12 @@ class ThreadRunner:
         self._pending_sql_lock: Lock = Lock()
 
         # Context-length recovery budget. When the model says the prompt
-        # is too large, we close the current step with an error result,
-        # inject a hint into the thread history via ``human_messages``,
-        # and let the next step try again with a simpler approach. We
-        # cap this at ``_max_context_recoveries`` per thread so a
-        # pathologically large dataset doesn't loop forever.
+        # is too large, we close the current step as an error row whose
+        # ``result`` explains the failure — ``format_thread_history``
+        # surfaces that result to the next coordinator call via the same
+        # path any other step's result uses, so the coordinator sees the
+        # overflow and picks a simpler next move. Capped at
+        # ``_max_context_recoveries`` per thread to bound retries.
         self._context_recoveries: int = 0
         self._max_context_recoveries: int = 2
 
@@ -654,45 +655,29 @@ class ThreadRunner:
             self._finish()
 
     def _recover_from_context_overflow(self, exc: Exception):
-        """Close the failing step and queue a hint for the next step.
+        """Close the failing step and continue the loop.
 
-        The hint goes into ``self.human_messages``, which ``_start_step``
-        records as a ``human_message`` event on the next step and
-        ``format_thread_history`` surfaces to the coordinator. That's
-        the "note in the history" the user sees and the model reads.
+        The step's ``result`` is set to a self-describing message. The
+        coordinator reads it via ``format_thread_history`` on the next
+        step — the same path any other step result takes — and can pick
+        a simpler next move without a separate hint channel.
         """
         error_msg = f"{type(exc).__name__}: {exc}"
 
-        # Finalize the current step (if still open) as an error row so it
-        # appears in snapshots with the failure context attached.
         if self._step is not None and self._step.end_time is None:
-            if not self._step.result:
-                self._step.result = (
-                    f"Context overflow: the prompt exceeded the model's context "
-                    f"window. Details: {error_msg}"
-                )
+            self._step.result = (
+                "Context overflow: this step's prompt exceeded the model's "
+                "context window. The next move should narrow the data — "
+                "fewer columns, tighter filters, aggressive aggregation, or "
+                "LIMIT — so the tool result stays short. "
+                f"Error: {error_msg}"
+            )
             self.store.end_step(self._step, status="error")
 
-        # Inject a hint for the coordinator to pick up on the next step.
-        # Targets "thread" so it sorts into this thread's timeline, not
-        # any session-wide broadcast UI.
-        hint = (
-            "⚠ The previous step's prompt exceeded the model's context window. "
-            "For the next move, pick a simpler query — narrow the date range, "
-            "pick fewer columns, aggregate aggressively, or LIMIT rows — so "
-            "the tool result is shorter."
-        )
-        self.human_messages.append({
-            "content": hint,
-            "target": "thread",
-            "timestamp": time.time(),
-        })
-
-        # Persist the failed step + save_session so a crash mid-recovery
-        # still leaves a coherent snapshot on disk.
+        # Persist so a crash mid-recovery still leaves a coherent snapshot.
         self.store.save_session(self.thread.session_id)
 
-        # Continue the loop with the next step.
+        # Continue with the next step.
         self._start_step()
 
     def _finish(self):
