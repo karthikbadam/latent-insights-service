@@ -344,43 +344,24 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
     # --- Start-a-new-thread branch ---
     if body.as_new_thread:
         if session.schema_summary is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Session profiling not complete yet",
-            )
-
+            raise HTTPException(status_code=400, detail="Session profiling not complete yet")
         from latent_insights.orchestration.runner import ThreadRunner
-
         new_thread = store.create_thread(
-            session_id,
-            seed_question=body.content,
-            motivation="Started from human guidance",
-            entry_point="",
+            session_id, body.content, "Started from human guidance", "",
         )
-        thread_db = db.open_session_connection(session_id)
-        runner = ThreadRunner(
-            config=config, llm=llm, session_db=thread_db, queue=queue,
-            store=store, thread=new_thread,
+        ThreadRunner(
+            config=config, llm=llm,
+            session_db=db.open_session_connection(session_id),
+            queue=queue, store=store, thread=new_thread,
             schema_summary=session.schema_summary,
-        )
-        runner.start()
-
+        ).start()
         queue.emit(StreamEvent(
-            session_id=session_id,
-            thread_id="",
+            session_id=session_id, thread_id="",
             event_type="message_injected",
             message=body.content,
-            data={
-                "content": body.content,
-                "target": "new_thread",
-                "thread_id": new_thread.id,
-            },
+            data={"content": body.content, "target": "new_thread", "thread_id": new_thread.id},
         ))
-        return {
-            "status": "thread_spawned",
-            "session_id": session_id,
-            "thread_id": new_thread.id,
-        }
+        return {"status": "thread_spawned", "session_id": session_id, "thread_id": new_thread.id}
 
     # --- Default broadcast branch ---
     threads = store.get_threads(session_id)

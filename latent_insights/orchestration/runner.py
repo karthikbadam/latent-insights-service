@@ -175,25 +175,16 @@ class ThreadRunner:
     # ------------------------------------------------------------------
 
     def _start_step(self):
-        """Begin a new coordinator step. Schedules the coordinator LLM call.
-
-        Order matters: emit ``thread_start`` first (if this is the very
-        first step), then drain any queued human messages as
-        ``HUMAN_INPUT`` steps, then commit the coordinator's own step
-        row. That way the timeline reads:
-        ``thread_start → [HUMAN_INPUT steps] → coordinator step`` — the
-        human guidance lands ahead of the coordinator move that will
-        react to it.
+        """Begin a coordinator step. Order: thread_start (once) → drain
+        pending as HUMAN_INPUT steps → coordinator step row → schedule
+        the coordinator LLM call.
         """
-        # 1. thread_start (one-shot, on the first call).
         if not self._thread_start_emitted:
             thread_obj = self.store.get_thread(self.thread.id)
-            if thread_obj:
-                created_ts = thread_obj.created_at.replace(
-                    tzinfo=timezone.utc
-                ).timestamp()
-            else:
-                created_ts = time.time()
+            created_ts = (
+                thread_obj.created_at.replace(tzinfo=timezone.utc).timestamp()
+                if thread_obj else time.time()
+            )
             self.recorder.thread_start(
                 self.thread.seed_question,
                 self.thread.motivation,
@@ -202,18 +193,12 @@ class ThreadRunner:
             )
             self._thread_start_emitted = True
 
-        # 2. Any pre-queued human messages become HUMAN_INPUT steps
-        # before the coordinator step gets created.
         self._drain_pending_as_steps()
 
-        # 3. Start the coordinator step row. Sync self.step_number to
-        # whatever the store assigned so the counter stays consistent
-        # regardless of how many HUMAN_INPUT steps were drained above.
         self._step = self.store.start_step(self.thread.id)
         self.step_number = self._step.step_number
         self._step_start = time.monotonic()
 
-        # 4. Schedule the coordinator LLM call as a pool task.
         self._schedule(
             fn=self._do_coordinator_call,
             callback=self._on_coordinator_done,
@@ -477,22 +462,16 @@ class ThreadRunner:
             self._coordinator_ms + worker_ms,
         )
 
-        # HITL: pause after one step. Route through recorder.thread_waiting
-        # so the pause is represented as a WAITING_FOR_HUMAN step in the
-        # timeline — same shape as any other terminal waiting state.
+        # HITL: pause after one step via recorder.thread_waiting → commits
+        # a WAITING_FOR_HUMAN step like any other pause path.
         if self.mode == RunnerMode.STEP_AND_PAUSE:
             thread_obj = self.store.get_thread(self.thread.id)
             if thread_obj and thread_obj.status != ThreadStatus.COMPLETE:
-                step_count = len(self.store.get_steps(self.thread.id))
-                question = (
-                    f"Step complete ({self._decision.next_move.value}). "
-                    "Review and send a message to continue."
-                )
                 self.recorder.thread_waiting(
                     reason="human_review",
-                    question=question,
+                    question=f"Step complete ({self._decision.next_move.value}). Review and send a message to continue.",
                     context=result.result,
-                    step_count=step_count,
+                    step_count=len(self.store.get_steps(self.thread.id)),
                     span_status="ok",
                 )
             self._finish()
@@ -565,67 +544,35 @@ class ThreadRunner:
     # ------------------------------------------------------------------
 
     def _drain_pending_as_steps(self) -> bool:
-        """Drain the store's pending-message queue into HUMAN_INPUT steps.
-
-        Each drained message becomes its own ``HUMAN_INPUT`` step via
-        ``recorder.human_input_step`` — visible in the timeline, in
-        snapshots, and on SSE just like any other step. Returns True if
-        anything was committed.
-        """
+        """Drain pending messages into HUMAN_INPUT steps. Returns True if any were committed."""
         injected = self.store.drain_pending_messages(self.thread.id)
         if not injected:
             return False
         for msg in injected:
             if isinstance(msg, dict):
-                content = msg.get("content", "")
-                target = msg.get("target", "thread")
-                ts = msg.get("timestamp")
+                self.recorder.human_input_step(
+                    msg.get("content", ""),
+                    target=msg.get("target", "thread"),
+                    timestamp=msg.get("timestamp"),
+                )
             else:
-                content = str(msg)
-                target = "thread"
-                ts = None
-            self.recorder.human_input_step(
-                content, target=target, timestamp=ts,
-            )
-        logger.info(
-            f"Thread {self.tid} committed {len(injected)} HUMAN_INPUT step(s)"
-        )
+                self.recorder.human_input_step(str(msg))
+        logger.info(f"Thread {self.tid} committed {len(injected)} HUMAN_INPUT step(s)")
         return True
 
     def _flush_and_pivot(self) -> bool:
-        """Interrupt the current step with any pending human input.
-
-        Called at the top of every scheduling callback. If human input
-        has been posted since the last callback:
-          1. Close the in-flight step (if still open) with
-             ``status="flushed"``.
-          2. Drain the pending queue into HUMAN_INPUT step(s).
-          3. Kick off a fresh coordinator step.
-          4. Return True so the caller short-circuits its default
-             "schedule the next natural task" flow.
-
-        If no pending input, returns False and the callback proceeds
-        normally.
+        """If pending human input exists, close the in-flight step,
+        commit HUMAN_INPUT steps, and restart at the coordinator.
+        Returns True if pivoted (caller must return early).
         """
         if not self.store.has_pending_messages(self.thread.id):
             return False
-
-        # Close the in-flight step with a self-describing result. This
-        # becomes visible in format_thread_history for the next
-        # coordinator call.
         if self._step is not None and self._step.end_time is None:
             if not self._step.result:
-                self._step.result = (
-                    "Step flushed — human input received mid-step"
-                )
+                self._step.result = "Step flushed — human input received mid-step"
             self.store.end_step(self._step, status="flushed")
             self._step = None
-
         self._drain_pending_as_steps()
-
-        # Pivot to a fresh coordinator step. The newly-committed
-        # HUMAN_INPUT step(s) are already in the store, so the
-        # coordinator sees them via format_thread_history.
         self._start_step()
         return True
 
@@ -669,17 +616,8 @@ class ThreadRunner:
     # ------------------------------------------------------------------
 
     def _handle_error(self, e: Exception):
-        """Route any loop error to a recovery path or ``thread_waiting``.
-
-        Context-length errors get a recovery budget: we close the current
-        step with an error result, inject a hint into the thread history
-        as a ``human_message``, and schedule the next step. The
-        coordinator sees the hint in ``format_thread_history`` and can
-        pick a simpler move. Once the budget is exhausted we fall
-        through to ``thread_waiting``.
-        """
+        """Route a loop error to context-overflow recovery or thread_waiting."""
         if self.done_event.is_set():
-            # Already finalized by a concurrent path — avoid double-emit.
             logger.debug(f"Thread {self.thread.id} error after finalize: {e}")
             return
 
@@ -690,42 +628,42 @@ class ThreadRunner:
             self._context_recoveries += 1
             logger.warning(
                 f"Thread {self.thread.id} context-length exceeded "
-                f"(recovery {self._context_recoveries}/{self._max_context_recoveries}); "
-                "injecting hint and continuing"
+                f"(recovery {self._context_recoveries}/{self._max_context_recoveries})"
             )
             self._recover_from_context_overflow(e)
             return
 
-        reason = "retry_exhausted" if is_transient_llm_error(e) else "unexpected_error"
         if is_context_length_error(e):
             reason = "context_exhausted"
+        elif is_transient_llm_error(e):
+            reason = "retry_exhausted"
+        else:
+            reason = "unexpected_error"
         error_msg = f"{type(e).__name__}: {e}"
         logger.error(
             f"Thread {self.thread.id} loop error ({reason}): {error_msg}",
             exc_info=True,
         )
 
+        questions = {
+            "retry_exhausted": (
+                "The LLM provider was unreachable after multiple retries. "
+                "Send a message when you want the thread to try again."
+            ),
+            "context_exhausted": (
+                "This thread's context has grown too large for the model. "
+                "Send a narrower follow-up and it will restart."
+            ),
+        }
+        question = questions.get(reason, f"Thread encountered an error: {error_msg}")
+
         try:
-            if reason == "retry_exhausted":
-                question = (
-                    "The LLM provider was unreachable after multiple retries. "
-                    "Send a message when you want the thread to try again."
-                )
-            elif reason == "context_exhausted":
-                question = (
-                    "This thread's context has grown too large for the model "
-                    "even after compressing its history. Send a narrower "
-                    "follow-up question and it will restart."
-                )
-            else:
-                question = f"Thread encountered an error: {error_msg}"
-            step_count = len(self.store.get_steps(self.thread.id))
             self.recorder.thread_waiting(
                 reason=reason,
                 question=question,
                 context=error_msg,
                 error=error_msg,
-                step_count=step_count,
+                step_count=len(self.store.get_steps(self.thread.id)),
                 span_status="error",
             )
         except Exception:
@@ -737,29 +675,18 @@ class ThreadRunner:
             self._finish()
 
     def _recover_from_context_overflow(self, exc: Exception):
-        """Close the failing step and continue the loop.
-
-        The step's ``result`` is set to a self-describing message. The
-        coordinator reads it via ``format_thread_history`` on the next
-        step — the same path any other step result takes — and can pick
-        a simpler next move without a separate hint channel.
+        """Close the failing step with a self-describing result so the next
+        coordinator step reads the overflow note via format_thread_history.
         """
-        error_msg = f"{type(exc).__name__}: {exc}"
-
         if self._step is not None and self._step.end_time is None:
             self._step.result = (
                 "Context overflow: this step's prompt exceeded the model's "
                 "context window. The next move should narrow the data — "
                 "fewer columns, tighter filters, aggressive aggregation, or "
-                "LIMIT — so the tool result stays short. "
-                f"Error: {error_msg}"
+                f"LIMIT — so the tool result stays short. Error: {type(exc).__name__}: {exc}"
             )
             self.store.end_step(self._step, status="error")
-
-        # Persist so a crash mid-recovery still leaves a coherent snapshot.
         self.store.save_session(self.thread.session_id)
-
-        # Continue with the next step.
         self._start_step()
 
     def _finish(self):

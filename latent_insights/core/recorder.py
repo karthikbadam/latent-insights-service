@@ -105,22 +105,17 @@ class Recorder:
         *,
         span_status: str = "stuck",
     ):
-        """Transition a thread into the terminal WAITING state.
+        """Terminal WAITING state.
 
-        Commits a dedicated ``WAITING_FOR_HUMAN`` step whose ``result`` is
-        the question the coordinator wants answered (and ``instruction``
-        carries any accompanying context). The ``thread_waiting`` SSE
-        event is kept as a thin terminal marker — its payload no longer
-        duplicates the question/context/error, which now live on the
-        waiting step and are reachable via the REST snapshot or the
-        preceding ``step_complete`` SSE.
+        Closes any in-flight analytical step, commits a
+        ``WAITING_FOR_HUMAN`` step (question on ``result``, context on
+        ``instruction``), then emits ``thread_waiting`` as a thin
+        terminal marker — ``question``/``context``/``error`` are on the
+        step, not duplicated on the event payload.
         """
         from latent_insights.models import MoveType, ThreadStatus
 
-        # End any in-flight analytical step so its row persists with the
-        # failure context. The caller passes ``span_status`` — "stuck" for
-        # coordinator-declared stuck / repeated-moves, "error" for raised
-        # exceptions.
+        # End any in-flight analytical step so its row persists.
         steps = self.store.get_steps(self.thread_id)
         if steps and steps[-1].end_time is None:
             step = steps[-1]
@@ -128,8 +123,7 @@ class Recorder:
                 step.result = f"{reason}: {context or error or ''}"
             self.store.end_step(step, status=span_status)
 
-        # Commit the WAITING_FOR_HUMAN step. This is a real row in the
-        # thread's timeline — UIs render it like any other step.
+        # Commit the WAITING_FOR_HUMAN step + emit its lifecycle SSE.
         waiting_step = self.store.start_step(self.thread_id)
         waiting_step.move = MoveType.WAITING_FOR_HUMAN.value
         waiting_step.instruction = context or ""
@@ -141,43 +135,24 @@ class Recorder:
         )
         self.store.save_session(self.session_id)
 
-        thread = self.store.get_thread(self.thread_id)
-        running_summary = thread.running_summary if thread else None
+        running_summary = (
+            self.store.get_thread(self.thread_id).running_summary
+            if self.store.get_thread(self.thread_id) else None
+        )
 
-        # Emit step_start + step_complete for the waiting step so live
-        # SSE consumers see it land in the timeline before the terminal
-        # thread_waiting marker.
-        self.queue.emit(StreamEvent(
-            session_id=self.session_id,
-            thread_id=self.thread_id,
-            event_type="step_start",
-            message=question,
-            data={
-                "move": MoveType.WAITING_FOR_HUMAN.value,
-                "step_number": waiting_step.step_number,
-                "instruction": context or "",
-                "provisional": False,
-                "assessment": "",
-                "rationale": "",
-                "status": "",
-            },
-        ))
-        self.queue.emit(StreamEvent(
-            session_id=self.session_id,
-            thread_id=self.thread_id,
-            event_type="step_complete",
-            message=question,
-            data={
-                "step_number": waiting_step.step_number,
-                "move": MoveType.WAITING_FOR_HUMAN.value,
-                "instruction": context or "",
-                "result": question,
-                "duration_ms": waiting_step.duration_ms or 0,
-            },
-        ))
+        self.step_start(
+            waiting_step.step_number,
+            MoveType.WAITING_FOR_HUMAN.value,
+            context or "",
+        )
+        self.step_complete(
+            waiting_step.step_number,
+            MoveType.WAITING_FOR_HUMAN.value,
+            context or "",
+            question,
+            waiting_step.duration_ms or 0,
+        )
 
-        # Thin terminal marker. The question/context/error are on the
-        # WAITING_FOR_HUMAN step; no need to duplicate them here.
         self.queue.emit(StreamEvent(
             session_id=self.session_id,
             thread_id=self.thread_id,
@@ -259,57 +234,23 @@ class Recorder:
         target: str = "thread",
         timestamp: float | None = None,
     ) -> Step:
-        """Commit a ``HUMAN_INPUT`` step carrying the human's guidance.
-
-        Every path that previously recorded a ``human_message`` event on
-        a step now calls this instead — human input is a step in its
-        own right, visible in the timeline alongside analytical moves.
-        The ``target`` ("thread" | "session") is preserved on the step's
-        instruction so the UI can badge session-broadcast messages.
-        """
+        """Commit a ``HUMAN_INPUT`` step. ``target`` goes on ``instruction``;
+        the message content goes on ``result``. Zero-duration."""
         from latent_insights.models import MoveType
 
         step = self.store.start_step(self.thread_id)
         step.move = MoveType.HUMAN_INPUT.value
-        step.instruction = target  # "thread" or "session"
+        step.instruction = target
         step.result = content
         if timestamp is not None:
             step.start_time = timestamp
         self.store.end_step(step, status="ok")
         self.store.save_session(self.session_id)
 
-        # Emit step_start + step_complete so a live SSE consumer sees
-        # the human step the same way it sees any other step.
-        self.queue.emit(StreamEvent(
-            session_id=self.session_id,
-            thread_id=self.thread_id,
-            event_type="step_start",
-            message=content,
-            data={
-                "move": MoveType.HUMAN_INPUT.value,
-                "step_number": step.step_number,
-                "instruction": target,
-                "provisional": False,
-                "assessment": "",
-                "rationale": "",
-                "status": "",
-            },
-            timestamp=timestamp or time.time(),
-        ))
-        self.queue.emit(StreamEvent(
-            session_id=self.session_id,
-            thread_id=self.thread_id,
-            event_type="step_complete",
-            message=content,
-            data={
-                "step_number": step.step_number,
-                "move": MoveType.HUMAN_INPUT.value,
-                "instruction": target,
-                "result": content,
-                "duration_ms": 0,
-            },
-            timestamp=timestamp or time.time(),
-        ))
+        self.step_start(step.step_number, MoveType.HUMAN_INPUT.value, target)
+        self.step_complete(
+            step.step_number, MoveType.HUMAN_INPUT.value, target, content, 0,
+        )
         return step
 
     # --- Events within a step (written as flat StepEvent dicts) ----------
