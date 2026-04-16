@@ -1,20 +1,23 @@
 """
-Recorder — dual-write helper that records span events and emits SSE in one call.
+Recorder — dual-write helper that records step events and emits SSE in one call.
 
 Every public method writes to ``InvestigationStore`` (the persistent record)
 **and** emits the matching ``StreamEvent`` through ``Queue`` (the SSE stream).
 This guarantees the two representations cannot drift.
+
+Event dicts stored on steps use the flat ``api.schemas.StepEvent`` shape, so
+the on-disk snapshot matches the API response byte-for-byte.
 """
 
 import time
 
 from latent_insights.core.queue import Queue
-from latent_insights.core.store import InvestigationStore, Span
+from latent_insights.core.store import InvestigationStore, Step
 from latent_insights.models import StreamEvent
 
 
 class Recorder:
-    """Dual-write: span events + SSE emission."""
+    """Dual-write: step events + SSE emission."""
 
     def __init__(
         self,
@@ -99,14 +102,13 @@ class Recorder:
     ):
         from latent_insights.models import ThreadStatus
 
-        # End current open span if any
-        spans = self.store.get_step_spans(self.thread_id)
-        if spans and spans[-1].end_time is None:
-            span = spans[-1]
-            span.attributes.setdefault("result", f"{reason}: {context or error or ''}")
-            if error:
-                span.attributes["error"] = error
-            self.store.end_span(span, status=span_status)
+        # End any open in-progress step on the thread so its row persists.
+        steps = self.store.get_steps(self.thread_id)
+        if steps and steps[-1].end_time is None:
+            step = steps[-1]
+            if not step.result:
+                step.result = f"{reason}: {context or error or ''}"
+            self.store.end_step(step, status=span_status)
 
         self.store.update_thread_status(
             self.thread_id, ThreadStatus.WAITING, error=error or reason,
@@ -132,7 +134,8 @@ class Recorder:
             },
         ))
 
-    # --- Step lifecycle ---
+    # --- Step lifecycle (SSE only — step rows are managed directly on
+    # the store by the runner) ---
 
     def step_start(self, step_number: int, move: str, instruction: str):
         self.queue.emit(StreamEvent(
@@ -170,11 +173,11 @@ class Recorder:
             },
         ))
 
-    # --- Events within a step ---
+    # --- Events within a step (written as flat StepEvent dicts) ----------
 
     def llm_call(
         self,
-        span: Span,
+        step: Step,
         *,
         step_number: int,
         move: str,
@@ -186,8 +189,9 @@ class Recorder:
         response: str = "",
         has_tool_calls: bool = False,
     ):
-        """Record an LLM call on the span and emit the SSE event."""
-        self.store.add_event(span, "llm_call", {
+        """Record an LLM call on the step and emit the SSE event."""
+        self.store.add_event(step, {
+            "type": "llm_call",
             "agent": agent,
             "model": model,
             "duration_ms": duration_ms,
@@ -215,7 +219,7 @@ class Recorder:
 
     def tool_call(
         self,
-        span: Span,
+        step: Step,
         *,
         step_number: int,
         move: str,
@@ -223,8 +227,9 @@ class Recorder:
         tool_result: str,
         duration_ms: int = 0,
     ):
-        """Record a SQL tool call on the span and emit the SSE event."""
-        self.store.add_event(span, "tool_call", {
+        """Record a SQL tool call on the step and emit the SSE event."""
+        self.store.add_event(step, {
+            "type": "tool_call",
             "agent": "worker",
             "sql": sql,
             "tool_result": tool_result,
@@ -247,16 +252,19 @@ class Recorder:
 
     def human_message(
         self,
-        span: Span,
+        step: Step,
         *,
         content: str,
         target: str = "thread",
         timestamp: float | None = None,
     ):
-        """Record a human message on the span."""
+        """Record a human message on the step."""
         self.store.add_event(
-            span,
-            "human_message",
-            {"content": content, "target": target},
+            step,
+            {
+                "type": "human_message",
+                "content": content,
+                "target": target,
+            },
             timestamp=timestamp,
         )

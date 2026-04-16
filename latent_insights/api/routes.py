@@ -47,48 +47,26 @@ def _get_state(request: Request):
 
 
 def _steps_from_store(store, thread) -> list[StepResponse]:
-    """Convert store spans to StepResponse list for API."""
-    spans = store.get_step_spans(thread.id)
+    """Project completed ``Step`` rows to ``StepResponse`` for the API.
 
-    # Only include completed steps (in-progress spans have no attributes yet)
-    spans = [s for s in spans if s.end_time is not None]
+    The store's Step and event shapes already match the API — this is a
+    trivial projection (copy fields + sort events by timestamp).
+    """
+    steps = [s for s in store.get_steps(thread.id) if s.end_time is not None]
 
-    steps = []
-    for i, span in enumerate(spans, 1):
-        attrs = span.attributes
-        duration_ms = None
-        if span.end_time and span.start_time:
-            duration_ms = round((span.end_time - span.start_time) * 1000)
-
-        step_events = []
-        for event in span.events:
-            event_attrs = event.get("attributes", {})
-            step_events.append(StepEvent(
-                type=event["name"],
-                timestamp=event.get("timestamp", 0),
-                agent=event_attrs.get("agent"),
-                model=event_attrs.get("model"),
-                duration_ms=event_attrs.get("duration_ms"),
-                input_tokens=event_attrs.get("input_tokens"),
-                output_tokens=event_attrs.get("output_tokens"),
-                sql=event_attrs.get("sql"),
-                tool_result=event_attrs.get("tool_result"),
-                response=event_attrs.get("response"),
-                content=event_attrs.get("content"),
-                target=event_attrs.get("target"),
-            ))
-        step_events.sort(key=lambda e: e.timestamp)
-
-        steps.append(StepResponse(
-            step_number=i,
-            move=attrs.get("move", ""),
-            instruction=attrs.get("instruction", ""),
-            result=attrs.get("result", ""),
-            view_created=attrs.get("view_created"),
-            duration_ms=duration_ms,
-            events=step_events,
+    responses: list[StepResponse] = []
+    for step in steps:
+        events = sorted(step.events, key=lambda e: e.get("timestamp", 0))
+        responses.append(StepResponse(
+            step_number=step.step_number,
+            move=step.move,
+            instruction=step.instruction,
+            result=step.result,
+            view_created=step.view_created,
+            duration_ms=step.duration_ms,
+            events=[StepEvent(**e) for e in events],
         ))
-    return steps
+    return responses
 
 
 # --- Sessions ---
@@ -562,23 +540,28 @@ def get_graph_state(thread_id: str, request: Request):
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    spans = store.get_step_spans(thread_id)
+    steps = store.get_steps(thread_id)
 
-    move_history = []
-    for span in spans:
-        move = span.attributes.get("move")
-        if move:
-            move_history.append(move)
+    move_history = [s.move for s in steps if s.move]
 
     current_node = None
     if thread.status.value == "running":
-        current_node = "coordinator" if not spans or spans[-1].end_time else "worker"
+        current_node = "coordinator" if not steps or steps[-1].end_time else "worker"
 
+    last = steps[-1] if steps else None
     return GraphStateResponse(
         thread_id=thread_id,
-        step_number=len(spans),
+        step_number=len(steps),
         current_node=current_node,
         move_history=move_history,
         status=thread.status.value,
-        decision=spans[-1].attributes if spans else None,
+        decision=(
+            {
+                "move": last.move,
+                "instruction": last.instruction,
+                "result": last.result,
+                "view_created": last.view_created,
+            }
+            if last else None
+        ),
     )

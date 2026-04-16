@@ -142,19 +142,17 @@ def test_trace_format_empty(tmp_path):
 
 def test_trace_format_windowed(tmp_path):
     store = InvestigationStore(data_dir=str(tmp_path))
-    trace_id = "test-trace"
+    thread_id = "test-trace"
 
     # Create 6 steps
     for i in range(6):
-        span = store.start_span(trace_id, f"step_{i+1}", kind="step")
-        span.attributes = {
-            "move": "FORAGE",
-            "instruction": f"instruction {i+1}",
-            "result": f"Result {i+1}. Some detail here.",
-        }
-        store.end_span(span)
+        step = store.start_step(thread_id)
+        step.move = "FORAGE"
+        step.instruction = f"instruction {i+1}"
+        step.result = f"Result {i+1}. Some detail here."
+        store.end_step(step)
 
-    result = store.format_thread_history(trace_id, full_window=3)
+    result = store.format_thread_history(thread_id, full_window=3)
 
     # Step 1 should be full
     assert 'Instruction: "instruction 1"' in result
@@ -169,14 +167,16 @@ def test_trace_format_windowed(tmp_path):
 
 def test_trace_format_with_summary(tmp_path):
     store = InvestigationStore(data_dir=str(tmp_path))
-    trace_id = "test-trace"
+    thread_id = "test-trace"
 
-    span = store.start_span(trace_id, "step_1", kind="step")
-    span.attributes = {"move": "SCOPE", "instruction": "test", "result": "scoped"}
-    store.end_span(span)
+    step = store.start_step(thread_id)
+    step.move = "SCOPE"
+    step.instruction = "test"
+    step.result = "scoped"
+    store.end_step(step)
 
     result = store.format_thread_history(
-        trace_id, running_summary="Earlier we found X and Y.",
+        thread_id, running_summary="Earlier we found X and Y.",
     )
     assert "Summary of earlier analysis" in result
     assert "Earlier we found X and Y." in result
@@ -184,13 +184,15 @@ def test_trace_format_with_summary(tmp_path):
 
 def test_trace_format_with_human_messages(tmp_path):
     store = InvestigationStore(data_dir=str(tmp_path))
-    trace_id = "test-trace"
+    thread_id = "test-trace"
 
-    span = store.start_span(trace_id, "step_1", kind="step")
-    span.attributes = {"move": "FORAGE", "instruction": "Explore", "result": "Found gap"}
-    store.end_span(span)
+    step = store.start_step(thread_id)
+    step.move = "FORAGE"
+    step.instruction = "Explore"
+    step.result = "Found gap"
+    store.end_step(step)
 
-    result = store.format_thread_history(trace_id, human_messages=["Check by stellar type"])
+    result = store.format_thread_history(thread_id, human_messages=["Check by stellar type"])
     assert "[Human input]" in result
     assert "Check by stellar type" in result
 
@@ -201,9 +203,11 @@ def test_trace_save_and_load(tmp_path):
     session = store.create_session("test.csv")
     thread = store.create_thread(session.id, "Q?")
 
-    span = store.start_span(thread.id, "step_1", kind="step")
-    span.attributes = {"move": "SCOPE", "instruction": "filter", "result": "done"}
-    store.end_span(span)
+    step = store.start_step(thread.id)
+    step.move = "SCOPE"
+    step.instruction = "filter"
+    step.result = "done"
+    store.end_step(step)
 
     store.save_session(session.id)
 
@@ -211,9 +215,9 @@ def test_trace_save_and_load(tmp_path):
     fresh = InvestigationStore(data_dir=str(tmp_path))
     fresh.load_session(session.id)
 
-    loaded_spans = fresh.get_step_spans(thread.id)
-    assert len(loaded_spans) == 1
-    assert loaded_spans[0].attributes["move"] == "SCOPE"
+    loaded_steps = fresh.get_steps(thread.id)
+    assert len(loaded_steps) == 1
+    assert loaded_steps[0].move == "SCOPE"
 
 
 # --- ThreadRunner integration tests ---
@@ -655,18 +659,15 @@ def test_human_message_appears_in_step_event_timeline(integration_setup):
     runner.start()
     runner.done_event.wait(timeout=10)
 
-    # After completion, spans are cleared from memory but saved to disk.
-    # Reload to inspect.
+    # After completion, steps are persisted to disk. Reload to inspect.
     store.load_session(session.id)
-    spans = store.get_step_spans(thread.id)
-    assert spans, "expected at least one step span"
+    steps = store.get_steps(thread.id)
+    assert steps, "expected at least one step"
 
-    human_events = [
-        e for e in spans[0].events if e["name"] == "human_message"
-    ]
+    human_events = [e for e in steps[0].events if e["type"] == "human_message"]
     assert len(human_events) == 1
-    assert human_events[0]["attributes"]["content"] == "look at cohort A"
-    assert human_events[0]["attributes"]["target"] == "thread"
+    assert human_events[0]["content"] == "look at cohort A"
+    assert human_events[0]["target"] == "thread"
 
-    # Timestamp set at push time, preserved on the span event.
+    # Timestamp set at push time, preserved on the step event.
     assert human_events[0]["timestamp"] > 0

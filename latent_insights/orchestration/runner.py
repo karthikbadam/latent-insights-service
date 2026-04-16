@@ -29,7 +29,7 @@ from latent_insights.core.llm import LLMClient, is_transient_llm_error
 from latent_insights.core.parsing import detect_degeneration
 from latent_insights.core.queue import Queue
 from latent_insights.core.recorder import Recorder
-from latent_insights.core.store import InvestigationStore, Span
+from latent_insights.core.store import InvestigationStore, Step
 from latent_insights.models import (
     CoordinatorDecision,
     CoordinatorStatus,
@@ -107,7 +107,7 @@ class ThreadRunner:
         self.thread_start: float = 0.0
 
         # Per-step state (reset by _start_step)
-        self._span: Span | None = None
+        self._step: Step | None = None
         self._decision: CoordinatorDecision | None = None
         self._coordinator_ms: int = 0
         self._step_start: float = 0.0
@@ -134,10 +134,10 @@ class ThreadRunner:
         if human_messages:
             self.human_messages = list(human_messages)
 
-        if not self.store.get_spans(self.thread.id):
+        if not self.store.get_steps(self.thread.id):
             self.store.load_session(self.thread.session_id)
 
-        self.step_number = len(self.store.get_step_spans(self.thread.id))
+        self.step_number = len(self.store.get_steps(self.thread.id))
         self.store.update_thread_status(self.thread.id, ThreadStatus.RUNNING)
         self.recorder.thread_resumed(self.step_number, self.human_messages)
         self.start()
@@ -160,12 +160,8 @@ class ThreadRunner:
                 f"Thread {self.tid} received {len(injected)} injected message(s)"
             )
 
-        # Start span for this step
-        self._span = self.store.start_span(
-            trace_id=self.thread.id,
-            name=f"step_{self.step_number}",
-            kind="step",
-        )
+        # Start a step row for this iteration
+        self._step = self.store.start_step(self.thread.id)
 
         # thread_start fires on step 1, stamped with created_at so the UI
         # orders it before the first step_start (see graph.py history).
@@ -184,7 +180,7 @@ class ThreadRunner:
                 timestamp=created_ts,
             )
 
-        # Record human messages on the span so they sort into the step
+        # Record human messages on the step so they sort into the step
         # timeline with their original wall-clock timestamp.
         for msg in self.human_messages:
             if isinstance(msg, dict):
@@ -196,7 +192,7 @@ class ThreadRunner:
                 target = "thread"
                 ts = None
             self.recorder.human_message(
-                self._span, content=content, target=target, timestamp=ts,
+                self._step, content=content, target=target, timestamp=ts,
             )
 
         # Schedule the coordinator LLM call as a pool task
@@ -252,8 +248,14 @@ class ThreadRunner:
 
         final_move = decision.next_move.value
 
+        # Stamp the chosen move + instruction on the in-progress step row
+        # so downstream consumers (history formatting, API snapshots if
+        # the thread terminates mid-step) see the committed move.
+        self._step.move = final_move
+        self._step.instruction = decision.worker_instruction or ""
+
         self.recorder.llm_call(
-            self._span,
+            self._step,
             step_number=self.step_number,
             move=final_move,
             agent="coordinator",
@@ -269,8 +271,8 @@ class ThreadRunner:
 
         # Genuinely STUCK (post step 2)
         if decision.status == CoordinatorStatus.STUCK:
-            self.store.end_span(self._span, status="stuck")
-            step_count = len(self.store.get_step_spans(self.thread.id))
+            self.store.end_step(self._step, status="stuck")
+            step_count = len(self.store.get_steps(self.thread.id))
             self.recorder.thread_waiting(
                 reason="coordinator_stuck",
                 question=decision.question_for_human or "Thread needs guidance.",
@@ -292,8 +294,8 @@ class ThreadRunner:
             logger.warning(
                 f"Thread {self.thread.id} repeated {final_move} {max_same} times — forcing STUCK"
             )
-            self.store.end_span(self._span, status="stuck")
-            step_count = len(self.store.get_step_spans(self.thread.id))
+            self.store.end_step(self._step, status="stuck")
+            step_count = len(self.store.get_steps(self.thread.id))
             self.recorder.thread_waiting(
                 reason="repeated_moves",
                 question="Thread repeated the same move too many times — needs guidance.",
@@ -396,20 +398,23 @@ class ThreadRunner:
     # --- Step completion / thread finalization ---------------------------
 
     def _complete_step(self, result):
-        """Worker turn produced a final result. Close span, emit SSE, decide next."""
+        """Worker turn produced a final result. Finalize step, emit SSE, decide next."""
         worker_ms = round((time.monotonic() - self._step_start) * 1000)
 
+        # The worker batched its per-turn events into ``result.llm_calls``
+        # (llm_call + tool_call records). They're already in the canonical
+        # flat ``StepEvent`` shape, so just append each one.
         if result.llm_calls:
             for call in result.llm_calls:
-                self.store.add_event(self._span, call["type"], call)
-        self._span.attributes.update({
-            "move": self._decision.next_move.value,
-            "instruction": self._decision.worker_instruction,
-            "result": result.result,
-            "coordinator_ms": self._coordinator_ms,
-            "worker_ms": worker_ms,
-        })
-        self.store.end_span(self._span)
+                self.store.add_event(self._step, call)
+        # Promote the final result + view onto the step row (move and
+        # instruction were already stamped in _on_coordinator_done).
+        self._step.result = result.result
+        if getattr(result, "view_requested", None):
+            view = result.view_requested
+            if isinstance(view, dict):
+                self._step.view_created = view.get("name")
+        self.store.end_step(self._step)
 
         logger.info(
             f"Thread {self.thread.id} step {self.step_number} "
@@ -432,7 +437,7 @@ class ThreadRunner:
         if self.mode == RunnerMode.STEP_AND_PAUSE:
             thread_obj = self.store.get_thread(self.thread.id)
             if thread_obj and thread_obj.status != ThreadStatus.COMPLETE:
-                step_count = len(self.store.get_step_spans(self.thread.id))
+                step_count = len(self.store.get_steps(self.thread.id))
                 self.store.update_thread_status(self.thread.id, ThreadStatus.WAITING)
                 self.store.save_session(self.thread.session_id)
                 self.queue.emit(StreamEvent(
@@ -488,7 +493,7 @@ class ThreadRunner:
 
     def _do_summarize(self):
         return self.store.summarize_history(
-            trace_id=self.thread.id,
+            thread_id=self.thread.id,
             llm=self.llm,
             model=self.config.models.coordinator,
             seed_question=self.thread.seed_question,
@@ -569,7 +574,7 @@ class ThreadRunner:
                 if reason == "retry_exhausted"
                 else f"Thread encountered an error: {error_msg}"
             )
-            step_count = len(self.store.get_step_spans(self.thread.id))
+            step_count = len(self.store.get_steps(self.thread.id))
             self.recorder.thread_waiting(
                 reason=reason,
                 question=question,
