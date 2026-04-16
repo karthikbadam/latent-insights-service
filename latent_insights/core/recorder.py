@@ -81,7 +81,13 @@ class Recorder:
             event_type="thread_complete",
             message=summary,
             data={
+                # ``summary`` is the REST-snapshot name (ThreadResponse.summary).
+                # ``result`` mirrors step_complete's payload so a UI that
+                # renders every event's "content" via a common ``data.result``
+                # field picks up the thread's final finding the same way it
+                # picks up each step's result.
                 "summary": summary,
+                "result": summary,
                 "total_seconds": total_seconds,
                 "total_ms": total_ms,
                 "step_count": step_count,

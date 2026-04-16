@@ -154,7 +154,7 @@ The `Step` dataclass is flat and mirrors `api.schemas.StepResponse` directly (`m
 - **Context-length errors** (400 with "maximum context length" in the body) are caught by the runner, which closes the current step with a self-describing result — *"Context overflow: this step's prompt exceeded the model's context window. The next move should narrow the data…"* — and lets the coordinator read that result through `format_thread_history` on the next step to pick a simpler move. After `max_context_recoveries` (default 2) attempts in a thread, it falls through to `thread_waiting` with `reason=context_exhausted`.
 - **Move repetition guard** — if the coordinator picks the same move `max_repeated_moves` (default 10) steps in a row without `DONE`, the thread enters `thread_waiting` with `reason=repeated_moves`.
 - **Early STUCK override** — if the coordinator returns `STUCK` on step 1 or 2, the runner overrides it to `FORAGE` to give the thread a chance to find something before asking for help.
-- **Periodic summarization** — every 5 steps the runner schedules a summarizer LLM call that condenses the history into a `running_summary`, which prepends future coordinator prompts.
+- **Periodic summarization** — every 10 steps the runner schedules a summarizer LLM call that condenses the history into a `running_summary`, which prepends future coordinator prompts.
 
 ## API
 
@@ -198,7 +198,7 @@ client-side view model.
 | `tool_call`            | thread   | `agent`, `sql`, `tool_result`, `duration_ms`, `step_number`, `move`     |
 | `human_message`        | thread   | `content`, `target`, `step_number`, `move`                              |
 | `step_complete`        | thread   | `step_number`, `move`, `instruction`, `result`, `duration_ms`           |
-| `thread_complete`      | thread   | `summary`, `total_ms`, `total_seconds`, `step_count`, `is_terminal: true` |
+| `thread_complete`      | thread   | `summary`, `result` (alias of `summary`), `total_ms`, `total_seconds`, `step_count`, `is_terminal: true` |
 | `thread_waiting`       | thread   | `reason` (`coordinator_stuck` \| `repeated_moves` \| `retry_exhausted` \| `context_exhausted` \| `unexpected_error`), `question`, `context`, `running_summary`, `error`, `is_terminal: true` |
 | `synthesis_start`      | thread   | `source_threads`, `synthesis_thread` (fan-out pattern only)             |
 

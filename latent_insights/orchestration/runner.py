@@ -515,8 +515,8 @@ class ThreadRunner:
             self._finish()
             return
 
-        # Periodic summarization every 5 steps — scheduled as its own LLM task.
-        if self.step_number > 1 and self.step_number % 5 == 0:
+        # Periodic summarization every 10 steps — scheduled as its own LLM task.
+        if self.step_number > 1 and self.step_number % 10 == 0:
             self._schedule_summarize()
             return
 
