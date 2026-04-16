@@ -14,8 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from latent_insights.config import AppConfig
 from latent_insights.core.llm import LLMClient
 from latent_insights.core.queue import Queue
-from latent_insights.core.state import StateStore
-from latent_insights.core.tracing import TraceStore
+from latent_insights.core.store import InvestigationStore
 from latent_insights.db.connection import Database
 from latent_insights.api import routes, sse
 
@@ -40,22 +39,20 @@ async def lifespan(app: FastAPI):
 
     db = Database(data_dir=config.data_dir)
     queue_instance = Queue()
-    state_store = StateStore(data_dir=config.data_dir)
-    trace_store = TraceStore(data_dir=config.data_dir)
+    store = InvestigationStore(data_dir=config.data_dir)
 
     # Store on app.state for access in route handlers
     app.state.config = config
     app.state.llm = llm
     app.state.db = db
     app.state.queue = queue_instance
-    app.state.state_store = state_store
-    app.state.trace_store = trace_store
+    app.state.store = store
 
     logger.info("Ready")
     yield
 
-    # Cleanup — dump all state to disk
-    state_store.dump_all()
+    # Cleanup — save all state to disk
+    store.save_all()
     queue_instance.cancel_session("*")
     queue_instance.shutdown(wait=False)
     db.close()

@@ -63,20 +63,6 @@ class Thread:
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
 
-@dataclass
-class Step:
-    id: str
-    thread_id: str
-    step_number: int
-    move: MoveType
-    instruction: str
-    result: str
-    view_created: str | None = None
-    duration_ms: int | None = None
-    llm_calls: list[dict] | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-
-
 # --- Agent I/O ---
 
 
