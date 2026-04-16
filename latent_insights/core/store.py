@@ -172,6 +172,14 @@ class InvestigationStore:
     def drain_pending_messages(self, thread_id: str) -> list[dict]:
         return self._pending_messages.pop(thread_id, [])
 
+    def has_pending_messages(self, thread_id: str) -> bool:
+        """Peek — does this thread have pending human messages?
+
+        Used by the runner's flush-and-pivot logic to avoid draining
+        when there's nothing to commit.
+        """
+        return bool(self._pending_messages.get(thread_id))
+
     # --- Steps ---
 
     def start_step(self, thread_id: str) -> Step:
@@ -224,19 +232,21 @@ class InvestigationStore:
     def format_thread_history(
         self,
         thread_id: str,
-        human_messages: list[dict] | list[str] | None = None,
         running_summary: str | None = None,
         full_window: int = 3,
     ) -> str:
-        def _content(m) -> str:
-            return m.get("content", "") if isinstance(m, dict) else str(m)
+        """Render the thread's step timeline as a prompt block.
 
+        Human-contributed steps (``move="HUMAN_INPUT"``) and terminal
+        waiting steps (``move="WAITING_FOR_HUMAN"``) are included the
+        same way analytical steps are — they have a ``move`` and a
+        ``result`` like any other step. No side-channel ``human_messages``
+        parameter is needed; a mixed-initiative timeline is just a list
+        of steps.
+        """
         steps = self.get_steps(thread_id)
         if not steps:
             preamble = f"Summary so far: {running_summary}\n\n" if running_summary else ""
-            if human_messages:
-                parts = [f'[Human input]: "{_content(msg)}"' for msg in human_messages]
-                return preamble + "\n\n".join(parts) if preamble else "\n\n".join(parts)
             return preamble + "(No steps yet — this is the first move)"
 
         parts = []
@@ -261,10 +271,6 @@ class InvestigationStore:
             else:
                 first_sentence = result.split(".")[0].strip() + "." if result else ""
                 parts.append(f"Step {i} [{move}]: {first_sentence}")
-
-        if human_messages:
-            for msg in human_messages:
-                parts.append(f'[Human input]: "{_content(msg)}"')
 
         return "\n\n".join(parts)
 

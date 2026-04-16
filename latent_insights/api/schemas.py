@@ -52,6 +52,11 @@ class CreateThreadRequest(BaseModel):
 
 class PostMessageRequest(BaseModel):
     content: str = Field(min_length=1)
+    # Only honored on ``POST /api/sessions/{id}/messages``. When True,
+    # the message is used as the seed question for a brand-new thread
+    # instead of being broadcast into existing threads. Ignored by
+    # ``POST /api/threads/{id}/messages`` (always thread-scoped).
+    as_new_thread: bool = False
 
 
 # --- Response schemas ---

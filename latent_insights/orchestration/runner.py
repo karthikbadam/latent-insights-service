@@ -38,7 +38,6 @@ from latent_insights.models import (
     CoordinatorDecision,
     CoordinatorStatus,
     MoveType,
-    StreamEvent,
     Thread,
     ThreadStatus,
 )
@@ -69,7 +68,6 @@ class ThreadRunner:
         store: InvestigationStore,
         thread: Thread,
         schema_summary: str,
-        human_messages: list | None = None,
         mode: RunnerMode = RunnerMode.LOOP_UNTIL_DONE,
         on_done: "callable | None" = None,
     ):
@@ -79,7 +77,6 @@ class ThreadRunner:
         self.thread = thread
         self.session_db = session_db
         self.schema_summary = schema_summary
-        self.human_messages: list = list(human_messages or [])
         self.mode = mode
         # One-shot completion hook, invoked once from ``_finish`` after
         # any terminal path (complete / waiting / error). Patterns that
@@ -116,6 +113,10 @@ class ThreadRunner:
         self.step_number: int = 0
         self.move_history: list[str] = []
         self.thread_start: float = 0.0
+        # True once ``thread_start`` has been emitted — controls the
+        # one-shot emission even when the first few rows committed are
+        # HUMAN_INPUT steps drained from the pending queue.
+        self._thread_start_emitted: bool = False
 
         # Per-step state (reset by _start_step)
         self._step: Step | None = None
@@ -150,17 +151,22 @@ class ThreadRunner:
         self.thread_start = time.monotonic()
         self._start_step()
 
-    def resume(self, human_messages: list | None = None):
-        """Resume a WAITING/COMPLETE thread."""
-        if human_messages:
-            self.human_messages = list(human_messages)
+    def resume(self):
+        """Resume a WAITING/COMPLETE thread.
 
+        The caller is responsible for pushing any human guidance to the
+        store's pending queue **before** calling resume — the runner
+        drains pending messages into ``HUMAN_INPUT`` steps on its first
+        ``_start_step``, ahead of the coordinator step.
+        """
         if not self.store.get_steps(self.thread.id):
             self.store.load_session(self.thread.session_id)
 
         self.step_number = len(self.store.get_steps(self.thread.id))
+        # thread_start already fired on the original run; don't re-fire.
+        self._thread_start_emitted = True
         self.store.update_thread_status(self.thread.id, ThreadStatus.RUNNING)
-        self.recorder.thread_resumed(self.step_number, self.human_messages)
+        self.recorder.thread_resumed(self.step_number)
         self.start()
 
     # ------------------------------------------------------------------
@@ -169,24 +175,18 @@ class ThreadRunner:
     # ------------------------------------------------------------------
 
     def _start_step(self):
-        """Begin a new coordinator step. Schedules the coordinator LLM call."""
-        self.step_number += 1
-        self._step_start = time.monotonic()
+        """Begin a new coordinator step. Schedules the coordinator LLM call.
 
-        # Drain injected messages from the interrupt API
-        injected = self.store.drain_pending_messages(self.thread.id)
-        if injected:
-            self.human_messages.extend(injected)
-            logger.info(
-                f"Thread {self.tid} received {len(injected)} injected message(s)"
-            )
-
-        # Start a step row for this iteration
-        self._step = self.store.start_step(self.thread.id)
-
-        # thread_start fires on step 1, stamped with created_at so the UI
-        # orders it before the first step_start (see graph.py history).
-        if self.step_number == 1:
+        Order matters: emit ``thread_start`` first (if this is the very
+        first step), then drain any queued human messages as
+        ``HUMAN_INPUT`` steps, then commit the coordinator's own step
+        row. That way the timeline reads:
+        ``thread_start → [HUMAN_INPUT steps] → coordinator step`` — the
+        human guidance lands ahead of the coordinator move that will
+        react to it.
+        """
+        # 1. thread_start (one-shot, on the first call).
+        if not self._thread_start_emitted:
             thread_obj = self.store.get_thread(self.thread.id)
             if thread_obj:
                 created_ts = thread_obj.created_at.replace(
@@ -200,31 +200,20 @@ class ThreadRunner:
                 self.thread.entry_point,
                 timestamp=created_ts,
             )
+            self._thread_start_emitted = True
 
-        # Record human messages on the step so they sort into the step
-        # timeline with their original wall-clock timestamp. ``move`` is
-        # not known yet (the coordinator hasn't picked one); the SSE
-        # event carries it as "" and the UI slots the message ahead of
-        # the step's first ``llm_call``.
-        for msg in self.human_messages:
-            if isinstance(msg, dict):
-                content = msg.get("content", "")
-                target = msg.get("target", "thread")
-                ts = msg.get("timestamp")
-            else:
-                content = str(msg)
-                target = "thread"
-                ts = None
-            self.recorder.human_message(
-                self._step,
-                step_number=self.step_number,
-                move="",
-                content=content,
-                target=target,
-                timestamp=ts,
-            )
+        # 2. Any pre-queued human messages become HUMAN_INPUT steps
+        # before the coordinator step gets created.
+        self._drain_pending_as_steps()
 
-        # Schedule the coordinator LLM call as a pool task
+        # 3. Start the coordinator step row. Sync self.step_number to
+        # whatever the store assigned so the counter stays consistent
+        # regardless of how many HUMAN_INPUT steps were drained above.
+        self._step = self.store.start_step(self.thread.id)
+        self.step_number = self._step.step_number
+        self._step_start = time.monotonic()
+
+        # 4. Schedule the coordinator LLM call as a pool task.
         self._schedule(
             fn=self._do_coordinator_call,
             callback=self._on_coordinator_done,
@@ -236,7 +225,6 @@ class ThreadRunner:
         """Runs on a pool thread — blocks only for the coordinator LLM call."""
         thread_history = self.store.format_thread_history(
             self.thread.id,
-            self.human_messages,
             running_summary=self.thread.running_summary,
         )
         t0 = time.monotonic()
@@ -252,6 +240,11 @@ class ThreadRunner:
 
     def _on_coordinator_done(self, future: Future):
         """Callback after coordinator LLM call. Decide worker / finalize."""
+        # Human input posted mid-LLM-call? Flush the in-flight step and
+        # pivot — the coordinator's decision is discarded; a fresh
+        # coordinator step runs with the HUMAN_INPUT step in history.
+        if self._flush_and_pivot():
+            return
         decision, coord_log = future.result()
         coordinator_ms = coord_log["duration_ms"]
 
@@ -378,6 +371,8 @@ class ThreadRunner:
         the tool calls, loops back for another LLM call, or completes the
         step with a ``WorkerResult``.
         """
+        if self._flush_and_pivot():
+            return
         response, call_ms = future.result()
 
         if response.tool_calls:
@@ -428,6 +423,11 @@ class ThreadRunner:
         """Callback after one SQL execution. Records the result; when all
         SQL for this LLM turn have completed, apply error guardrails and
         schedule the next worker LLM call.
+
+        If human input landed during SQL execution we still record this
+        SQL's result (losing it would be wasteful) but the flush-and-pivot
+        check fires on the LAST SQL of the turn so the pivot happens in
+        place of the next worker LLM call.
         """
         tool_call_id, sql, result_text, sql_ms = future.result()
         self.worker.record_tool_result(tool_call_id, sql, result_text, sql_ms)
@@ -437,6 +437,8 @@ class ThreadRunner:
             last = self._pending_sql == 0
 
         if last:
+            if self._flush_and_pivot():
+                return
             self.worker.apply_error_guardrails()
             self._schedule_worker_call()
 
@@ -475,31 +477,24 @@ class ThreadRunner:
             self._coordinator_ms + worker_ms,
         )
 
-        # Human messages are consumed by the step that saw them.
-        self.human_messages = []
-
-        # HITL: pause after one step
+        # HITL: pause after one step. Route through recorder.thread_waiting
+        # so the pause is represented as a WAITING_FOR_HUMAN step in the
+        # timeline — same shape as any other terminal waiting state.
         if self.mode == RunnerMode.STEP_AND_PAUSE:
             thread_obj = self.store.get_thread(self.thread.id)
             if thread_obj and thread_obj.status != ThreadStatus.COMPLETE:
                 step_count = len(self.store.get_steps(self.thread.id))
-                self.store.update_thread_status(self.thread.id, ThreadStatus.WAITING)
-                self.store.save_session(self.thread.session_id)
-                self.queue.emit(StreamEvent(
-                    session_id=self.thread.session_id,
-                    thread_id=self.thread.id,
-                    event_type="thread_waiting",
-                    message=(
-                        f"Step complete ({self._decision.next_move.value}). "
-                        "Review and send a message to continue."
-                    ),
-                    data={
-                        "pattern": "human_in_the_loop",
-                        "last_move": self._decision.next_move.value,
-                        "last_result": result.result,
-                        "step_number": step_count,
-                    },
-                ))
+                question = (
+                    f"Step complete ({self._decision.next_move.value}). "
+                    "Review and send a message to continue."
+                )
+                self.recorder.thread_waiting(
+                    reason="human_review",
+                    question=question,
+                    context=result.result,
+                    step_count=step_count,
+                    span_status="ok",
+                )
             self._finish()
             return
 
@@ -558,8 +553,81 @@ class ThreadRunner:
                 )
         except Exception as e:
             logger.warning(f"History summarization failed: {e}")
-        # Always continue the loop — summarization failure is non-fatal.
+        # If human input arrived while summarizing, pivot now; otherwise
+        # continue the loop — summarization failure is non-fatal.
+        if self._flush_and_pivot():
+            return
         self._start_step()
+
+    # ------------------------------------------------------------------
+    # Mixed-initiative: commit pending human messages as HUMAN_INPUT
+    # steps, and flush-and-pivot when input arrives mid-step.
+    # ------------------------------------------------------------------
+
+    def _drain_pending_as_steps(self) -> bool:
+        """Drain the store's pending-message queue into HUMAN_INPUT steps.
+
+        Each drained message becomes its own ``HUMAN_INPUT`` step via
+        ``recorder.human_input_step`` — visible in the timeline, in
+        snapshots, and on SSE just like any other step. Returns True if
+        anything was committed.
+        """
+        injected = self.store.drain_pending_messages(self.thread.id)
+        if not injected:
+            return False
+        for msg in injected:
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                target = msg.get("target", "thread")
+                ts = msg.get("timestamp")
+            else:
+                content = str(msg)
+                target = "thread"
+                ts = None
+            self.recorder.human_input_step(
+                content, target=target, timestamp=ts,
+            )
+        logger.info(
+            f"Thread {self.tid} committed {len(injected)} HUMAN_INPUT step(s)"
+        )
+        return True
+
+    def _flush_and_pivot(self) -> bool:
+        """Interrupt the current step with any pending human input.
+
+        Called at the top of every scheduling callback. If human input
+        has been posted since the last callback:
+          1. Close the in-flight step (if still open) with
+             ``status="flushed"``.
+          2. Drain the pending queue into HUMAN_INPUT step(s).
+          3. Kick off a fresh coordinator step.
+          4. Return True so the caller short-circuits its default
+             "schedule the next natural task" flow.
+
+        If no pending input, returns False and the callback proceeds
+        normally.
+        """
+        if not self.store.has_pending_messages(self.thread.id):
+            return False
+
+        # Close the in-flight step with a self-describing result. This
+        # becomes visible in format_thread_history for the next
+        # coordinator call.
+        if self._step is not None and self._step.end_time is None:
+            if not self._step.result:
+                self._step.result = (
+                    "Step flushed — human input received mid-step"
+                )
+            self.store.end_step(self._step, status="flushed")
+            self._step = None
+
+        self._drain_pending_as_steps()
+
+        # Pivot to a fresh coordinator step. The newly-committed
+        # HUMAN_INPUT step(s) are already in the store, so the
+        # coordinator sees them via format_thread_history.
+        self._start_step()
+        return True
 
     # ------------------------------------------------------------------
     # Scheduling helper: wraps queue.schedule and routes callback errors

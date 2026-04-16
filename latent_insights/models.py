@@ -20,6 +20,7 @@ class ThreadStatus(str, Enum):
 
 
 class MoveType(str, Enum):
+    # Coordinator-picked analytical moves
     SCOPE = "SCOPE"
     FORAGE = "FORAGE"
     FRAME = "FRAME"
@@ -27,6 +28,14 @@ class MoveType(str, Enum):
     SYNTHESIZE = "SYNTHESIZE"
     STUCK = "STUCK"
     DONE = "DONE"
+    # Mixed-initiative moves — steps contributed by the human or
+    # representing the thread's waiting state. These aren't chosen by
+    # the coordinator; they're committed directly by the runner when a
+    # human posts guidance or when a thread enters a terminal waiting
+    # state. They live in the step timeline alongside the analytical
+    # moves so the UI can render every step uniformly.
+    HUMAN_INPUT = "HUMAN_INPUT"
+    WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
 
 
 class CoordinatorStatus(str, Enum):

@@ -113,12 +113,18 @@ POST /api/sessions (upload CSV)
                     GET /api/sessions/{id}/events (SSE)
                     ← schema_summary_ready, scout_done,
                       thread_start, step_start, llm_call,
-                      tool_call, human_message, step_complete,
+                      tool_call, step_complete,
                       thread_complete, thread_waiting
 ```
 
 ### Sensemaking moves
 
+Every row in a thread's timeline is a **step** with a `move`. Most are
+coordinator-picked analytical moves; the mixed-initiative moves
+(`HUMAN_INPUT`, `WAITING_FOR_HUMAN`) are committed by the runner when
+a human contributes guidance or when the thread is waiting for one.
+
+**Coordinator-picked analytical moves** — the coordinator chooses one each step, no fixed order.
 
 | Move            | Purpose                                                      |
 | --------------- | ------------------------------------------------------------ |
@@ -128,8 +134,12 @@ POST /api/sessions (upload CSV)
 | **INTERROGATE** | Stress-test the frame — contradictions, confounds            |
 | **SYNTHESIZE**  | Terminal summary — writes the final finding from prior steps. The worker receives no SQL tool on this move; it can only condense what earlier steps found. |
 
+**Mixed-initiative moves** — committed by the runner, not the coordinator.
 
-The coordinator picks moves freely based on data — no fixed order.
+| Move                    | Purpose                                                      |
+| ----------------------- | ------------------------------------------------------------ |
+| **HUMAN_INPUT**         | A human's message posted via `POST /api/{sessions,threads}/{id}/messages`. The step's `result` is the message content; `instruction` is the target (`thread` \| `session`). No LLM/SQL runs inside the step. Posting mid-step causes the runner to **flush** the in-flight step (soft: the current pool task finishes, then the next callback pivots) and commit a HUMAN_INPUT step before resuming the coordinator loop. |
+| **WAITING_FOR_HUMAN**   | Terminal step committed when the thread enters the waiting state (coordinator stuck, repeated-moves guard, retry-exhausted, context-exhausted, unexpected error, or HITL pause). The step's `result` is the question the thread wants answered; `instruction` carries any accompanying context. The sibling `thread_waiting` SSE event is a thin terminal marker — it no longer duplicates the question/context. |
 
 ### State management
 
@@ -139,7 +149,7 @@ Three components own all per-thread state:
 | --- | --- | --- |
 | **`InvestigationStore`** | `core/store.py` | In-memory store for `Session`, `Thread`, and `Step` records plus pending human messages. Persists one JSON file per session at `data/sessions/{id}.json` whose shape matches the `SessionResponse` REST snapshot — saved files and live snapshots are byte-for-byte equivalent. |
 | **`ThreadRunner`** | `orchestration/runner.py` | Drives one thread through its coordinator→worker lifecycle in continuation-passing style. Each LLM call, each SQL tool call, and the periodic history summarizer is submitted as a separate task to the shared `Queue`, chained via `future.add_done_callback`. Pool workers are released between calls, so N active threads can share a pool of `max_workers` without one thread starving another. |
-| **`Recorder`** | `core/recorder.py` | Dual-write helper: every event the runner emits goes through one method (`recorder.llm_call`, `recorder.tool_call`, `recorder.human_message`, `recorder.step_start`, `recorder.step_complete`, `recorder.thread_complete`, `recorder.thread_waiting`) that records it on the current step **and** emits the matching `StreamEvent` over SSE. Span events and SSE frames cannot drift. |
+| **`Recorder`** | `core/recorder.py` | Dual-write helper: every event the runner emits goes through one method (`recorder.llm_call`, `recorder.tool_call`, `recorder.step_start`, `recorder.step_complete`, `recorder.human_input_step`, `recorder.thread_complete`, `recorder.thread_waiting`) that records it on the current step (or commits a new mixed-initiative step in the case of `human_input_step` / `thread_waiting`) **and** emits the matching `StreamEvent` over SSE. Step rows and SSE frames cannot drift. |
 
 Supporting pieces:
 
@@ -168,7 +178,7 @@ The `Step` dataclass is flat and mirrors `api.schemas.StepResponse` directly (`m
 | `GET /api/sessions/{id}/saved`     | Previously saved session snapshot from `data/sessions/{id}.json` |
 | `POST /api/sessions/{id}/threads`  | Create custom thread with a question                          |
 | `POST /api/sessions/{id}/continue` | Resume stuck threads + scout new questions                    |
-| `POST /api/sessions/{id}/messages` | Broadcast a message to all running/waiting threads            |
+| `POST /api/sessions/{id}/messages` | Broadcast guidance to all running/waiting threads. Body accepts `as_new_thread: true` to instead spawn a **new thread** seeded with the message (existing threads untouched). |
 | `GET /api/threads/{id}`            | Get single thread with steps and events                       |
 | `POST /api/threads/{id}/messages`  | Reply to or interrupt a thread                                |
 | `GET /api/sessions/{id}/events`    | SSE event stream (see event list below)                       |
@@ -190,16 +200,15 @@ client-side view model.
 | `schema_summary_ready` | session  | `schema_summary` (full profiler output)                                 |
 | `scout_done`           | session  | `question_count`, `questions[]`                                         |
 | `session_ready`        | session  | `question_source` (emitted only in `human` mode)                        |
-| `message_injected`     | session/thread | `content`, `target`, `injected_threads`, `resumed_threads`        |
+| `message_injected`     | session/thread | `content`, `target` (`thread` \| `session` \| `new_thread`), `injected_threads`, `resumed_threads`, `thread_id` (when `target=new_thread`) |
 | `thread_start`         | thread   | `seed_question`, `motivation`, `entry_point`, `step_number: 0`          |
-| `thread_resumed`       | thread   | `from_step`, `human_messages`                                           |
+| `thread_resumed`       | thread   | `from_step`                                                             |
 | `step_start`           | thread   | `move`, `step_number`, `instruction`, `assessment`, `rationale`, `status`, `provisional: false` |
 | `llm_call`             | thread   | `agent`, `model`, `input_tokens`, `output_tokens`, `duration_ms`, `response`, `step_number`, `move` |
 | `tool_call`            | thread   | `agent`, `sql`, `tool_result`, `duration_ms`, `step_number`, `move`     |
-| `human_message`        | thread   | `content`, `target`, `step_number`, `move`                              |
 | `step_complete`        | thread   | `step_number`, `move`, `instruction`, `result`, `duration_ms`           |
 | `thread_complete`      | thread   | `summary`, `result` (alias of `summary`), `total_ms`, `total_seconds`, `step_count`, `is_terminal: true` |
-| `thread_waiting`       | thread   | `reason` (`coordinator_stuck` \| `repeated_moves` \| `retry_exhausted` \| `context_exhausted` \| `unexpected_error`), `question`, `context`, `running_summary`, `error`, `is_terminal: true` |
+| `thread_waiting`       | thread   | `reason` (`coordinator_stuck` \| `repeated_moves` \| `retry_exhausted` \| `context_exhausted` \| `unexpected_error` \| `human_review`), `running_summary`, `step_number`, `is_terminal: true` — **the question/context live on the preceding `WAITING_FOR_HUMAN` step's `step_complete` event** |
 | `synthesis_start`      | thread   | `source_threads`, `synthesis_thread` (fan-out pattern only)             |
 
 All `duration_ms` and `total_ms` values are integer milliseconds.
@@ -210,6 +219,16 @@ self-contained and the UI can group events into steps without maintaining
 cross-event state. Exceptions: `thread_start` (step_number is 0, move is absent)
 and `thread_complete` / `thread_waiting` (step-independent terminal events that
 carry `is_terminal: true`).
+
+**Human input and waiting states are full steps.** When a human posts a
+message, a `HUMAN_INPUT` step lands in the timeline — the UI sees a
+regular `step_start` + `step_complete` pair with `move=HUMAN_INPUT` and
+the message text on `result`. When a thread enters a waiting state, a
+`WAITING_FOR_HUMAN` step lands with the question on `result` and any
+accompanying context on `instruction`. The sibling `thread_waiting`
+terminal marker is then emitted without duplicating those fields.
+There is no `human_message` event type — it was replaced by the
+`HUMAN_INPUT` step in the move-based timeline.
 
 
 ### Per-session config

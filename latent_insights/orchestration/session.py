@@ -180,7 +180,10 @@ class SessionFlow:
 
         threads = self.store.get_threads(session_id)
 
-        # 1. Resume all WAITING and COMPLETE threads
+        # 1. Resume all WAITING and COMPLETE threads. Push a "continue"
+        # message to the pending queue first; the runner drains it into
+        # a HUMAN_INPUT step on resume, ahead of the next coordinator
+        # step.
         resumable = [t for t in threads if t.status in (ThreadStatus.WAITING, ThreadStatus.COMPLETE)]
         for t in resumable:
             message = (
@@ -188,6 +191,7 @@ class SessionFlow:
                 if t.status == ThreadStatus.WAITING
                 else "The previous analysis is complete. Dig deeper — are there follow-up questions, edge cases, or subgroups worth investigating?"
             )
+            self.store.push_pending_message(t.id, message, target="session")
             thread_db = self.db.open_session_connection(session_id)
             runner = ThreadRunner(
                 config=self.config,
@@ -197,7 +201,6 @@ class SessionFlow:
                 store=self.store,
                 thread=t,
                 schema_summary=schema_summary,
-                human_messages=[message],
             )
             runner.resume()
 

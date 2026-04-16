@@ -182,18 +182,27 @@ def test_trace_format_with_summary(tmp_path):
     assert "Earlier we found X and Y." in result
 
 
-def test_trace_format_with_human_messages(tmp_path):
+def test_trace_format_includes_human_input_steps(tmp_path):
+    """HUMAN_INPUT steps appear in format_thread_history just like any
+    other step — no side-channel human_messages parameter needed.
+    """
     store = InvestigationStore(data_dir=str(tmp_path))
     thread_id = "test-trace"
 
-    step = store.start_step(thread_id)
-    step.move = "FORAGE"
-    step.instruction = "Explore"
-    step.result = "Found gap"
-    store.end_step(step)
+    step1 = store.start_step(thread_id)
+    step1.move = "FORAGE"
+    step1.instruction = "Explore"
+    step1.result = "Found gap"
+    store.end_step(step1)
 
-    result = store.format_thread_history(thread_id, human_messages=["Check by stellar type"])
-    assert "[Human input]" in result
+    human_step = store.start_step(thread_id)
+    human_step.move = "HUMAN_INPUT"
+    human_step.instruction = "thread"
+    human_step.result = "Check by stellar type"
+    store.end_step(human_step)
+
+    result = store.format_thread_history(thread_id)
+    assert "HUMAN_INPUT" in result
     assert "Check by stellar type" in result
 
 
@@ -267,7 +276,17 @@ def _make_worker_response(summary):
 
 
 def _build_runner(setup, thread, session_db=None, human_messages=None):
-    """Build a ThreadRunner for testing."""
+    """Build a ThreadRunner for testing.
+
+    ``human_messages`` is a test-only convenience — each entry is
+    pushed to the store's pending queue so the runner picks it up as
+    a HUMAN_INPUT step via its normal drain path. This matches how
+    production callers (routes.py) work.
+    """
+    for msg in human_messages or []:
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        target = msg.get("target", "thread") if isinstance(msg, dict) else "thread"
+        setup["store"].push_pending_message(thread.id, content, target=target)
     return ThreadRunner(
         config=setup["config"],
         llm=MagicMock(),
@@ -276,7 +295,6 @@ def _build_runner(setup, thread, session_db=None, human_messages=None):
         store=setup["store"],
         thread=thread,
         schema_summary="test schema",
-        human_messages=human_messages or [],
     )
 
 
@@ -624,8 +642,10 @@ def test_pending_message_carries_target_and_timestamp(tmp_path):
     assert drained[1]["target"] == "session"
 
 
-def test_human_message_appears_in_step_event_timeline(integration_setup):
-    """A message pushed before a step shows up as a human_message span event."""
+def test_human_input_lands_as_its_own_step(integration_setup):
+    """A message pushed before the thread starts shows up as a
+    dedicated HUMAN_INPUT step (not as a sub-event on another step).
+    """
     setup = integration_setup
     store = setup["store"]
 
@@ -659,15 +679,20 @@ def test_human_message_appears_in_step_event_timeline(integration_setup):
     runner.start()
     runner.done_event.wait(timeout=10)
 
-    # After completion, steps are persisted to disk. Reload to inspect.
+    # Reload from disk to verify persistence + step ordering.
     store.load_session(session.id)
     steps = store.get_steps(thread.id)
     assert steps, "expected at least one step"
 
-    human_events = [e for e in steps[0].events if e["type"] == "human_message"]
-    assert len(human_events) == 1
-    assert human_events[0]["content"] == "look at cohort A"
-    assert human_events[0]["target"] == "thread"
+    # HUMAN_INPUT is the FIRST step (posted before anything else).
+    human_steps = [s for s in steps if s.move == "HUMAN_INPUT"]
+    assert len(human_steps) == 1, f"expected 1 HUMAN_INPUT step, got {len(human_steps)}"
+    assert human_steps[0].result == "look at cohort A"
+    assert human_steps[0].instruction == "thread"  # target stamped on instruction
+    assert steps[0].move == "HUMAN_INPUT", (
+        "HUMAN_INPUT step must come before the coordinator step"
+    )
 
-    # Timestamp set at push time, preserved on the step event.
-    assert human_events[0]["timestamp"] > 0
+    # No ``human_message`` event on any step — human input is the step now.
+    for s in steps:
+        assert not any(e.get("type") == "human_message" for e in s.events)

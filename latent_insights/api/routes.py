@@ -274,9 +274,12 @@ def continue_session(session_id: str, request: Request):
 def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     """Post a human message to a thread.
 
-    - If thread is WAITING or COMPLETE: resumes the thread with the message.
-    - If thread is RUNNING: injects the message into the next coordinator step
-      (non-blocking interrupt).
+    The message lands in the store's pending queue regardless of thread
+    status. For RUNNING threads the runner picks it up at its next
+    callback boundary via ``_flush_and_pivot`` and commits a HUMAN_INPUT
+    step. For WAITING/COMPLETE threads we construct a runner and
+    ``resume()`` it — the runner drains pending into a HUMAN_INPUT step
+    ahead of the first coordinator step.
     """
     config, llm, db, queue, store = _get_state(request)
 
@@ -303,6 +306,9 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     session = store.get_session(thread.session_id)
     thread_db = db.open_session_connection(thread.session_id)
 
+    # Push before resume so the runner's _drain_pending_as_steps commits
+    # a HUMAN_INPUT step as the first row of this resumed run.
+    store.push_pending_message(thread_id, body.content, target="thread")
     runner = ThreadRunner(
         config=config,
         llm=llm,
@@ -312,27 +318,74 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
         thread=thread,
         schema_summary=session.schema_summary or "",
     )
-    runner.resume(human_messages=[{
-        "content": body.content, "target": "thread", "timestamp": time.time(),
-    }])
+    runner.resume()
 
     return {"status": "resumed", "thread_id": thread_id}
 
 
 @router.post("/sessions/{session_id}/messages")
 def post_session_message(session_id: str, request: Request, body: PostMessageRequest):
-    """Broadcast a human message to all running threads in a session."""
+    """Session-scoped message — broadcast or start-a-new-thread.
+
+    Default (``as_new_thread=False``): push the message to every
+    thread's pending queue and resume any WAITING threads. Each affected
+    thread's runner commits a HUMAN_INPUT step at its next boundary.
+
+    With ``as_new_thread=True``: skip the broadcast entirely and spawn a
+    fresh thread using the message as its seed question. Existing
+    threads are untouched.
+    """
     config, llm, db, queue, store = _get_state(request)
 
     session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    # --- Start-a-new-thread branch ---
+    if body.as_new_thread:
+        if session.schema_summary is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Session profiling not complete yet",
+            )
+
+        from latent_insights.orchestration.runner import ThreadRunner
+
+        new_thread = store.create_thread(
+            session_id,
+            seed_question=body.content,
+            motivation="Started from human guidance",
+            entry_point="",
+        )
+        thread_db = db.open_session_connection(session_id)
+        runner = ThreadRunner(
+            config=config, llm=llm, session_db=thread_db, queue=queue,
+            store=store, thread=new_thread,
+            schema_summary=session.schema_summary,
+        )
+        runner.start()
+
+        queue.emit(StreamEvent(
+            session_id=session_id,
+            thread_id="",
+            event_type="message_injected",
+            message=body.content,
+            data={
+                "content": body.content,
+                "target": "new_thread",
+                "thread_id": new_thread.id,
+            },
+        ))
+        return {
+            "status": "thread_spawned",
+            "session_id": session_id,
+            "thread_id": new_thread.id,
+        }
+
+    # --- Default broadcast branch ---
     threads = store.get_threads(session_id)
     injected_ids = []
     resumed_ids = []
-
-    broadcast_ts = time.time()
 
     for t in threads:
         if t.status == ThreadStatus.RUNNING:
@@ -340,16 +393,14 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
             injected_ids.append(t.id)
         elif t.status == ThreadStatus.WAITING:
             from latent_insights.orchestration.runner import ThreadRunner
+            store.push_pending_message(t.id, body.content, target="session")
             thread_db = db.open_session_connection(session_id)
             runner = ThreadRunner(
                 config=config, llm=llm, session_db=thread_db, queue=queue,
                 store=store, thread=t,
                 schema_summary=session.schema_summary or "",
             )
-            runner.resume(human_messages=[{
-                "content": body.content, "target": "session",
-                "timestamp": broadcast_ts,
-            }])
+            runner.resume()
             resumed_ids.append(t.id)
 
     queue.emit(StreamEvent(

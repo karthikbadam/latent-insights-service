@@ -58,6 +58,10 @@ def _make_worker_response(summary):
 
 
 def _build_runner(setup_dict, thread, human_messages=None):
+    for msg in human_messages or []:
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        target = msg.get("target", "thread") if isinstance(msg, dict) else "thread"
+        setup_dict["store"].push_pending_message(thread.id, content, target=target)
     return ThreadRunner(
         config=setup_dict["config"],
         llm=MagicMock(),
@@ -66,7 +70,6 @@ def _build_runner(setup_dict, thread, human_messages=None):
         store=setup_dict["store"],
         thread=thread,
         schema_summary="test schema",
-        human_messages=human_messages or [],
     )
 
 
