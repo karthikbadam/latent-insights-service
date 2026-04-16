@@ -154,7 +154,7 @@ The `Step` dataclass is flat and mirrors `api.schemas.StepResponse` directly (`m
 - **Context-length errors** (400 with "maximum context length" in the body) are caught by the runner, which closes the current step with a self-describing result — *"Context overflow: this step's prompt exceeded the model's context window. The next move should narrow the data…"* — and lets the coordinator read that result through `format_thread_history` on the next step to pick a simpler move. After `max_context_recoveries` (default 2) attempts in a thread, it falls through to `thread_waiting` with `reason=context_exhausted`.
 - **Move repetition guard** — if the coordinator picks the same move `max_repeated_moves` (default 10) steps in a row without `DONE`, the thread enters `thread_waiting` with `reason=repeated_moves`.
 - **Early STUCK override** — if the coordinator returns `STUCK` on step 1 or 2, the runner overrides it to `FORAGE` to give the thread a chance to find something before asking for help.
-- **Periodic summarization** — every 10 steps the runner schedules a summarizer LLM call that condenses the history into a `running_summary`, which prepends future coordinator prompts.
+- **Periodic summarization** — every `summarize_every_steps` steps (default 10; set `SUMMARIZE_EVERY_STEPS` env var or pass `summarize_every_steps` in the per-session config to change; 0 disables) the runner schedules a summarizer LLM call that condenses the history into a `running_summary`, which prepends future coordinator prompts.
 
 ## API
 
@@ -252,6 +252,7 @@ Available config fields:
 | `question_source`          | `string`   | `scout` (default), `human`, or `both`     |
 | `scout_context`            | `string`   | Free-text guidance to steer scout         |
 | `default_pattern`          | `string`   | `coordinator_worker` (default), `fan_out`, or `human_in_the_loop` |
+| `summarize_every_steps`    | `int`      | Interval (in steps) between history-summarizer runs; 0 disables |
 
 
 ## Publishing to PyPI

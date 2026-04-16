@@ -111,6 +111,12 @@ class AppConfig:
     max_consecutive_errors: int = 5
     max_repeated_moves: int = 10
     llm_timeout: float = 120.0
+    # How often the runner schedules a history-summarizer LLM call
+    # (one summarize per N completed coordinator-worker steps). The
+    # summarizer condenses earlier steps into a ``running_summary`` that
+    # prepends future coordinator prompts. Set to 0 or a very large
+    # value to effectively disable summarization.
+    summarize_every_steps: int = 10
 
     # Sub-configs
     models: ModelConfig = field(default_factory=ModelConfig)
@@ -142,7 +148,7 @@ class AppConfig:
         for key in ["max_worker_retries", "max_consecutive_errors", "max_repeated_moves",
                     "llm_timeout", "num_scout_seed_questions", "max_threads",
                     "initial_questions", "question_source", "scout_context",
-                    "default_pattern"]:
+                    "default_pattern", "summarize_every_steps"]:
             if overrides.get(key) is not None:
                 setattr(cfg, key, overrides[key])
 
@@ -181,6 +187,7 @@ class AppConfig:
             max_consecutive_errors=int(os.getenv("MAX_CONSECUTIVE_ERRORS", cls.max_consecutive_errors)),
             max_repeated_moves=int(os.getenv("MAX_REPEATED_MOVES", cls.max_repeated_moves)),
             llm_timeout=float(os.getenv("LLM_TIMEOUT", cls.llm_timeout)),
+            summarize_every_steps=int(os.getenv("SUMMARIZE_EVERY_STEPS", cls.summarize_every_steps)),
             models=ModelConfig.from_env(provider),
             temperatures=TemperatureConfig.from_env(),
         )

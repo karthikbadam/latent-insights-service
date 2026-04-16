@@ -36,6 +36,8 @@ class SessionConfig(BaseModel):
     scout_context: str | None = None
     # Default pattern for session-spawned threads
     default_pattern: str | None = None
+    # Summarize the thread history every N steps (0 or very large to disable)
+    summarize_every_steps: int | None = None
 
 
 class CreateSessionRequest(BaseModel):

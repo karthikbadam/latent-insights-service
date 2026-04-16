@@ -515,8 +515,10 @@ class ThreadRunner:
             self._finish()
             return
 
-        # Periodic summarization every 10 steps — scheduled as its own LLM task.
-        if self.step_number > 1 and self.step_number % 10 == 0:
+        # Periodic summarization at the configured cadence. ``<= 0`` or
+        # an unset interval disables it entirely.
+        every = self.config.summarize_every_steps
+        if every and every > 0 and self.step_number > 1 and self.step_number % every == 0:
             self._schedule_summarize()
             return
 
