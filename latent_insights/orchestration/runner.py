@@ -25,7 +25,11 @@ from typing import Any
 from latent_insights.agents.coordinator import Coordinator
 from latent_insights.agents.worker import Worker
 from latent_insights.config import AppConfig
-from latent_insights.core.llm import LLMClient, is_transient_llm_error
+from latent_insights.core.llm import (
+    LLMClient,
+    is_context_length_error,
+    is_transient_llm_error,
+)
 from latent_insights.core.parsing import detect_degeneration
 from latent_insights.core.queue import Queue
 from latent_insights.core.recorder import Recorder
@@ -116,6 +120,15 @@ class ThreadRunner:
         self._pending_sql: int = 0
         self._pending_sql_lock: Lock = Lock()
 
+        # Context-length recovery budget. When the model says the prompt
+        # is too large, we close the current step with an error result,
+        # inject a hint into the thread history via ``human_messages``,
+        # and let the next step try again with a simpler approach. We
+        # cap this at ``_max_context_recoveries`` per thread so a
+        # pathologically large dataset doesn't loop forever.
+        self._context_recoveries: int = 0
+        self._max_context_recoveries: int = 2
+
     @property
     def tid(self) -> str:
         return self.thread.id[:8]
@@ -181,7 +194,10 @@ class ThreadRunner:
             )
 
         # Record human messages on the step so they sort into the step
-        # timeline with their original wall-clock timestamp.
+        # timeline with their original wall-clock timestamp. ``move`` is
+        # not known yet (the coordinator hasn't picked one); the SSE
+        # event carries it as "" and the UI slots the message ahead of
+        # the step's first ``llm_call``.
         for msg in self.human_messages:
             if isinstance(msg, dict):
                 content = msg.get("content", "")
@@ -192,7 +208,12 @@ class ThreadRunner:
                 target = "thread"
                 ts = None
             self.recorder.human_message(
-                self._step, content=content, target=target, timestamp=ts,
+                self._step,
+                step_number=self.step_number,
+                move="",
+                content=content,
+                target=target,
+                timestamp=ts,
             )
 
         # Schedule the coordinator LLM call as a pool task
@@ -304,13 +325,24 @@ class ThreadRunner:
             self._finish()
             return
 
-        # Initialize worker for this step and schedule its first LLM call
+        # Initialize worker for this step and schedule its first LLM call.
+        # SYNTHESIZE is handled specially: the worker gets the condensed
+        # thread history (the same view the coordinator sees) and no tool,
+        # so it can only summarize what the previous steps found — no new
+        # queries.
         thread_views = self._get_thread_views()
+        worker_history = ""
+        if final_move == "SYNTHESIZE":
+            worker_history = self.store.format_thread_history(
+                self.thread.id,
+                running_summary=self.thread.running_summary,
+            )
         self.worker.start(
             instruction=decision.worker_instruction or "",
             thread_views=thread_views,
             step_number=self.step_number,
             move=final_move,
+            thread_history=worker_history,
         )
         self._schedule_worker_call()
 
@@ -554,13 +586,36 @@ class ThreadRunner:
     # ------------------------------------------------------------------
 
     def _handle_error(self, e: Exception):
-        """Route any loop error to thread_waiting with a classified reason."""
+        """Route any loop error to a recovery path or ``thread_waiting``.
+
+        Context-length errors get a recovery budget: we close the current
+        step with an error result, inject a hint into the thread history
+        as a ``human_message``, and schedule the next step. The
+        coordinator sees the hint in ``format_thread_history`` and can
+        pick a simpler move. Once the budget is exhausted we fall
+        through to ``thread_waiting``.
+        """
         if self.done_event.is_set():
             # Already finalized by a concurrent path — avoid double-emit.
             logger.debug(f"Thread {self.thread.id} error after finalize: {e}")
             return
 
+        if (
+            is_context_length_error(e)
+            and self._context_recoveries < self._max_context_recoveries
+        ):
+            self._context_recoveries += 1
+            logger.warning(
+                f"Thread {self.thread.id} context-length exceeded "
+                f"(recovery {self._context_recoveries}/{self._max_context_recoveries}); "
+                "injecting hint and continuing"
+            )
+            self._recover_from_context_overflow(e)
+            return
+
         reason = "retry_exhausted" if is_transient_llm_error(e) else "unexpected_error"
+        if is_context_length_error(e):
+            reason = "context_exhausted"
         error_msg = f"{type(e).__name__}: {e}"
         logger.error(
             f"Thread {self.thread.id} loop error ({reason}): {error_msg}",
@@ -568,12 +623,19 @@ class ThreadRunner:
         )
 
         try:
-            question = (
-                "The LLM provider was unreachable after multiple retries. "
-                "Send a message when you want the thread to try again."
-                if reason == "retry_exhausted"
-                else f"Thread encountered an error: {error_msg}"
-            )
+            if reason == "retry_exhausted":
+                question = (
+                    "The LLM provider was unreachable after multiple retries. "
+                    "Send a message when you want the thread to try again."
+                )
+            elif reason == "context_exhausted":
+                question = (
+                    "This thread's context has grown too large for the model "
+                    "even after compressing its history. Send a narrower "
+                    "follow-up question and it will restart."
+                )
+            else:
+                question = f"Thread encountered an error: {error_msg}"
             step_count = len(self.store.get_steps(self.thread.id))
             self.recorder.thread_waiting(
                 reason=reason,
@@ -590,6 +652,48 @@ class ThreadRunner:
             )
         finally:
             self._finish()
+
+    def _recover_from_context_overflow(self, exc: Exception):
+        """Close the failing step and queue a hint for the next step.
+
+        The hint goes into ``self.human_messages``, which ``_start_step``
+        records as a ``human_message`` event on the next step and
+        ``format_thread_history`` surfaces to the coordinator. That's
+        the "note in the history" the user sees and the model reads.
+        """
+        error_msg = f"{type(exc).__name__}: {exc}"
+
+        # Finalize the current step (if still open) as an error row so it
+        # appears in snapshots with the failure context attached.
+        if self._step is not None and self._step.end_time is None:
+            if not self._step.result:
+                self._step.result = (
+                    f"Context overflow: the prompt exceeded the model's context "
+                    f"window. Details: {error_msg}"
+                )
+            self.store.end_step(self._step, status="error")
+
+        # Inject a hint for the coordinator to pick up on the next step.
+        # Targets "thread" so it sorts into this thread's timeline, not
+        # any session-wide broadcast UI.
+        hint = (
+            "⚠ The previous step's prompt exceeded the model's context window. "
+            "For the next move, pick a simpler query — narrow the date range, "
+            "pick fewer columns, aggregate aggressively, or LIMIT rows — so "
+            "the tool result is shorter."
+        )
+        self.human_messages.append({
+            "content": hint,
+            "target": "thread",
+            "timestamp": time.time(),
+        })
+
+        # Persist the failed step + save_session so a crash mid-recovery
+        # still leaves a coherent snapshot on disk.
+        self.store.save_session(self.thread.session_id)
+
+        # Continue the loop with the next step.
+        self._start_step()
 
     def _finish(self):
         """Release DB, set done_event. Idempotent."""

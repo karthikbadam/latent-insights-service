@@ -92,6 +92,39 @@ anything not built into standard SQL must be computed manually.
 ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expressions.
 """
 
+    SYNTHESIZE_PROMPT = """\
+You are the synthesis writer for an analytical thread. The thread has
+already run several SQL-based investigation steps and is ready for a
+final summary.
+
+You MUST NOT run any new queries. You have no tool available. Your job
+is to condense the findings below into a single narrative.
+
+## Dataset schema
+
+{schema_summary}
+
+## Thread history (previous steps and their results)
+
+{thread_history}
+
+## Coordinator's synthesis instruction
+
+{worker_instruction}
+
+## Output format
+
+Return JSON (no tool call):
+
+{{
+  "summary": "3-6 sentences. Lead with the headline finding. Include key \
+numbers, caveats (NULL rates, small subgroups, confounds), and any \
+limitations. Do NOT invent numbers — only use what the steps above \
+produced. If the evidence is thin, say so.",
+  "view_requested": null
+}}
+"""
+
     RUN_SQL_TOOL = {
         "type": "function",
         "function": {
@@ -157,8 +190,15 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
         thread_views: str = "(none)",
         step_number: int = 0,
         move: str = "",
+        thread_history: str = "",
     ):
-        """Initialize worker state for a new step."""
+        """Initialize worker state for a new step.
+
+        ``thread_history`` is only consulted for ``SYNTHESIZE`` moves,
+        where the worker has no tool and must write the final summary
+        from what previous steps already found. For non-SYNTHESIZE moves
+        the history passes through the coordinator, not the worker.
+        """
         self.instruction = instruction
         self.current_model = self.model
         self.consecutive_errors = 0
@@ -167,14 +207,27 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
         self.step_number = step_number
         self.current_move = move
 
-        prompt = self.SYSTEM_PROMPT.format(
-            schema_summary=self.schema_summary,
-            thread_views=thread_views,
-            worker_instruction=instruction,
-        )
+        if move == "SYNTHESIZE":
+            prompt = self.SYNTHESIZE_PROMPT.format(
+                schema_summary=self.schema_summary,
+                thread_history=thread_history or "(no prior steps recorded)",
+                worker_instruction=instruction,
+            )
+            user_turn = (
+                "Write the synthesis now. Do not run queries. Base the "
+                "summary only on the thread history above."
+            )
+        else:
+            prompt = self.SYSTEM_PROMPT.format(
+                schema_summary=self.schema_summary,
+                thread_views=thread_views,
+                worker_instruction=instruction,
+            )
+            user_turn = "Execute this analysis and return results."
+
         self.messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": "Execute this analysis and return results."},
+            {"role": "user", "content": user_turn},
         ]
 
     def call(self) -> tuple:
@@ -186,13 +239,19 @@ ols). Stick to standard SQL: aggregates, window functions, CTEs, CASE expression
         if self.consecutive_errors >= self.config.max_worker_retries:
             self.current_model = self.fallback_model
 
+        # SYNTHESIZE is a terminal summary move: the worker should NOT run
+        # new queries, only condense what previous steps have already found.
+        # Withholding the tool forces the model to return a final JSON
+        # summary instead of looping on ``run_sql``.
+        tools = None if self.current_move == "SYNTHESIZE" else [self.RUN_SQL_TOOL]
+
         t0 = time.monotonic()
         response = self.llm.call(
             model=self.current_model,
             messages=self.messages,
             role=self.role,
             temperature=0.0,
-            tools=[self.RUN_SQL_TOOL],
+            tools=tools,
             timeout=self.config.llm_timeout,
         )
         call_ms = round((time.monotonic() - t0) * 1000)

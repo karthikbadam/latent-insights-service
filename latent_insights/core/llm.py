@@ -46,6 +46,54 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     return False
 
 
+# Substrings that identify "prompt exceeds model's context window" errors
+# across OpenAI-compatible providers. Providers don't standardize the error
+# code for this — it can be 400 with varying wording — so we match on the
+# message content.
+_CONTEXT_LENGTH_MARKERS = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "context window",
+    "prompt is too long",
+)
+
+
+def is_context_length_error(exc: BaseException) -> bool:
+    """True if the error is a prompt-too-large failure.
+
+    Not transient in the network sense — the same prompt will fail
+    again — but it IS recoverable by a higher layer that shrinks the
+    prompt (e.g. dropping or summarizing earlier steps) before retrying.
+    The runner catches these and queues a "use a simpler query" hint
+    into the thread history instead of terminating the thread.
+
+    Message text is not standardized across providers, so we check both
+    ``str(exc)`` (the SDK's formatted error) and the structured body /
+    message attributes (what OpenRouter returns).
+    """
+    if not isinstance(exc, APIStatusError):
+        return False
+    status = getattr(exc, "status_code", None)
+    if status != 400:
+        return False
+
+    haystacks: list[str] = [str(exc)]
+    # The SDK exposes the parsed body (dict) and a top-level message
+    # string. Flatten both into strings so our markers match whether
+    # the provider puts the phrase in the top-level ``message`` or the
+    # nested ``error.message``.
+    body = getattr(exc, "body", None)
+    if body is not None:
+        haystacks.append(repr(body))
+    message = getattr(exc, "message", None)
+    if isinstance(message, str):
+        haystacks.append(message)
+
+    combined = " ".join(haystacks).lower()
+    return any(m in combined for m in _CONTEXT_LENGTH_MARKERS)
+
+
 # Internal alias kept terse for use inside this module.
 _is_transient = is_transient_llm_error
 

@@ -254,11 +254,21 @@ class Recorder:
         self,
         step: Step,
         *,
+        step_number: int,
+        move: str = "",
         content: str,
         target: str = "thread",
         timestamp: float | None = None,
     ):
-        """Record a human message on the step."""
+        """Record a human message on the step and emit the SSE event.
+
+        The SSE event carries ``step_number`` (the step that will
+        consume the message) plus ``move`` when known, so the UI can
+        slot it into the timeline the same way as sibling ``llm_call`` /
+        ``tool_call`` events. ``move`` is empty when the message is
+        recorded at the top of a step before the coordinator has picked
+        a move — the UI renders those as "pre-step" human input.
+        """
         self.store.add_event(
             step,
             {
@@ -268,3 +278,16 @@ class Recorder:
             },
             timestamp=timestamp,
         )
+        self.queue.emit(StreamEvent(
+            session_id=self.session_id,
+            thread_id=self.thread_id,
+            event_type="human_message",
+            message=content,
+            data={
+                "content": content,
+                "target": target,
+                "step_number": step_number,
+                "move": move,
+            },
+            timestamp=timestamp or time.time(),
+        ))
