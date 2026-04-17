@@ -61,6 +61,7 @@ class SessionFlow:
         profiler_ms = round((time.monotonic() - t0) * 1000)
 
         self.store.update_session_schema(session_id, schema_summary)
+        self.store.update_session_profiler_model(session_id, self.profiler.model)
         logger.info(f"Session {session_id} profiled ({profiler_ms}ms)")
 
         self.queue.emit(StreamEvent(
@@ -68,7 +69,10 @@ class SessionFlow:
             thread_id="",
             event_type="schema_summary_ready",
             message="Dataset profiled.",
-            data={"schema_summary": schema_summary},
+            data={
+                "schema_summary": schema_summary,
+                "model": self.profiler.model,
+            },
         ))
 
         # Close read-write connection — all further access is read-only
@@ -125,6 +129,7 @@ class SessionFlow:
         scout_db.close()
 
         self.store.update_session_scout(session_id, asdict(scout_output))
+        self.store.update_session_scout_model(session_id, self.scout.model)
 
         # Apply max_threads budget to scout questions
         scout_questions = scout_output.questions
@@ -149,6 +154,7 @@ class SessionFlow:
                     }
                     for q in scout_questions
                 ],
+                "model": self.scout.model,
             },
         ))
 
@@ -273,6 +279,7 @@ class SessionFlow:
                     for q in new_questions
                 ],
                 "resumed_threads": len(resumable),
+                "model": self.scout.model,
             },
         ))
 

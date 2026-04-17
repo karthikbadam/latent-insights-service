@@ -100,10 +100,20 @@ class InvestigationStore:
         if session:
             session.schema_summary = schema_summary
 
+    def update_session_profiler_model(self, session_id: str, model: str):
+        session = self._sessions.get(session_id)
+        if session:
+            session.profiler_model = model
+
     def update_session_scout(self, session_id: str, scout_output: dict):
         session = self._sessions.get(session_id)
         if session:
             session.scout_output = scout_output
+
+    def update_session_scout_model(self, session_id: str, model: str):
+        session = self._sessions.get(session_id)
+        if session:
+            session.scout_model = model
 
     # --- Threads ---
 
@@ -373,6 +383,8 @@ class InvestigationStore:
             # Frontend consumers of /saved can ignore it.
             "table_name": session.table_name,
             "schema_summary": session.schema_summary,
+            "profiler_model": session.profiler_model,
+            "scout_model": session.scout_model,
             "scout_questions": scout_questions,
             "threads": [self._thread_to_dict(t) for t in threads],
             "created_at": session.created_at.isoformat() if session.created_at else "",
@@ -424,6 +436,8 @@ class InvestigationStore:
                 if data.get("scout_questions") is not None
                 else None
             ),
+            profiler_model=data.get("profiler_model"),
+            scout_model=data.get("scout_model"),
         )
         self._sessions[session.id] = session
         self._session_threads[session.id] = []

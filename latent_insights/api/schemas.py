@@ -110,6 +110,8 @@ class SessionResponse(BaseModel):
     id: str
     dataset_path: str
     schema_summary: str | None = None
+    profiler_model: str | None = None
+    scout_model: str | None = None
     scout_questions: list[dict] | None = None
     threads: list[ThreadResponse]
     urls: SessionUrls

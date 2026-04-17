@@ -54,6 +54,8 @@ class Session:
     table_name: str = "dataset"
     schema_summary: str | None = None
     scout_output: dict | None = None
+    profiler_model: str | None = None
+    scout_model: str | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 

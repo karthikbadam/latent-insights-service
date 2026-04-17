@@ -190,6 +190,8 @@ def get_session(session_id: str, request: Request):
         id=session.id,
         dataset_path=session.dataset_path,
         schema_summary=session.schema_summary,
+        profiler_model=session.profiler_model,
+        scout_model=session.scout_model,
         scout_questions=session.scout_output.get("questions") if session.scout_output else None,
         threads=thread_responses,
         urls=SessionUrls(
