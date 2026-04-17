@@ -9,7 +9,6 @@ COPY latent_insights/ latent_insights/
 RUN uv sync --frozen --no-dev
 
 COPY data/ data/
-COPY docs/ docs/
 
 EXPOSE ${PORT:-8000}
 
