@@ -696,3 +696,59 @@ def test_human_input_lands_as_its_own_step(integration_setup):
     # No ``human_message`` event on any step — human input is the step now.
     for s in steps:
         assert not any(e.get("type") == "human_message" for e in s.events)
+
+
+def test_flush_and_pivot_emits_step_complete_for_in_flight_step(integration_setup):
+    """When human input flushes an in-flight step that already emitted
+    step_start (move was stamped), the runner must emit the matching
+    step_complete so the UI doesn't leave the row spinning forever.
+    """
+    setup = integration_setup
+    store = setup["store"]
+    queue = setup["queue"]
+
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Q?", "m", "e")
+    event_queue = queue.subscribe(session.id)
+
+    call_counts = {"coord": 0, "worker": 0}
+
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+        if role == "coordinator":
+            call_counts["coord"] += 1
+            if call_counts["coord"] == 1:
+                return LLMResponse(
+                    content=_make_coordinator_response("CONTINUE", "FORAGE", "Run query"),
+                    model=model,
+                )
+            return LLMResponse(
+                content=_make_coordinator_response("DONE", "SYNTHESIZE", "Wrap"),
+                model=model,
+            )
+        # Worker: push a pending message just before returning, so when
+        # _on_worker_llm_done fires the flush triggers on an in-flight
+        # step that has already emitted step_start (move=FORAGE).
+        call_counts["worker"] += 1
+        if call_counts["worker"] == 1:
+            store.push_pending_message(thread.id, "pivot now", target="thread")
+        return LLMResponse(
+            content=_make_worker_response("partial result"),
+            model=model, tool_calls=None,
+        )
+
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
+
+    events = []
+    while not event_queue.empty():
+        events.append(event_queue.get_nowait())
+
+    # The flushed FORAGE step must have both step_start and step_complete.
+    starts = [e for e in events if e.event_type == "step_start" and e.data.get("move") == "FORAGE"]
+    completes = [e for e in events if e.event_type == "step_complete" and e.data.get("move") == "FORAGE"]
+    assert starts, "expected a step_start(FORAGE) for the flushed step"
+    assert completes, "expected a matching step_complete(FORAGE) after flush"
+    assert "flushed" in completes[0].data["result"].lower()

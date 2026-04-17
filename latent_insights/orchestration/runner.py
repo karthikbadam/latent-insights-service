@@ -567,10 +567,23 @@ class ThreadRunner:
         """
         if not self.store.has_pending_messages(self.thread.id):
             return False
-        if self._step is not None and self._step.end_time is None:
-            if not self._step.result:
-                self._step.result = "Step flushed — human input received mid-step"
-            self.store.end_step(self._step, status="flushed")
+        step = self._step
+        if step is not None and step.end_time is None:
+            if not step.result:
+                step.result = "Step flushed — human input received mid-step"
+            self.store.end_step(step, status="flushed")
+            # If ``move`` was stamped, step_start was already emitted for this
+            # row (that happens in _on_coordinator_done after the coordinator
+            # returns). Emit the matching step_complete so the UI closes the
+            # row instead of leaving it spinning.
+            if step.move:
+                self.recorder.step_complete(
+                    step.step_number,
+                    step.move,
+                    step.instruction,
+                    step.result,
+                    step.duration_ms or 0,
+                )
             self._step = None
         self._drain_pending_as_steps()
         self._start_step()
