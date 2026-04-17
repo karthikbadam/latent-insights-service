@@ -9,13 +9,12 @@ import pytest
 from latent_insights.config import AppConfig
 from latent_insights.core.llm import LLMResponse
 from latent_insights.core.queue import Queue
-from latent_insights.core.state import StateStore, generate_id
-from latent_insights.core.tracing import TraceStore
+from latent_insights.core.store import InvestigationStore, generate_id
 from latent_insights.models import ThreadStatus
-from latent_insights.orchestration.thread import ThreadRunner
+from latent_insights.orchestration.runner import ThreadRunner
 
 
-# --- StateStore unit tests ---
+# --- InvestigationStore unit tests ---
 
 
 def test_generate_id_format():
@@ -104,10 +103,10 @@ def test_dump_and_load_session(state_store):
     thread = state_store.create_thread(session.id, "Question?", "Why", "Start")
     state_store.update_thread_status(thread.id, ThreadStatus.COMPLETE, summary="Found it")
 
-    state_store.dump_session(session.id)
+    state_store.save_session(session.id)
 
     # Create a fresh store and load
-    fresh = StateStore(data_dir=state_store._data_dir)
+    fresh = InvestigationStore(data_dir=state_store._data_dir)
     loaded = fresh.load_session(session.id)
 
     assert loaded is not None
@@ -132,30 +131,28 @@ def test_counts(state_store):
     assert state_store.thread_count == 2
 
 
-# --- TraceStore unit tests ---
+# --- Span / trace tests (now on InvestigationStore) ---
 
 
 def test_trace_format_empty(tmp_path):
-    ts = TraceStore(data_dir=str(tmp_path))
-    result = ts.format_thread_history("nonexistent")
+    store = InvestigationStore(data_dir=str(tmp_path))
+    result = store.format_thread_history("nonexistent")
     assert "No steps yet" in result
 
 
 def test_trace_format_windowed(tmp_path):
-    ts = TraceStore(data_dir=str(tmp_path))
-    trace_id = "test-trace"
+    store = InvestigationStore(data_dir=str(tmp_path))
+    thread_id = "test-trace"
 
     # Create 6 steps
     for i in range(6):
-        span = ts.start_span(trace_id, f"step_{i+1}", kind="step")
-        span.attributes = {
-            "move": "FORAGE",
-            "instruction": f"instruction {i+1}",
-            "result": f"Result {i+1}. Some detail here.",
-        }
-        ts.end_span(span)
+        step = store.start_step(thread_id)
+        step.move = "FORAGE"
+        step.instruction = f"instruction {i+1}"
+        step.result = f"Result {i+1}. Some detail here."
+        store.end_step(step)
 
-    result = ts.format_thread_history(trace_id, full_window=3)
+    result = store.format_thread_history(thread_id, full_window=3)
 
     # Step 1 should be full
     assert 'Instruction: "instruction 1"' in result
@@ -169,72 +166,88 @@ def test_trace_format_windowed(tmp_path):
 
 
 def test_trace_format_with_summary(tmp_path):
-    ts = TraceStore(data_dir=str(tmp_path))
-    trace_id = "test-trace"
+    store = InvestigationStore(data_dir=str(tmp_path))
+    thread_id = "test-trace"
 
-    span = ts.start_span(trace_id, "step_1", kind="step")
-    span.attributes = {"move": "SCOPE", "instruction": "test", "result": "scoped"}
-    ts.end_span(span)
+    step = store.start_step(thread_id)
+    step.move = "SCOPE"
+    step.instruction = "test"
+    step.result = "scoped"
+    store.end_step(step)
 
-    result = ts.format_thread_history(
-        trace_id, running_summary="Earlier we found X and Y.",
+    result = store.format_thread_history(
+        thread_id, running_summary="Earlier we found X and Y.",
     )
     assert "Summary of earlier analysis" in result
     assert "Earlier we found X and Y." in result
 
 
-def test_trace_format_with_human_messages(tmp_path):
-    ts = TraceStore(data_dir=str(tmp_path))
-    trace_id = "test-trace"
+def test_trace_format_includes_human_input_steps(tmp_path):
+    """HUMAN_INPUT steps appear in format_thread_history just like any
+    other step — no side-channel human_messages parameter needed.
+    """
+    store = InvestigationStore(data_dir=str(tmp_path))
+    thread_id = "test-trace"
 
-    span = ts.start_span(trace_id, "step_1", kind="step")
-    span.attributes = {"move": "FORAGE", "instruction": "Explore", "result": "Found gap"}
-    ts.end_span(span)
+    step1 = store.start_step(thread_id)
+    step1.move = "FORAGE"
+    step1.instruction = "Explore"
+    step1.result = "Found gap"
+    store.end_step(step1)
 
-    result = ts.format_thread_history(trace_id, human_messages=["Check by stellar type"])
-    assert "[Human input]" in result
+    human_step = store.start_step(thread_id)
+    human_step.move = "HUMAN_INPUT"
+    human_step.instruction = "thread"
+    human_step.result = "Check by stellar type"
+    store.end_step(human_step)
+
+    result = store.format_thread_history(thread_id)
+    assert "HUMAN_INPUT" in result
     assert "Check by stellar type" in result
 
 
-def test_trace_flush_and_load(tmp_path):
-    ts = TraceStore(data_dir=str(tmp_path))
-    trace_id = "test-trace"
-    session_id = "test-session"
+def test_trace_save_and_load(tmp_path):
+    store = InvestigationStore(data_dir=str(tmp_path))
 
-    span = ts.start_span(trace_id, "step_1", kind="step")
-    span.attributes = {"move": "SCOPE", "instruction": "filter", "result": "done"}
-    ts.end_span(span)
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Q?")
 
-    ts.flush_to_file(trace_id, session_id)
-    ts.clear_trace(trace_id)
-    assert ts.get_spans(trace_id) == []
+    step = store.start_step(thread.id)
+    step.move = "SCOPE"
+    step.instruction = "filter"
+    step.result = "done"
+    store.end_step(step)
 
-    loaded = ts.load_trace(trace_id, session_id)
-    assert len(loaded) == 1
-    assert loaded[0].attributes["move"] == "SCOPE"
+    store.save_session(session.id)
+
+    # Load into fresh store
+    fresh = InvestigationStore(data_dir=str(tmp_path))
+    fresh.load_session(session.id)
+
+    loaded_steps = fresh.get_steps(thread.id)
+    assert len(loaded_steps) == 1
+    assert loaded_steps[0].move == "SCOPE"
 
 
-# --- Thread state machine integration tests ---
+# --- ThreadRunner integration tests ---
 
 
 @pytest.fixture
 def integration_setup(tmp_path):
-    """Set up session DB, config, mock LLM, queue, state, and trace store."""
+    """Set up session DB, config, mock LLM, queue, and store."""
     session_db = duckdb.connect(":memory:")
     csv_path = "tests/fixtures/sample_dataset.csv"
     session_db.execute(f"CREATE TABLE dataset AS SELECT * FROM read_csv_auto('{csv_path}')")
 
     config = AppConfig()
     queue = Queue()
-    state = StateStore(data_dir=str(tmp_path))
-    trace_store = TraceStore(data_dir=str(tmp_path))
+    store = InvestigationStore(data_dir=str(tmp_path))
 
     return {
         "session_db": session_db,
         "config": config,
         "queue": queue,
-        "state": state,
-        "trace_store": trace_store,
+        "store": store,
     }
 
 
@@ -263,27 +276,35 @@ def _make_worker_response(summary):
 
 
 def _build_runner(setup, thread, session_db=None, human_messages=None):
-    """Build a ThreadRunner for testing."""
+    """Build a ThreadRunner for testing.
+
+    ``human_messages`` is a test-only convenience — each entry is
+    pushed to the store's pending queue so the runner picks it up as
+    a HUMAN_INPUT step via its normal drain path. This matches how
+    production callers (routes.py) work.
+    """
+    for msg in human_messages or []:
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        target = msg.get("target", "thread") if isinstance(msg, dict) else "thread"
+        setup["store"].push_pending_message(thread.id, content, target=target)
     return ThreadRunner(
         config=setup["config"],
         llm=MagicMock(),
         session_db=session_db or setup["session_db"],
         queue=setup["queue"],
-        state=setup["state"],
-        trace_store=setup["trace_store"],
+        store=setup["store"],
         thread=thread,
         schema_summary="test schema",
-        human_messages=human_messages or [],
     )
 
 
-def test_thread_loop_three_steps_done(integration_setup):
+def test_thread_runner_three_steps_done(integration_setup):
     """Thread runs 3 steps then completes."""
     setup = integration_setup
-    state = setup["state"]
+    store = setup["store"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Test question?", "Motivation", "Entry")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Test question?", "Motivation", "Entry")
 
     coordinator_calls = [0]
 
@@ -309,18 +330,18 @@ def test_thread_loop_three_steps_done(integration_setup):
     runner.start()
     runner.done_event.wait(timeout=10)
 
-    final_thread = state.get_thread(thread.id)
+    final_thread = store.get_thread(thread.id)
     assert final_thread.status == ThreadStatus.COMPLETE
     assert final_thread.summary is not None
 
 
-def test_thread_loop_stuck_then_resume(integration_setup):
+def test_thread_runner_stuck_then_resume(integration_setup):
     """Thread gets stuck, human replies, thread resumes and completes."""
     setup = integration_setup
-    state = setup["state"]
+    store = setup["store"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Hard question?", "Complex", "Start here")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Hard question?", "Complex", "Start here")
 
     phase = {"value": "initial"}
     coordinator_calls = [0]
@@ -369,7 +390,7 @@ def test_thread_loop_stuck_then_resume(integration_setup):
     runner.start()
     runner.done_event.wait(timeout=10)
 
-    t = state.get_thread(thread.id)
+    t = store.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
 
     # Resume with human message
@@ -387,18 +408,18 @@ def test_thread_loop_stuck_then_resume(integration_setup):
     runner2.resume()
     runner2.done_event.wait(timeout=10)
 
-    t = state.get_thread(thread.id)
+    t = store.get_thread(thread.id)
     assert t.status == ThreadStatus.COMPLETE
 
 
 def test_thread_emits_events(integration_setup):
     """Verify SSE events are emitted during thread execution."""
     setup = integration_setup
-    state = setup["state"]
+    store = setup["store"]
     queue = setup["queue"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Event test?", "", "")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Event test?", "", "")
 
     event_queue = queue.subscribe(session.id)
 
@@ -436,10 +457,10 @@ def test_thread_emits_events(integration_setup):
 def test_thread_move_repetition_guard(integration_setup):
     """Thread that repeats the same move N times gets forced to STUCK/WAITING."""
     setup = integration_setup
-    state = setup["state"]
+    store = setup["store"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Repetitive?", "Test", "Start")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Repetitive?", "Test", "Start")
 
     def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
         if role == "coordinator":
@@ -461,17 +482,17 @@ def test_thread_move_repetition_guard(integration_setup):
     runner.start()
     runner.done_event.wait(timeout=10)
 
-    t = state.get_thread(thread.id)
+    t = store.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
 
 
 def test_thread_error_becomes_waiting(integration_setup):
     """Thread errors become WAITING (not ERROR) so human can help."""
     setup = integration_setup
-    state = setup["state"]
+    store = setup["store"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Will error?", "Test", "Start")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Will error?", "Test", "Start")
 
     call_count = [0]
 
@@ -488,7 +509,7 @@ def test_thread_error_becomes_waiting(integration_setup):
     runner.start()
     runner.done_event.wait(timeout=10)
 
-    t = state.get_thread(thread.id)
+    t = store.get_thread(thread.id)
     assert t.status == ThreadStatus.WAITING
 
 
@@ -497,11 +518,11 @@ def test_thread_unexpected_error_sets_reason(integration_setup):
     import httpx
 
     setup = integration_setup
-    state = setup["state"]
+    store = setup["store"]
     queue = setup["queue"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Will error?", "Test", "Start")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Will error?", "Test", "Start")
     event_queue = queue.subscribe(session.id)
 
     def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
@@ -521,22 +542,22 @@ def test_thread_unexpected_error_sets_reason(integration_setup):
 
     assert waiting_events, "expected a thread_waiting event"
     assert waiting_events[-1].data["reason"] == "unexpected_error"
-    t = state.get_thread(thread.id)
+    t = store.get_thread(thread.id)
     assert t.error  # error text recorded on the thread
     assert httpx  # imported only to confirm dev dep is present
 
 
 def test_thread_transient_error_sets_retry_exhausted_reason(integration_setup):
-    """APIConnectionError surviving retries → reason=retry_exhausted."""
+    """APIConnectionError surviving retries -> reason=retry_exhausted."""
     import httpx
     from openai import APIConnectionError
 
     setup = integration_setup
-    state = setup["state"]
+    store = setup["store"]
     queue = setup["queue"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Net flaky?", "Test", "Start")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Net flaky?", "Test", "Start")
     event_queue = queue.subscribe(session.id)
 
     request = httpx.Request("POST", "http://test")
@@ -560,13 +581,13 @@ def test_thread_transient_error_sets_retry_exhausted_reason(integration_setup):
 
 
 def test_thread_coordinator_stuck_reason(integration_setup):
-    """Coordinator returning STUCK at step > 2 → reason=coordinator_stuck."""
+    """Coordinator returning STUCK at step > 2 -> reason=coordinator_stuck."""
     setup = integration_setup
-    state = setup["state"]
+    store = setup["store"]
     queue = setup["queue"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Stuck test?", "Test", "Start")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Stuck test?", "Test", "Start")
     event_queue = queue.subscribe(session.id)
 
     step = [0]
@@ -606,14 +627,14 @@ def test_thread_coordinator_stuck_reason(integration_setup):
 
 def test_pending_message_carries_target_and_timestamp(tmp_path):
     """push_pending_message stores target and a wall-clock timestamp."""
-    state = StateStore(data_dir=str(tmp_path))
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Q?", "m", "e")
+    store = InvestigationStore(data_dir=str(tmp_path))
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Q?", "m", "e")
 
-    state.push_pending_message(thread.id, "try a different angle", target="thread")
-    state.push_pending_message(thread.id, "focus on cohort A", target="session")
+    store.push_pending_message(thread.id, "try a different angle", target="thread")
+    store.push_pending_message(thread.id, "focus on cohort A", target="session")
 
-    drained = state.drain_pending_messages(thread.id)
+    drained = store.drain_pending_messages(thread.id)
     assert len(drained) == 2
     assert drained[0]["content"] == "try a different angle"
     assert drained[0]["target"] == "thread"
@@ -621,17 +642,18 @@ def test_pending_message_carries_target_and_timestamp(tmp_path):
     assert drained[1]["target"] == "session"
 
 
-def test_human_message_appears_in_step_event_timeline(integration_setup):
-    """A message pushed before a step shows up as a human_message span event."""
+def test_human_input_lands_as_its_own_step(integration_setup):
+    """A message pushed before the thread starts shows up as a
+    dedicated HUMAN_INPUT step (not as a sub-event on another step).
+    """
     setup = integration_setup
-    state = setup["state"]
-    trace_store = setup["trace_store"]
+    store = setup["store"]
 
-    session = state.create_session("test.csv")
-    thread = state.create_thread(session.id, "Q?", "m", "e")
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Q?", "m", "e")
 
     # Simulate user posting before any step has run.
-    state.push_pending_message(thread.id, "look at cohort A", target="thread")
+    store.push_pending_message(thread.id, "look at cohort A", target="thread")
 
     coordinator_calls = [0]
 
@@ -657,17 +679,76 @@ def test_human_message_appears_in_step_event_timeline(integration_setup):
     runner.start()
     runner.done_event.wait(timeout=10)
 
-    # Trace is flushed to disk and cleared from memory on completion.
-    trace_store.load_trace(thread.id, session.id)
-    spans = trace_store.get_step_spans(thread.id)
-    assert spans, "expected at least one step span"
+    # Reload from disk to verify persistence + step ordering.
+    store.load_session(session.id)
+    steps = store.get_steps(thread.id)
+    assert steps, "expected at least one step"
 
-    human_events = [
-        e for e in spans[0].events if e["name"] == "human_message"
-    ]
-    assert len(human_events) == 1
-    assert human_events[0]["attributes"]["content"] == "look at cohort A"
-    assert human_events[0]["attributes"]["target"] == "thread"
+    # HUMAN_INPUT is the FIRST step (posted before anything else).
+    human_steps = [s for s in steps if s.move == "HUMAN_INPUT"]
+    assert len(human_steps) == 1, f"expected 1 HUMAN_INPUT step, got {len(human_steps)}"
+    assert human_steps[0].result == "look at cohort A"
+    assert human_steps[0].instruction == "thread"  # target stamped on instruction
+    assert steps[0].move == "HUMAN_INPUT", (
+        "HUMAN_INPUT step must come before the coordinator step"
+    )
 
-    # Timestamp set at push time, preserved on the span event.
-    assert human_events[0]["timestamp"] > 0
+    # No ``human_message`` event on any step — human input is the step now.
+    for s in steps:
+        assert not any(e.get("type") == "human_message" for e in s.events)
+
+
+def test_flush_and_pivot_emits_step_complete_for_in_flight_step(integration_setup):
+    """When human input flushes an in-flight step that already emitted
+    step_start (move was stamped), the runner must emit the matching
+    step_complete so the UI doesn't leave the row spinning forever.
+    """
+    setup = integration_setup
+    store = setup["store"]
+    queue = setup["queue"]
+
+    session = store.create_session("test.csv")
+    thread = store.create_thread(session.id, "Q?", "m", "e")
+    event_queue = queue.subscribe(session.id)
+
+    call_counts = {"coord": 0, "worker": 0}
+
+    def mock_call(model, messages, role, temperature=0.0, tools=None, max_tokens=4096, timeout=120.0):
+        if role == "coordinator":
+            call_counts["coord"] += 1
+            if call_counts["coord"] == 1:
+                return LLMResponse(
+                    content=_make_coordinator_response("CONTINUE", "FORAGE", "Run query"),
+                    model=model,
+                )
+            return LLMResponse(
+                content=_make_coordinator_response("DONE", "SYNTHESIZE", "Wrap"),
+                model=model,
+            )
+        # Worker: push a pending message just before returning, so when
+        # _on_worker_llm_done fires the flush triggers on an in-flight
+        # step that has already emitted step_start (move=FORAGE).
+        call_counts["worker"] += 1
+        if call_counts["worker"] == 1:
+            store.push_pending_message(thread.id, "pivot now", target="thread")
+        return LLMResponse(
+            content=_make_worker_response("partial result"),
+            model=model, tool_calls=None,
+        )
+
+    runner = _build_runner(setup, thread)
+    runner.coordinator.llm.call = mock_call
+    runner.worker.llm.call = mock_call
+    runner.start()
+    runner.done_event.wait(timeout=10)
+
+    events = []
+    while not event_queue.empty():
+        events.append(event_queue.get_nowait())
+
+    # The flushed FORAGE step must have both step_start and step_complete.
+    starts = [e for e in events if e.event_type == "step_start" and e.data.get("move") == "FORAGE"]
+    completes = [e for e in events if e.event_type == "step_complete" and e.data.get("move") == "FORAGE"]
+    assert starts, "expected a step_start(FORAGE) for the flushed step"
+    assert completes, "expected a matching step_complete(FORAGE) after flush"
+    assert "flushed" in completes[0].data["result"].lower()

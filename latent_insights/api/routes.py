@@ -43,59 +43,30 @@ def _get_state(request: Request):
     s = request.app.state
     if not hasattr(s, "config") or not s.config:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    return s.config, s.llm, s.db, s.queue, s.state_store, s.trace_store
+    return s.config, s.llm, s.db, s.queue, s.store
 
 
-def _steps_from_trace(trace_store, thread) -> list[StepResponse]:
-    """Convert TraceStore spans to StepResponse list for API."""
-    spans = trace_store.get_step_spans(thread.id)
-    if not spans:
-        trace_store.load_trace(thread.id, thread.session_id)
-        spans = trace_store.get_step_spans(thread.id)
+def _steps_from_store(store, thread) -> list[StepResponse]:
+    """Project completed ``Step`` rows to ``StepResponse`` for the API.
 
-    # Only include completed steps (in-progress spans have no attributes yet)
-    spans = [s for s in spans if s.end_time is not None]
+    The store's Step and event shapes already match the API — this is a
+    trivial projection (copy fields + sort events by timestamp).
+    """
+    steps = [s for s in store.get_steps(thread.id) if s.end_time is not None]
 
-    steps = []
-    for i, span in enumerate(spans, 1):
-        attrs = span.attributes
-        duration_ms = None
-        if span.end_time and span.start_time:
-            duration_ms = round((span.end_time - span.start_time) * 1000)
-
-        # Build interleaved event timeline from span events. Events include
-        # llm_call, tool_call, and human_message — the latter is how human
-        # interventions are recorded so they land in the step timeline
-        # alongside model calls and tool uses.
-        step_events = []
-        for event in span.events:
-            event_attrs = event.get("attributes", {})
-            step_events.append(StepEvent(
-                type=event["name"],
-                timestamp=event.get("timestamp", 0),
-                agent=event_attrs.get("agent"),
-                model=event_attrs.get("model"),
-                duration_ms=event_attrs.get("duration_ms"),
-                input_tokens=event_attrs.get("input_tokens"),
-                output_tokens=event_attrs.get("output_tokens"),
-                sql=event_attrs.get("sql"),
-                tool_result=event_attrs.get("tool_result"),
-                response=event_attrs.get("response"),
-                content=event_attrs.get("content"),
-                target=event_attrs.get("target"),
-            ))
-        step_events.sort(key=lambda e: e.timestamp)
-
-        steps.append(StepResponse(
-            step_number=i,
-            move=attrs.get("move", ""),
-            instruction=attrs.get("instruction", ""),
-            result=attrs.get("result", ""),
-            view_created=attrs.get("view_created"),
-            duration_ms=duration_ms,
-            events=step_events,
+    responses: list[StepResponse] = []
+    for step in steps:
+        events = sorted(step.events, key=lambda e: e.get("timestamp", 0))
+        responses.append(StepResponse(
+            step_number=step.step_number,
+            move=step.move,
+            instruction=step.instruction,
+            result=step.result,
+            view_created=step.view_created,
+            duration_ms=step.duration_ms,
+            events=[StepEvent(**e) for e in events],
         ))
-    return steps
+    return responses
 
 
 # --- Sessions ---
@@ -109,7 +80,7 @@ def create_session(
     config_json: str | None = Form(None, alias="config"),
 ):
     """Create a new analysis session from file upload or existing dataset path."""
-    config, llm, db, queue, state, trace_store = _get_state(request)
+    config, llm, db, queue, store = _get_state(request)
 
     # Parse per-session config overrides
     session_config = config
@@ -122,7 +93,6 @@ def create_session(
 
         # Validate default_pattern if provided
         if parsed.default_pattern:
-            from latent_insights.orchestration.patterns import PATTERN_REGISTRY
             valid_patterns = {"coordinator_worker", "fan_out", "human_in_the_loop"}
             if parsed.default_pattern not in valid_patterns:
                 raise HTTPException(
@@ -156,9 +126,9 @@ def create_session(
     from latent_insights.orchestration.session import SessionFlow
 
     table_name = table_name_from_path(resolved_path)
-    session = state.create_session(resolved_path, table_name)
+    session = store.create_session(resolved_path, table_name)
 
-    flow = SessionFlow(session_config, llm, db, queue, state, trace_store)
+    flow = SessionFlow(session_config, llm, db, queue, store)
     queue.schedule(
         fn=flow.create,
         args=(session.id, resolved_path),
@@ -193,17 +163,17 @@ def get_saved_session(session_id: str, request: Request):
 @router.get("/sessions/{session_id}")
 def get_session(session_id: str, request: Request):
     """Get full session state with threads and steps."""
-    _, _, _, _, state, trace_store = _get_state(request)
+    _, _, _, _, store = _get_state(request)
 
-    session = state.get_session(session_id)
+    session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    threads = state.get_threads(session_id)
+    threads = store.get_threads(session_id)
 
     thread_responses = []
     for t in threads:
-        steps = _steps_from_trace(trace_store, t)
+        steps = _steps_from_store(store, t)
         thread_responses.append(ThreadResponse(
             id=t.id,
             seed_question=t.seed_question,
@@ -234,16 +204,16 @@ def get_session(session_id: str, request: Request):
 @router.post("/sessions/{session_id}/threads")
 def create_thread(session_id: str, request: Request, body: CreateThreadRequest):
     """Create a user-initiated thread with a custom question."""
-    config, llm, db, queue, state, trace_store = _get_state(request)
-    from latent_insights.orchestration.thread import ThreadRunner
+    config, llm, db, queue, store = _get_state(request)
+    from latent_insights.orchestration.runner import ThreadRunner
 
-    session = state.get_session(session_id)
+    session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     if session.schema_summary is None:
         raise HTTPException(status_code=400, detail="Session profiling not complete yet")
 
-    thread = state.create_thread(
+    thread = store.create_thread(
         session_id, body.question, body.motivation or "", "",
     )
 
@@ -254,8 +224,7 @@ def create_thread(session_id: str, request: Request, body: CreateThreadRequest):
         llm=llm,
         session_db=thread_db,
         queue=queue,
-        state=state,
-        trace_store=trace_store,
+        store=store,
         thread=thread,
         schema_summary=session.schema_summary,
     )
@@ -273,16 +242,16 @@ def create_thread(session_id: str, request: Request, body: CreateThreadRequest):
 @router.post("/sessions/{session_id}/continue")
 def continue_session(session_id: str, request: Request):
     """Continue a session: resume stuck threads + scout new questions."""
-    config, llm, db, queue, state, trace_store = _get_state(request)
+    config, llm, db, queue, store = _get_state(request)
     from latent_insights.orchestration.session import SessionFlow
 
-    session = state.get_session(session_id)
+    session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     if session.schema_summary is None:
         raise HTTPException(status_code=400, detail="Session profiling not complete yet")
 
-    flow = SessionFlow(config, llm, db, queue, state, trace_store)
+    flow = SessionFlow(config, llm, db, queue, store)
     queue.schedule(
         fn=flow.continue_,
         args=(session_id,),
@@ -291,7 +260,7 @@ def continue_session(session_id: str, request: Request):
         description=f"Continue session {session_id}",
     )
 
-    threads = state.get_threads(session_id)
+    threads = store.get_threads(session_id)
     resumable = [t for t in threads if t.status.value in ("waiting", "complete")]
 
     return {
@@ -305,21 +274,21 @@ def continue_session(session_id: str, request: Request):
 def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     """Post a human message to a thread.
 
-    - If thread is WAITING or COMPLETE: resumes the thread with the message.
-    - If thread is RUNNING: injects the message into the next coordinator step
-      (non-blocking interrupt).
+    The message lands in the store's pending queue regardless of thread
+    status. For RUNNING threads the runner picks it up at its next
+    callback boundary via ``_flush_and_pivot`` and commits a HUMAN_INPUT
+    step. For WAITING/COMPLETE threads we construct a runner and
+    ``resume()`` it — the runner drains pending into a HUMAN_INPUT step
+    ahead of the first coordinator step.
     """
-    config, llm, db, queue, state, trace_store = _get_state(request)
+    config, llm, db, queue, store = _get_state(request)
 
-    thread = state.get_thread(thread_id)
+    thread = store.get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
 
     if thread.status == ThreadStatus.RUNNING:
-        # Inject message into the running thread — picked up at the next
-        # coordinator step, which will record it as a `human_message`
-        # event on that step's trace span.
-        state.push_pending_message(thread_id, body.content, target="thread")
+        store.push_pending_message(thread_id, body.content, target="thread")
         queue.emit(StreamEvent(
             session_id=thread.session_id,
             thread_id=thread_id,
@@ -332,63 +301,87 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     if thread.status.value not in ("waiting", "complete"):
         raise HTTPException(status_code=400, detail=f"Thread status '{thread.status.value}' does not accept messages")
 
-    from latent_insights.orchestration.thread import ThreadRunner
+    from latent_insights.orchestration.runner import ThreadRunner
 
-    session = state.get_session(thread.session_id)
+    session = store.get_session(thread.session_id)
     thread_db = db.open_session_connection(thread.session_id)
 
+    # Push before resume so the runner's _drain_pending_as_steps commits
+    # a HUMAN_INPUT step as the first row of this resumed run.
+    store.push_pending_message(thread_id, body.content, target="thread")
     runner = ThreadRunner(
         config=config,
         llm=llm,
         session_db=thread_db,
         queue=queue,
-        state=state,
-        trace_store=trace_store,
+        store=store,
         thread=thread,
         schema_summary=session.schema_summary or "",
     )
-    runner.resume(human_messages=[{
-        "content": body.content, "target": "thread", "timestamp": time.time(),
-    }])
+    runner.resume()
 
     return {"status": "resumed", "thread_id": thread_id}
 
 
 @router.post("/sessions/{session_id}/messages")
 def post_session_message(session_id: str, request: Request, body: PostMessageRequest):
-    """Broadcast a human message to all running threads in a session.
+    """Session-scoped message — broadcast or start-a-new-thread.
 
-    The message is injected into each running thread and picked up at
-    the next coordinator step. Also resumes any waiting threads.
+    Default (``as_new_thread=False``): push the message to every
+    thread's pending queue and resume any WAITING threads. Each affected
+    thread's runner commits a HUMAN_INPUT step at its next boundary.
+
+    With ``as_new_thread=True``: skip the broadcast entirely and spawn a
+    fresh thread using the message as its seed question. Existing
+    threads are untouched.
     """
-    config, llm, db, queue, state, trace_store = _get_state(request)
+    config, llm, db, queue, store = _get_state(request)
 
-    session = state.get_session(session_id)
+    session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    threads = state.get_threads(session_id)
+    # --- Start-a-new-thread branch ---
+    if body.as_new_thread:
+        if session.schema_summary is None:
+            raise HTTPException(status_code=400, detail="Session profiling not complete yet")
+        from latent_insights.orchestration.runner import ThreadRunner
+        new_thread = store.create_thread(
+            session_id, body.content, "Started from human guidance", "",
+        )
+        ThreadRunner(
+            config=config, llm=llm,
+            session_db=db.open_session_connection(session_id),
+            queue=queue, store=store, thread=new_thread,
+            schema_summary=session.schema_summary,
+        ).start()
+        queue.emit(StreamEvent(
+            session_id=session_id, thread_id="",
+            event_type="message_injected",
+            message=body.content,
+            data={"content": body.content, "target": "new_thread", "thread_id": new_thread.id},
+        ))
+        return {"status": "thread_spawned", "session_id": session_id, "thread_id": new_thread.id}
+
+    # --- Default broadcast branch ---
+    threads = store.get_threads(session_id)
     injected_ids = []
     resumed_ids = []
 
-    broadcast_ts = time.time()
-
     for t in threads:
         if t.status == ThreadStatus.RUNNING:
-            state.push_pending_message(t.id, body.content, target="session")
+            store.push_pending_message(t.id, body.content, target="session")
             injected_ids.append(t.id)
         elif t.status == ThreadStatus.WAITING:
-            from latent_insights.orchestration.thread import ThreadRunner
+            from latent_insights.orchestration.runner import ThreadRunner
+            store.push_pending_message(t.id, body.content, target="session")
             thread_db = db.open_session_connection(session_id)
             runner = ThreadRunner(
                 config=config, llm=llm, session_db=thread_db, queue=queue,
-                state=state, trace_store=trace_store, thread=t,
+                store=store, thread=t,
                 schema_summary=session.schema_summary or "",
             )
-            runner.resume(human_messages=[{
-                "content": body.content, "target": "session",
-                "timestamp": broadcast_ts,
-            }])
+            runner.resume()
             resumed_ids.append(t.id)
 
     queue.emit(StreamEvent(
@@ -415,12 +408,12 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
 @router.get("/sessions")
 def list_sessions(request: Request):
     """List all sessions with metadata."""
-    _, _, _, _, state, _ = _get_state(request)
+    _, _, _, _, store = _get_state(request)
 
-    sessions = state.get_all_sessions()
+    sessions = store.get_all_sessions()
     summaries = []
     for s in sessions:
-        threads = state.get_threads(s.id)
+        threads = store.get_threads(s.id)
         status_counts: dict[str, int] = {}
         for t in threads:
             status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
@@ -439,13 +432,13 @@ def list_sessions(request: Request):
 @router.get("/threads/{thread_id}")
 def get_thread(thread_id: str, request: Request):
     """Get a single thread with its steps."""
-    _, _, _, _, state, trace_store = _get_state(request)
+    _, _, _, _, store = _get_state(request)
 
-    thread = state.get_thread(thread_id)
+    thread = store.get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    steps = _steps_from_trace(trace_store, thread)
+    steps = _steps_from_store(store, thread)
     return ThreadResponse(
         id=thread.id,
         seed_question=thread.seed_question,
@@ -465,11 +458,11 @@ def get_thread(thread_id: str, request: Request):
 @router.get("/system/stats")
 def system_stats(request: Request) -> SystemStats:
     """Session and thread counts."""
-    _, _, _, _, state, _ = _get_state(request)
+    _, _, _, _, store = _get_state(request)
 
     return SystemStats(
-        session_count=state.session_count,
-        thread_count=state.thread_count,
+        session_count=store.session_count,
+        thread_count=store.thread_count,
     )
 
 
@@ -492,10 +485,10 @@ def run_pattern(
     body: RunPatternRequest,
 ):
     """Run a named pattern for a session."""
-    config, llm, db, queue, state, trace_store = _get_state(request)
+    config, llm, db, queue, store = _get_state(request)
     from latent_insights.orchestration.patterns import PATTERN_REGISTRY
 
-    session = state.get_session(session_id)
+    session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     if session.schema_summary is None:
@@ -509,15 +502,15 @@ def run_pattern(
         question = inputs.get("question", "")
         if not question:
             raise HTTPException(status_code=400, detail="'question' is required")
-        from latent_insights.orchestration.thread import ThreadRunner
+        from latent_insights.orchestration.runner import ThreadRunner
 
-        thread = state.create_thread(
+        thread = store.create_thread(
             session_id, question, inputs.get("motivation", ""), "",
         )
         thread_db = db.open_session_connection(session_id)
         runner = ThreadRunner(
             config=config, llm=llm, session_db=thread_db, queue=queue,
-            state=state, trace_store=trace_store, thread=thread,
+            store=store, thread=thread,
             schema_summary=session.schema_summary,
         )
         runner.start()
@@ -535,7 +528,7 @@ def run_pattern(
             questions=questions,
             session_id=session_id,
             config=config, llm=llm, db=db, queue=queue,
-            state_store=state, trace_store=trace_store,
+            store=store,
             schema_summary=session.schema_summary,
         )
         return {
@@ -549,14 +542,15 @@ def run_pattern(
         question = inputs.get("question", "")
         if not question:
             raise HTTPException(status_code=400, detail="'question' is required")
-        from latent_insights.orchestration.patterns import human_in_the_loop_step
+        from latent_insights.orchestration.runner import RunnerMode, ThreadRunner
 
-        thread = state.create_thread(session_id, question, inputs.get("motivation", ""), "")
+        thread = store.create_thread(session_id, question, inputs.get("motivation", ""), "")
         thread_db = db.open_session_connection(session_id)
-        runner = human_in_the_loop_step(
+        runner = ThreadRunner(
             config=config, llm=llm, session_db=thread_db, queue=queue,
-            state_store=state, trace_store=trace_store,
-            thread=thread, schema_summary=session.schema_summary,
+            store=store, thread=thread,
+            schema_summary=session.schema_summary,
+            mode=RunnerMode.STEP_AND_PAUSE,
         )
         runner.start()
         return RunPatternResponse(
@@ -566,39 +560,40 @@ def run_pattern(
     raise HTTPException(status_code=400, detail=f"Pattern '{pattern_name}' not yet implemented")
 
 
-# --- Graph State (debug) ---
+# --- Thread State (debug) ---
 
 
 @router.get("/threads/{thread_id}/graph-state")
 def get_graph_state(thread_id: str, request: Request):
-    """Inspect the current LangGraph state for a thread."""
-    _, _, _, _, state, trace_store = _get_state(request)
+    """Inspect the current thread state (step history, move sequence)."""
+    _, _, _, _, store = _get_state(request)
 
-    thread = state.get_thread(thread_id)
+    thread = store.get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    spans = trace_store.get_step_spans(thread_id)
-    if not spans:
-        trace_store.load_trace(thread_id, thread.session_id)
-        spans = trace_store.get_step_spans(thread_id)
+    steps = store.get_steps(thread_id)
 
-    move_history = []
-    for span in spans:
-        move = span.attributes.get("move")
-        if move:
-            move_history.append(move)
+    move_history = [s.move for s in steps if s.move]
 
-    # Determine current node from thread status
     current_node = None
     if thread.status.value == "running":
-        current_node = "coordinator" if not spans or spans[-1].end_time else "worker"
+        current_node = "coordinator" if not steps or steps[-1].end_time else "worker"
 
+    last = steps[-1] if steps else None
     return GraphStateResponse(
         thread_id=thread_id,
-        step_number=len(spans),
+        step_number=len(steps),
         current_node=current_node,
         move_history=move_history,
         status=thread.status.value,
-        decision=spans[-1].attributes if spans else None,
+        decision=(
+            {
+                "move": last.move,
+                "instruction": last.instruction,
+                "result": last.result,
+                "view_created": last.view_created,
+            }
+            if last else None
+        ),
     )

@@ -10,10 +10,9 @@ import pytest
 from latent_insights.config import AppConfig
 from latent_insights.core.llm import LLMResponse
 from latent_insights.core.queue import Queue
-from latent_insights.core.state import StateStore
-from latent_insights.core.tracing import TraceStore
+from latent_insights.core.store import InvestigationStore
 from latent_insights.models import StreamEvent, ThreadStatus
-from latent_insights.orchestration.thread import ThreadRunner
+from latent_insights.orchestration.runner import ThreadRunner
 
 
 # ---------------------------------------------------------------------------
@@ -28,15 +27,13 @@ def setup(tmp_path):
 
     config = AppConfig()
     queue = Queue()
-    state = StateStore(data_dir=str(tmp_path))
-    trace_store = TraceStore(data_dir=str(tmp_path))
+    store = InvestigationStore(data_dir=str(tmp_path))
 
     return {
         "session_db": session_db,
         "config": config,
         "queue": queue,
-        "state": state,
-        "trace_store": trace_store,
+        "store": store,
     }
 
 
@@ -61,52 +58,54 @@ def _make_worker_response(summary):
 
 
 def _build_runner(setup_dict, thread, human_messages=None):
+    for msg in human_messages or []:
+        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+        target = msg.get("target", "thread") if isinstance(msg, dict) else "thread"
+        setup_dict["store"].push_pending_message(thread.id, content, target=target)
     return ThreadRunner(
         config=setup_dict["config"],
         llm=MagicMock(),
         session_db=setup_dict["session_db"],
         queue=setup_dict["queue"],
-        state=setup_dict["state"],
-        trace_store=setup_dict["trace_store"],
+        store=setup_dict["store"],
         thread=thread,
         schema_summary="test schema",
-        human_messages=human_messages or [],
     )
 
 
 # ---------------------------------------------------------------------------
-# StateStore pending messages
+# InvestigationStore pending messages
 # ---------------------------------------------------------------------------
 
 
 class TestPendingMessages:
     def test_push_and_drain(self, setup):
-        state = setup["state"]
-        state.push_pending_message("t1", "Hello")
-        state.push_pending_message("t1", "World")
+        store = setup["store"]
+        store.push_pending_message("t1", "Hello")
+        store.push_pending_message("t1", "World")
 
-        msgs = state.drain_pending_messages("t1")
+        msgs = store.drain_pending_messages("t1")
         assert [m["content"] for m in msgs] == ["Hello", "World"]
         assert all(m["target"] == "thread" for m in msgs)
 
     def test_drain_clears(self, setup):
-        state = setup["state"]
-        state.push_pending_message("t1", "msg")
-        state.drain_pending_messages("t1")
+        store = setup["store"]
+        store.push_pending_message("t1", "msg")
+        store.drain_pending_messages("t1")
 
-        assert state.drain_pending_messages("t1") == []
+        assert store.drain_pending_messages("t1") == []
 
     def test_drain_nonexistent_returns_empty(self, setup):
-        state = setup["state"]
-        assert state.drain_pending_messages("nonexistent") == []
+        store = setup["store"]
+        assert store.drain_pending_messages("nonexistent") == []
 
     def test_separate_threads(self, setup):
-        state = setup["state"]
-        state.push_pending_message("t1", "for-t1")
-        state.push_pending_message("t2", "for-t2")
+        store = setup["store"]
+        store.push_pending_message("t1", "for-t1")
+        store.push_pending_message("t2", "for-t2")
 
-        assert [m["content"] for m in state.drain_pending_messages("t1")] == ["for-t1"]
-        assert [m["content"] for m in state.drain_pending_messages("t2")] == ["for-t2"]
+        assert [m["content"] for m in store.drain_pending_messages("t1")] == ["for-t1"]
+        assert [m["content"] for m in store.drain_pending_messages("t2")] == ["for-t2"]
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +116,9 @@ class TestPendingMessages:
 class TestThreadInterrupt:
     def test_injected_message_reaches_coordinator(self, setup):
         """Messages injected via push_pending_message appear in coordinator's history."""
-        state = setup["state"]
-        session = state.create_session("test.csv")
-        thread = state.create_thread(session.id, "Test question?")
+        store = setup["store"]
+        session = store.create_session("test.csv")
+        thread = store.create_thread(session.id, "Test question?")
 
         coordinator_calls = [0]
         seen_messages = []
@@ -129,7 +128,7 @@ class TestThreadInterrupt:
                 coordinator_calls[0] += 1
                 # On first call, inject a pending message for the next step
                 if coordinator_calls[0] == 1:
-                    state.push_pending_message(thread.id, "Focus on outliers!")
+                    store.push_pending_message(thread.id, "Focus on outliers!")
                     content = _make_coordinator_response("CONTINUE", "FORAGE", "Run query")
                 elif coordinator_calls[0] == 2:
                     # Check if the injected message appears in the prompt
@@ -153,20 +152,18 @@ class TestThreadInterrupt:
         runner.start()
         runner.done_event.wait(timeout=10)
 
-        # The message was injected after step 1, so coordinator step 2 should have seen it
-        # We verify via the trace_store history which includes human messages
         assert coordinator_calls[0] >= 2
 
     def test_pending_messages_drained_after_use(self, setup):
         """After coordinator reads pending messages, they're gone."""
-        state = setup["state"]
-        state.push_pending_message("t1", "msg1")
+        store = setup["store"]
+        store.push_pending_message("t1", "msg1")
 
-        # Simulate what the coordinator node does
-        drained = state.drain_pending_messages("t1")
+        # Simulate what the coordinator loop does
+        drained = store.drain_pending_messages("t1")
         assert len(drained) == 1
         assert drained[0]["content"] == "msg1"
-        assert state.drain_pending_messages("t1") == []
+        assert store.drain_pending_messages("t1") == []
 
 
 # ---------------------------------------------------------------------------
@@ -232,9 +229,8 @@ class TestSessionFlowQuestionSource:
         from latent_insights.orchestration.session import SessionFlow
 
         config = AppConfig(question_source="human", data_dir=str(tmp_path))
-        state = setup["state"]
+        store = setup["store"]
         queue = setup["queue"]
-        trace_store = setup["trace_store"]
         mock_llm = MagicMock()
 
         # Profiler mock
@@ -249,8 +245,8 @@ class TestSessionFlowQuestionSource:
         with open(csv_path, "w") as f:
             f.write("a,b,c\n1,2,3\n4,5,6\n")
 
-        session = state.create_session(csv_path, "test")
-        flow = SessionFlow(config, mock_llm, db, queue, state, trace_store)
+        session = store.create_session(csv_path, "test")
+        flow = SessionFlow(config, mock_llm, db, queue, store)
 
         # Subscribe to events
         event_queue = queue.subscribe(session.id)
@@ -271,7 +267,6 @@ class TestSessionFlowQuestionSource:
         """When question_source=scout (default), scout runs normally."""
         config = AppConfig(question_source="scout")
         assert config.question_source == "scout"
-        # We just verify config; full scout integration is covered by existing tests
 
 
 class TestScoutContext:
@@ -309,17 +304,16 @@ class TestScoutContext:
         mock_llm = MagicMock()
         mock_llm.call = capture_llm_call
 
-        state = setup["state"]
+        store = setup["store"]
         queue = setup["queue"]
-        trace_store = setup["trace_store"]
         db = Database(data_dir=str(tmp_path))
 
         csv_path = str(tmp_path / "test.csv")
         with open(csv_path, "w") as f:
             f.write("revenue,churn\n100,0.1\n200,0.05\n")
 
-        session = state.create_session(csv_path, "test")
-        flow = SessionFlow(config, mock_llm, db, queue, state, trace_store)
+        session = store.create_session(csv_path, "test")
+        flow = SessionFlow(config, mock_llm, db, queue, store)
 
         # Don't spawn actual threads — just verify scout received context
         flow._spawn_threads = MagicMock()

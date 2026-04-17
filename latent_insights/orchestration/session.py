@@ -9,11 +9,10 @@ from latent_insights.agents.scout import Scout
 from latent_insights.config import AppConfig
 from latent_insights.core.llm import LLMClient
 from latent_insights.core.queue import Queue
-from latent_insights.core.state import StateStore
-from latent_insights.core.tracing import TraceStore
+from latent_insights.core.store import InvestigationStore
 from latent_insights.db.connection import Database
 from latent_insights.models import ScoutQuestion, StreamEvent, ThreadStatus
-from latent_insights.orchestration.thread import ThreadRunner
+from latent_insights.orchestration.runner import RunnerMode, ThreadRunner
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +26,13 @@ class SessionFlow:
         llm: LLMClient,
         db: Database,
         queue: Queue,
-        state: StateStore,
-        trace_store: TraceStore,
+        store: InvestigationStore,
     ):
         self.config = config
         self.llm = llm
         self.db = db
         self.queue = queue
-        self.state = state
-        self.trace_store = trace_store
+        self.store = store
         self.profiler = Profiler(llm, config.models.profiler)
         self.scout = Scout(llm, config.models.scout)
 
@@ -46,11 +43,6 @@ class SessionFlow:
         2. Run profiler -> store schema_summary
         3. Optionally run scout -> store scout_output (controlled by question_source)
         4. Spawn threads for scout/initial questions
-
-        question_source controls where seed questions come from:
-        - "scout": auto-discover questions via scout agent (default)
-        - "human": skip scout, only use initial_questions or wait for user
-        - "both": run scout AND use initial_questions
         """
         session_start = time.monotonic()
         question_source = self.config.question_source
@@ -61,15 +53,23 @@ class SessionFlow:
         )
 
         session_db, table_name = self.db.create_session_db(session_id, dataset_path)
-        self.state.update_session_table_name(session_id, table_name)
+        self.store.update_session_table_name(session_id, table_name)
 
         # Run profiler
         t0 = time.monotonic()
         schema_summary = self.profiler.call(session_db, table_name)
         profiler_ms = round((time.monotonic() - t0) * 1000)
 
-        self.state.update_session_schema(session_id, schema_summary)
+        self.store.update_session_schema(session_id, schema_summary)
         logger.info(f"Session {session_id} profiled ({profiler_ms}ms)")
+
+        self.queue.emit(StreamEvent(
+            session_id=session_id,
+            thread_id="",
+            event_type="schema_summary_ready",
+            message="Dataset profiled.",
+            data={"schema_summary": schema_summary},
+        ))
 
         # Close read-write connection — all further access is read-only
         session_db.close()
@@ -98,14 +98,12 @@ class SessionFlow:
                 message="Session profiled. Waiting for human questions.",
                 data={
                     "question_source": "human",
-                    "schema_summary": schema_summary[:500],
                 },
             ))
-            self.state.dump_session(session_id)
+            self.store.save_session(session_id)
             return session_id
 
         # Run scout with a read-only connection
-        # Prepend user-provided scout_context if available
         scout_schema = schema_summary
         scout_context = self.config.scout_context
         if scout_context:
@@ -126,7 +124,7 @@ class SessionFlow:
         scout_ms = round((time.monotonic() - t0) * 1000)
         scout_db.close()
 
-        self.state.update_session_scout(session_id, asdict(scout_output))
+        self.store.update_session_scout(session_id, asdict(scout_output))
 
         # Apply max_threads budget to scout questions
         scout_questions = scout_output.questions
@@ -163,16 +161,16 @@ class SessionFlow:
 
         self._spawn_threads(session_id, scout_questions, schema_summary)
 
-        self.state.dump_session(session_id)
+        self.store.save_session(session_id)
         return session_id
 
     def continue_(self, session_id: str) -> str:
         """
         Continue an existing session:
         1. Resume any WAITING threads with a default message
-        2. Re-run scout with existing findings as context → spawn new threads
+        2. Re-run scout with existing findings as context -> spawn new threads
         """
-        session = self.state.get_session(session_id)
+        session = self.store.get_session(session_id)
         if session is None:
             raise ValueError(f"Session {session_id} not found")
 
@@ -180,9 +178,12 @@ class SessionFlow:
         if not schema_summary:
             raise ValueError(f"Session {session_id} has no schema — run initial setup first")
 
-        threads = self.state.get_threads(session_id)
+        threads = self.store.get_threads(session_id)
 
-        # 1. Resume all WAITING and COMPLETE threads
+        # 1. Resume all WAITING and COMPLETE threads. Push a "continue"
+        # message to the pending queue first; the runner drains it into
+        # a HUMAN_INPUT step on resume, ahead of the next coordinator
+        # step.
         resumable = [t for t in threads if t.status in (ThreadStatus.WAITING, ThreadStatus.COMPLETE)]
         for t in resumable:
             message = (
@@ -190,17 +191,16 @@ class SessionFlow:
                 if t.status == ThreadStatus.WAITING
                 else "The previous analysis is complete. Dig deeper — are there follow-up questions, edge cases, or subgroups worth investigating?"
             )
+            self.store.push_pending_message(t.id, message, target="session")
             thread_db = self.db.open_session_connection(session_id)
             runner = ThreadRunner(
                 config=self.config,
                 llm=self.llm,
                 session_db=thread_db,
                 queue=self.queue,
-                state=self.state,
-                trace_store=self.trace_store,
+                store=self.store,
                 thread=t,
                 schema_summary=schema_summary,
-                human_messages=[message],
             )
             runner.resume()
 
@@ -225,7 +225,6 @@ class SessionFlow:
 
         scout_schema = schema_summary + prior_context
 
-        # Prepend scout_context if provided
         scout_context = self.config.scout_context
         if scout_context:
             scout_schema = (
@@ -279,16 +278,16 @@ class SessionFlow:
 
         self._spawn_threads(session_id, new_questions, schema_summary)
 
-        self.state.dump_session(session_id)
+        self.store.save_session(session_id)
         return session_id
 
     def _spawn_threads(self, session_id: str, questions, schema_summary: str):
-        """Create and start threads for a list of questions using the configured pattern.
+        """Create and start threads for a list of questions.
 
         Pattern dispatch:
-        - "coordinator_worker" (default): one ThreadRunner per question, independent
-        - "fan_out": spawn all questions as a fan-out with post-hoc synthesis
-        - "human_in_the_loop": each thread pauses after every step for human review
+        - "coordinator_worker" (default): one ThreadRunner per question
+        - "fan_out": spawn all questions as fan-out with post-hoc synthesis
+        - "human_in_the_loop": each thread pauses after every step
         """
         pattern = self.config.default_pattern
         if not questions:
@@ -304,35 +303,19 @@ class SessionFlow:
                 llm=self.llm,
                 db=self.db,
                 queue=self.queue,
-                state_store=self.state,
-                trace_store=self.trace_store,
+                store=self.store,
                 schema_summary=schema_summary,
             )
             return
 
-        if pattern == "human_in_the_loop":
-            from latent_insights.orchestration.patterns import human_in_the_loop_step
-            for q in questions:
-                thread = self.state.create_thread(
-                    session_id, q.question, q.motivation, q.entry_point,
-                )
-                thread_db = self.db.open_session_connection(session_id)
-                runner = human_in_the_loop_step(
-                    config=self.config,
-                    llm=self.llm,
-                    session_db=thread_db,
-                    queue=self.queue,
-                    state_store=self.state,
-                    trace_store=self.trace_store,
-                    thread=thread,
-                    schema_summary=schema_summary,
-                )
-                runner.start()
-            return
+        mode = (
+            RunnerMode.STEP_AND_PAUSE
+            if pattern == "human_in_the_loop"
+            else RunnerMode.LOOP_UNTIL_DONE
+        )
 
-        # Default: coordinator_worker
         for q in questions:
-            thread = self.state.create_thread(
+            thread = self.store.create_thread(
                 session_id, q.question, q.motivation, q.entry_point,
             )
             thread_db = self.db.open_session_connection(session_id)
@@ -341,9 +324,9 @@ class SessionFlow:
                 llm=self.llm,
                 session_db=thread_db,
                 queue=self.queue,
-                state=self.state,
-                trace_store=self.trace_store,
+                store=self.store,
                 thread=thread,
                 schema_summary=schema_summary,
+                mode=mode,
             )
             runner.start()

@@ -11,8 +11,7 @@ import pytest
 from latent_insights.config import AppConfig
 from latent_insights.core.llm import LLMResponse
 from latent_insights.core.queue import Queue
-from latent_insights.core.state import StateStore
-from latent_insights.core.tracing import TraceStore
+from latent_insights.core.store import InvestigationStore
 from latent_insights.models import ThreadStatus
 
 
@@ -20,14 +19,12 @@ from latent_insights.models import ThreadStatus
 def pattern_setup(tmp_path):
     config = AppConfig()
     queue = Queue()
-    state = StateStore(data_dir=str(tmp_path))
-    trace_store = TraceStore(data_dir=str(tmp_path))
+    store = InvestigationStore(data_dir=str(tmp_path))
     try:
         yield {
             "config": config,
             "queue": queue,
-            "state": state,
-            "trace_store": trace_store,
+            "store": store,
             "tmp_path": tmp_path,
         }
     finally:
@@ -78,75 +75,111 @@ def _make_mock_call(done_on_step=2):
 
 
 class TestFanOutWithSynthesis:
-    def test_spawns_multiple_threads_plus_synthesis(self, pattern_setup, tmp_path):
-        """fan_out creates N analysis threads + schedules a synthesis."""
+    def test_spawns_multiple_threads_and_fires_synthesis_on_last_done(
+        self, pattern_setup, tmp_path,
+    ):
+        """fan_out creates N analysis threads and triggers synthesis from
+        the last-to-finish runner's ``on_done`` callback — no blocking
+        pool worker held on a wait.
+        """
         from latent_insights.db.connection import Database
         from latent_insights.orchestration.patterns import fan_out_with_synthesis
 
         setup = pattern_setup
-        state = setup["state"]
+        store = setup["store"]
         config = setup["config"]
         queue = setup["queue"]
-        trace_store = setup["trace_store"]
 
-        # Create a real DB for thread runners
         db = Database(data_dir=str(tmp_path))
         csv_path = str(tmp_path / "test.csv")
         with open(csv_path, "w") as f:
             f.write("a,b,c\n1,2,3\n4,5,6\n")
-        session = state.create_session(csv_path, "test")
+        session = store.create_session(csv_path, "test")
         session_db, _ = db.create_session_db(session.id, csv_path)
         session_db.close()
-        state.update_session_schema(session.id, "test schema")
+        store.update_session_schema(session.id, "test schema")
 
-        # Patch ThreadRunner.start to be a no-op, AND patch queue.schedule
-        # so the synthesis wait task never runs (it would block for hours
-        # waiting on done_events that never fire).
-        with patch("latent_insights.orchestration.thread.ThreadRunner.start"), \
-             patch.object(queue, "schedule") as mock_schedule:
+        # Capture on_done callbacks off each ThreadRunner so we can
+        # simulate analysis threads finishing (without actually running
+        # them). ThreadRunner.start is a no-op in this test.
+        captured_callbacks: list = []
+        original_init = None
+
+        from latent_insights.orchestration.runner import ThreadRunner
+
+        def capture_init(self, **kwargs):
+            captured_callbacks.append(kwargs.get("on_done"))
+            # Assign the minimum attrs start()/no-op needs; skip the
+            # heavyweight real __init__ that opens DB connections etc.
+            self.thread = kwargs["thread"]
+            self.on_done = kwargs.get("on_done")
+            self.done_event = __import__("threading").Event()
+
+        with patch.object(ThreadRunner, "__init__", capture_init), \
+             patch.object(ThreadRunner, "start", lambda self: None):
             thread_ids = fan_out_with_synthesis(
                 questions=["Q1?", "Q2?", "Q3?"],
                 session_id=session.id,
                 config=config, llm=MagicMock(), db=db, queue=queue,
-                state_store=state, trace_store=trace_store,
+                store=store,
                 schema_summary="test schema",
             )
-            # Verify synthesis task was scheduled
-            assert mock_schedule.called
-            scheduled_task = mock_schedule.call_args.kwargs.get("task_id", "")
-            assert "fanout-synth" in scheduled_task
 
-        # Should have created 3 analysis threads
-        assert len(thread_ids) == 3
-        threads = state.get_threads(session.id)
-        assert len(threads) == 3
-        assert threads[0].seed_question == "Q1?"
-        assert threads[1].seed_question == "Q2?"
-        assert threads[2].seed_question == "Q3?"
+            # 3 analysis threads created, each handed an on_done callback.
+            assert len(thread_ids) == 3
+            threads = store.get_threads(session.id)
+            assert [t.seed_question for t in threads] == ["Q1?", "Q2?", "Q3?"]
+            assert len(captured_callbacks) == 3
+            assert all(cb is not None for cb in captured_callbacks)
+
+            # Simulate finish-callback firing from the first two runners —
+            # the counter has not yet reached zero, so synthesis must NOT
+            # have started (no 4th thread).
+            captured_callbacks[0]()
+            captured_callbacks[1]()
+            assert len(store.get_threads(session.id)) == 3
+
+            # Give the analysis threads finished-looking summaries so the
+            # synthesizer has something to work with, then fire the last
+            # callback. The synthesis thread is created from within it.
+            for tid in thread_ids:
+                store.update_thread_status(
+                    tid,
+                    store.get_thread(tid).status,  # keep status
+                    summary=f"Summary for {tid[:4]}",
+                )
+            captured_callbacks[2]()
+
+            # A 4th thread (the synthesis thread) now exists.
+            all_threads = store.get_threads(session.id)
+            assert len(all_threads) == 4
+            synth = all_threads[-1]
+            assert synth.motivation == "Fan-out synthesis"
+            assert "Summary for" in synth.seed_question
 
     def test_fan_out_differs_from_coordinator_worker(self, pattern_setup, tmp_path):
         """fan_out creates threads with different questions; coordinator_worker is single-question."""
         setup = pattern_setup
-        state = setup["state"]
+        store = setup["store"]
 
-        session = state.create_session("test.csv", "test")
+        session = store.create_session("test.csv", "test")
 
         # coordinator_worker: 1 thread
-        t1 = state.create_thread(session.id, "Single question?")
-        assert len(state.get_threads(session.id)) == 1
+        t1 = store.create_thread(session.id, "Single question?")
+        assert len(store.get_threads(session.id)) == 1
 
         # fan_out: multiple threads
-        t2 = state.create_thread(session.id, "Q1?")
-        t3 = state.create_thread(session.id, "Q2?")
-        t4 = state.create_thread(session.id, "Q3?")
-        threads = state.get_threads(session.id)
+        t2 = store.create_thread(session.id, "Q1?")
+        t3 = store.create_thread(session.id, "Q2?")
+        t4 = store.create_thread(session.id, "Q3?")
+        threads = store.get_threads(session.id)
         assert len(threads) == 4
         questions = {t.seed_question for t in threads}
         assert questions == {"Single question?", "Q1?", "Q2?", "Q3?"}
 
 
 # ---------------------------------------------------------------------------
-# human_in_the_loop_step
+# human_in_the_loop (via RunnerMode.STEP_AND_PAUSE)
 # ---------------------------------------------------------------------------
 
 
@@ -154,24 +187,23 @@ class TestHumanInTheLoop:
     def test_hitl_pauses_after_one_step(self, pattern_setup, tmp_path):
         """human_in_the_loop runs one step then sets thread to WAITING."""
         from latent_insights.db.connection import Database
-        from latent_insights.orchestration.patterns import human_in_the_loop_step
+        from latent_insights.orchestration.runner import RunnerMode, ThreadRunner
 
         setup = pattern_setup
-        state = setup["state"]
+        store = setup["store"]
         config = setup["config"]
         queue = setup["queue"]
-        trace_store = setup["trace_store"]
 
         db = Database(data_dir=str(tmp_path))
         csv_path = str(tmp_path / "test.csv")
         with open(csv_path, "w") as f:
             f.write("a,b,c\n1,2,3\n4,5,6\n")
-        session = state.create_session(csv_path, "test")
+        session = store.create_session(csv_path, "test")
         session_db, _ = db.create_session_db(session.id, csv_path)
         session_db.close()
-        state.update_session_schema(session.id, "test schema")
+        store.update_session_schema(session.id, "test schema")
 
-        thread = state.create_thread(session.id, "HITL question?")
+        thread = store.create_thread(session.id, "HITL question?")
 
         # Mock that runs 1 step then reports CONTINUE (not DONE)
         call_count = [0]
@@ -192,10 +224,11 @@ class TestHumanInTheLoop:
             return LLMResponse(content="{}", model=model)
 
         thread_db = db.open_session_connection(session.id)
-        runner = human_in_the_loop_step(
+        runner = ThreadRunner(
             config=config, llm=MagicMock(), session_db=thread_db,
-            queue=queue, state_store=state, trace_store=trace_store,
+            queue=queue, store=store,
             thread=thread, schema_summary="test schema",
+            mode=RunnerMode.STEP_AND_PAUSE,
         )
         runner.coordinator.llm.call = mock_call
         runner.worker.llm.call = mock_call
@@ -204,7 +237,7 @@ class TestHumanInTheLoop:
         runner.done_event.wait(timeout=10)
 
         # Thread should be WAITING, not COMPLETE or RUNNING
-        final = state.get_thread(thread.id)
+        final = store.get_thread(thread.id)
         assert final.status in (ThreadStatus.WAITING, ThreadStatus.COMPLETE), (
             f"Expected WAITING or COMPLETE, got {final.status}"
         )
@@ -226,7 +259,7 @@ class TestHumanInTheLoop:
         event_queue = queue.subscribe(session_id)
 
         from latent_insights.models import StreamEvent
-        # Simulate what the HITL runner emits when it pauses
+        # Simulate what the HITL loop emits when it pauses
         queue.emit(StreamEvent(
             session_id=session_id,
             thread_id="test-thread",
@@ -258,7 +291,6 @@ class TestPatternRegistry:
         assert "coordinator_worker" in PATTERN_REGISTRY
         assert "fan_out" in PATTERN_REGISTRY
         assert "human_in_the_loop" in PATTERN_REGISTRY
-        assert "sequential_chain" in PATTERN_REGISTRY
 
     def test_patterns_have_different_descriptions(self):
         from latent_insights.orchestration.patterns import PATTERN_REGISTRY
@@ -291,33 +323,32 @@ class TestSessionFlowPatternDispatch:
         from latent_insights.orchestration.session import SessionFlow
 
         config = AppConfig(default_pattern="coordinator_worker", data_dir=str(tmp_path))
-        state = pattern_setup["state"]
+        store = pattern_setup["store"]
         queue = pattern_setup["queue"]
-        trace_store = pattern_setup["trace_store"]
         db = Database(data_dir=str(tmp_path))
 
         csv_path = str(tmp_path / "test.csv")
         with open(csv_path, "w") as f:
             f.write("a,b,c\n1,2,3\n")
-        session = state.create_session(csv_path, "test")
+        session = store.create_session(csv_path, "test")
         session_db, _ = db.create_session_db(session.id, csv_path)
         session_db.close()
-        state.update_session_schema(session.id, "test schema")
+        store.update_session_schema(session.id, "test schema")
 
-        flow = SessionFlow(config, MagicMock(), db, queue, state, trace_store)
+        flow = SessionFlow(config, MagicMock(), db, queue, store)
 
         questions = [
             ScoutQuestion(question="Q1?", motivation="", entry_point="", difficulty="moderate"),
             ScoutQuestion(question="Q2?", motivation="", entry_point="", difficulty="moderate"),
         ]
 
-        with patch("latent_insights.orchestration.thread.ThreadRunner.start") as mock_start:
+        with patch("latent_insights.orchestration.runner.ThreadRunner.start") as mock_start:
             flow._spawn_threads(session.id, questions, "test schema")
             # coordinator_worker: one ThreadRunner.start() per question
             assert mock_start.call_count == 2
 
         # Two threads created
-        threads = state.get_threads(session.id)
+        threads = store.get_threads(session.id)
         assert len(threads) == 2
 
     def test_default_pattern_fan_out(self, pattern_setup, tmp_path):
@@ -327,19 +358,18 @@ class TestSessionFlowPatternDispatch:
         from latent_insights.orchestration.session import SessionFlow
 
         config = AppConfig(default_pattern="fan_out", data_dir=str(tmp_path))
-        state = pattern_setup["state"]
+        store = pattern_setup["store"]
         queue = pattern_setup["queue"]
-        trace_store = pattern_setup["trace_store"]
         db = Database(data_dir=str(tmp_path))
 
         csv_path = str(tmp_path / "test.csv")
         with open(csv_path, "w") as f:
             f.write("a,b,c\n1,2,3\n")
-        session = state.create_session(csv_path, "test")
+        session = store.create_session(csv_path, "test")
         session_db, _ = db.create_session_db(session.id, csv_path)
         session_db.close()
 
-        flow = SessionFlow(config, MagicMock(), db, queue, state, trace_store)
+        flow = SessionFlow(config, MagicMock(), db, queue, store)
 
         questions = [
             ScoutQuestion(question="Q1?", motivation="", entry_point="", difficulty="moderate"),
@@ -358,39 +388,37 @@ class TestSessionFlowPatternDispatch:
             assert call_kwargs["session_id"] == session.id
 
     def test_default_pattern_human_in_the_loop(self, pattern_setup, tmp_path):
-        """default_pattern='human_in_the_loop' uses human_in_the_loop_step."""
+        """default_pattern='human_in_the_loop' uses ThreadRunner with STEP_AND_PAUSE."""
         from latent_insights.db.connection import Database
         from latent_insights.models import ScoutQuestion
         from latent_insights.orchestration.session import SessionFlow
 
         config = AppConfig(default_pattern="human_in_the_loop", data_dir=str(tmp_path))
-        state = pattern_setup["state"]
+        store = pattern_setup["store"]
         queue = pattern_setup["queue"]
-        trace_store = pattern_setup["trace_store"]
         db = Database(data_dir=str(tmp_path))
 
         csv_path = str(tmp_path / "test.csv")
         with open(csv_path, "w") as f:
             f.write("a,b,c\n1,2,3\n")
-        session = state.create_session(csv_path, "test")
+        session = store.create_session(csv_path, "test")
         session_db, _ = db.create_session_db(session.id, csv_path)
         session_db.close()
 
-        flow = SessionFlow(config, MagicMock(), db, queue, state, trace_store)
+        flow = SessionFlow(config, MagicMock(), db, queue, store)
 
         questions = [
             ScoutQuestion(question="Q1?", motivation="", entry_point="", difficulty="moderate"),
             ScoutQuestion(question="Q2?", motivation="", entry_point="", difficulty="moderate"),
         ]
 
-        with patch(
-            "latent_insights.orchestration.patterns.human_in_the_loop_step"
-        ) as mock_hitl:
-            mock_runner = MagicMock()
-            mock_hitl.return_value = mock_runner
+        with patch("latent_insights.orchestration.runner.ThreadRunner.start") as mock_start:
             flow._spawn_threads(session.id, questions, "test schema")
-            assert mock_hitl.call_count == 2
-            assert mock_runner.start.call_count == 2
+            assert mock_start.call_count == 2
+
+        # Two threads created
+        threads = store.get_threads(session.id)
+        assert len(threads) == 2
 
     def test_empty_questions_does_nothing(self, pattern_setup, tmp_path):
         """_spawn_threads with empty list returns early, no threads created."""
@@ -398,13 +426,12 @@ class TestSessionFlowPatternDispatch:
         from latent_insights.orchestration.session import SessionFlow
 
         config = AppConfig(default_pattern="coordinator_worker", data_dir=str(tmp_path))
-        state = pattern_setup["state"]
+        store = pattern_setup["store"]
         queue = pattern_setup["queue"]
-        trace_store = pattern_setup["trace_store"]
         db = Database(data_dir=str(tmp_path))
 
-        session = state.create_session("test.csv", "test")
-        flow = SessionFlow(config, MagicMock(), db, queue, state, trace_store)
+        session = store.create_session("test.csv", "test")
+        flow = SessionFlow(config, MagicMock(), db, queue, store)
 
         flow._spawn_threads(session.id, [], "test schema")
-        assert len(state.get_threads(session.id)) == 0
+        assert len(store.get_threads(session.id)) == 0

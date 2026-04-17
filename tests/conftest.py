@@ -8,15 +8,21 @@ import duckdb
 import pytest
 
 from latent_insights.core.llm import LLMClient, LLMResponse
-from latent_insights.core.state import StateStore
+from latent_insights.core.store import InvestigationStore
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
 
 
 @pytest.fixture
-def state_store(tmp_path):
-    """In-memory StateStore backed by tmp_path for persistence tests."""
-    return StateStore(data_dir=str(tmp_path))
+def store(tmp_path):
+    """In-memory InvestigationStore backed by tmp_path for persistence tests."""
+    return InvestigationStore(data_dir=str(tmp_path))
+
+
+# Backwards-compatible alias used by older tests
+@pytest.fixture
+def state_store(store):
+    return store
 
 
 @pytest.fixture

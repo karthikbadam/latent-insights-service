@@ -20,6 +20,7 @@ class ThreadStatus(str, Enum):
 
 
 class MoveType(str, Enum):
+    # Coordinator-picked analytical moves
     SCOPE = "SCOPE"
     FORAGE = "FORAGE"
     FRAME = "FRAME"
@@ -27,6 +28,14 @@ class MoveType(str, Enum):
     SYNTHESIZE = "SYNTHESIZE"
     STUCK = "STUCK"
     DONE = "DONE"
+    # Mixed-initiative moves — steps contributed by the human or
+    # representing the thread's waiting state. These aren't chosen by
+    # the coordinator; they're committed directly by the runner when a
+    # human posts guidance or when a thread enters a terminal waiting
+    # state. They live in the step timeline alongside the analytical
+    # moves so the UI can render every step uniformly.
+    HUMAN_INPUT = "HUMAN_INPUT"
+    WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
 
 
 class CoordinatorStatus(str, Enum):
@@ -61,20 +70,6 @@ class Thread:
     running_summary: str | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
-
-
-@dataclass
-class Step:
-    id: str
-    thread_id: str
-    step_number: int
-    move: MoveType
-    instruction: str
-    result: str
-    view_created: str | None = None
-    duration_ms: int | None = None
-    llm_calls: list[dict] | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
 
 
 # --- Agent I/O ---
@@ -118,9 +113,27 @@ class WorkerResult:
 
 @dataclass
 class StreamEvent:
+    """
+    SSE event payload. `data` fields are flattened into the top-level JSON
+    by the SSE serializer (api/sse.py), so keys in `data` become sibling
+    fields to `thread_id`/`message`/`timestamp` on the wire.
+
+    Field naming and semantics are aligned with api/schemas.py::StepEvent so
+    the SSE stream can be used to reconstruct the same shapes the REST
+    snapshot returns. Any `duration_ms`/`total_ms` field is always an integer
+    in milliseconds.
+
+    Known event_types:
+      session-scoped:  schema_summary_ready, scout_done, session_ready,
+                       message_injected, synthesis_start
+      thread-scoped:   thread_start, thread_resumed, step_start, llm_call,
+                       tool_call, step_complete, thread_complete,
+                       thread_waiting
+    """
+
     session_id: str
     thread_id: str
-    event_type: str  # scout_done, thread_start, step_start, llm_call, tool_call, step_complete, thread_complete, thread_waiting
+    event_type: str
     message: str  # Human-readable, e.g. "[abc123] FORAGE: Analyzing orbital periods..."
     data: dict = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)

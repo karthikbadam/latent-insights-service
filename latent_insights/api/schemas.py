@@ -20,6 +20,10 @@ class SessionConfig(BaseModel):
     temp_coordinator: float | None = None
     temp_worker: float | None = None
     max_threads: int | None = None
+    # Alias for max_threads + num_scout_seed_questions: if set, caps both the
+    # number of scout questions generated AND the total spawned thread count.
+    # max_threads takes precedence when both are provided.
+    seed_threads: int | None = None
     max_worker_retries: int | None = None
     max_consecutive_errors: int | None = None
     max_repeated_moves: int | None = None
@@ -32,6 +36,8 @@ class SessionConfig(BaseModel):
     scout_context: str | None = None
     # Default pattern for session-spawned threads
     default_pattern: str | None = None
+    # Summarize the thread history every N steps (0 or very large to disable)
+    summarize_every_steps: int | None = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -46,6 +52,11 @@ class CreateThreadRequest(BaseModel):
 
 class PostMessageRequest(BaseModel):
     content: str = Field(min_length=1)
+    # Only honored on ``POST /api/sessions/{id}/messages``. When True,
+    # the message is used as the seed question for a brand-new thread
+    # instead of being broadcast into existing threads. Ignored by
+    # ``POST /api/threads/{id}/messages`` (always thread-scoped).
+    as_new_thread: bool = False
 
 
 # --- Response schemas ---

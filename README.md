@@ -3,7 +3,7 @@
 Parallel-agent sensemaking for collaborative data analysis.
 For any uploaded dataset, the system discovers questions, spawns analytical threads, executes LLM orchestrated tool calls, and builds insights with you.
 
-The agent is designed to follow steps from a sensemaking process such as foraging for evidence, framing the hypothesis, investigating the data, and synthesizing the results. 
+The agent is designed to follow steps from a sensemaking process such as foraging for evidence, framing the hypothesis, investigating the data, and synthesizing the results.
 
 ## Install
 
@@ -38,8 +38,7 @@ export MODEL_WORKER=gemma3:4b
 from latent_insights import AppConfig
 from latent_insights.core.llm import LLMClient
 from latent_insights.core.queue import Queue
-from latent_insights.core.state import StateStore
-from latent_insights.core.tracing import TraceStore
+from latent_insights.core.store import InvestigationStore
 from latent_insights.db.connection import Database
 from latent_insights.orchestration.session import SessionFlow
 
@@ -52,11 +51,11 @@ llm = LLMClient(
 )
 db = Database(data_dir=config.data_dir)
 queue = Queue()
-state = StateStore(data_dir=config.data_dir)
-trace = TraceStore(data_dir=config.data_dir)
+store = InvestigationStore(data_dir=config.data_dir)
 
-flow = SessionFlow(config, llm, db, queue, state, trace)
-flow.create(session_id, "path/to/data.csv")
+flow = SessionFlow(config, llm, db, queue, store)
+session = store.create_session("path/to/data.csv")
+flow.create(session.id, "path/to/data.csv")
 ```
 
 ## Development
@@ -112,11 +111,20 @@ POST /api/sessions (upload CSV)
          └────────────────────┴───────────────────────┘
                               │
                     GET /api/sessions/{id}/events (SSE)
-                    ← llm_call, tool_call, step, complete
+                    ← schema_summary_ready, scout_done,
+                      thread_start, step_start, llm_call,
+                      tool_call, step_complete,
+                      thread_complete, thread_waiting
 ```
 
 ### Sensemaking moves
 
+Every row in a thread's timeline is a **step** with a `move`. Most are
+coordinator-picked analytical moves; the mixed-initiative moves
+(`HUMAN_INPUT`, `WAITING_FOR_HUMAN`) are committed by the runner when
+a human contributes guidance or when the thread is waiting for one.
+
+**Coordinator-picked analytical moves** — the coordinator chooses one each step, no fixed order.
 
 | Move            | Purpose                                                      |
 | --------------- | ------------------------------------------------------------ |
@@ -124,10 +132,39 @@ POST /api/sessions (upload CSV)
 | **FORAGE**      | Exploratory analysis — distributions, correlations, outliers |
 | **FRAME**       | Propose tentative hypothesis as testable claim               |
 | **INTERROGATE** | Stress-test the frame — contradictions, confounds            |
-| **SYNTHESIZE**  | Thread conclusion — finding, confidence, limitations         |
+| **SYNTHESIZE**  | Terminal summary — writes the final finding from prior steps. The worker receives no SQL tool on this move; it can only condense what earlier steps found. |
 
+**Mixed-initiative moves** — committed by the runner, not the coordinator.
 
-The coordinator picks moves freely based on data — no fixed order.
+| Move                    | Purpose                                                      |
+| ----------------------- | ------------------------------------------------------------ |
+| **HUMAN_INPUT**         | A human's message posted via `POST /api/{sessions,threads}/{id}/messages`. The step's `result` is the message content; `instruction` is the target (`thread` \| `session`). No LLM/SQL runs inside the step. Posting mid-step causes the runner to **flush** the in-flight step (soft: the current pool task finishes, then the next callback pivots) and commit a HUMAN_INPUT step before resuming the coordinator loop. |
+| **WAITING_FOR_HUMAN**   | Terminal step committed when the thread enters the waiting state (coordinator stuck, repeated-moves guard, retry-exhausted, context-exhausted, unexpected error, or HITL pause). The step's `result` is the question the thread wants answered; `instruction` carries any accompanying context. The sibling `thread_waiting` SSE event is a thin terminal marker — it no longer duplicates the question/context. |
+
+### State management
+
+Three components own all per-thread state:
+
+| Component | File | Role |
+| --- | --- | --- |
+| **`InvestigationStore`** | `core/store.py` | In-memory store for `Session`, `Thread`, and `Step` records plus pending human messages. Persists one JSON file per session at `data/sessions/{id}.json` whose shape matches the `SessionResponse` REST snapshot — saved files and live snapshots are byte-for-byte equivalent. |
+| **`ThreadRunner`** | `orchestration/runner.py` | Drives one thread through its coordinator→worker lifecycle in continuation-passing style. Each LLM call, each SQL tool call, and the periodic history summarizer is submitted as a separate task to the shared `Queue`, chained via `future.add_done_callback`. Pool workers are released between calls, so N active threads can share a pool of `max_workers` without one thread starving another. |
+| **`Recorder`** | `core/recorder.py` | Dual-write helper: every event the runner emits goes through one method (`recorder.llm_call`, `recorder.tool_call`, `recorder.step_start`, `recorder.step_complete`, `recorder.human_input_step`, `recorder.thread_complete`, `recorder.thread_waiting`) that records it on the current step (or commits a new mixed-initiative step in the case of `human_input_step` / `thread_waiting`) **and** emits the matching `StreamEvent` over SSE. Step rows and SSE frames cannot drift. |
+
+Supporting pieces:
+
+- **`Queue`** (`core/queue.py`) — thread pool for scheduling, plus the session→subscriber registry for SSE.
+- **`Coordinator`** and **`Worker`** (`agents/`) — agent classes called by the runner; the worker exposes a granular API (`prepare_tool_calls`, `record_tool_result`, `apply_error_guardrails`, `handle_final`) so each SQL exec can be its own pool task.
+
+The `Step` dataclass is flat and mirrors `api.schemas.StepResponse` directly (`move`, `instruction`, `result`, `view_created`, `events[]`, `start_time`, `end_time`). Its `events[]` are flat `StepEvent` dicts (`type`, `timestamp`, plus type-specific fields like `sql` or `response`) — the same shape clients consume from REST and SSE.
+
+### Resilience behaviors
+
+- **Transient LLM errors** (connection resets, 429, 5xx, timeouts) retry inside `LLMClient.call` with exponential backoff. If retries exhaust, the thread enters `thread_waiting` with `reason=retry_exhausted`.
+- **Context-length errors** (400 with "maximum context length" in the body) are caught by the runner, which closes the current step with a self-describing result — *"Context overflow: this step's prompt exceeded the model's context window. The next move should narrow the data…"* — and lets the coordinator read that result through `format_thread_history` on the next step to pick a simpler move. After `max_context_recoveries` (default 2) attempts in a thread, it falls through to `thread_waiting` with `reason=context_exhausted`.
+- **Move repetition guard** — if the coordinator picks the same move `max_repeated_moves` (default 10) steps in a row without `DONE`, the thread enters `thread_waiting` with `reason=repeated_moves`.
+- **Early STUCK override** — if the coordinator returns `STUCK` on step 1 or 2, the runner overrides it to `FORAGE` to give the thread a chance to find something before asking for help.
+- **Periodic summarization** — every `summarize_every_steps` steps (default 10; set `SUMMARIZE_EVERY_STEPS` env var or pass `summarize_every_steps` in the per-session config to change; 0 disables) the runner schedules a summarizer LLM call that condenses the history into a `running_summary`, which prepends future coordinator prompts.
 
 ## API
 
@@ -137,13 +174,61 @@ The coordinator picks moves freely based on data — no fixed order.
 | `GET /health`                      | Health check                                                  |
 | `POST /api/sessions`               | Create session (upload CSV + profile + scout + spawn threads) |
 | `GET /api/sessions`                | List all sessions with metadata and thread counts             |
-| `GET /api/sessions/{id}`           | Full session state with threads and steps                     |
+| `GET /api/sessions/{id}`           | Full session state with threads, steps, and step events       |
+| `GET /api/sessions/{id}/saved`     | Previously saved session snapshot from `data/sessions/{id}.json` |
 | `POST /api/sessions/{id}/threads`  | Create custom thread with a question                          |
 | `POST /api/sessions/{id}/continue` | Resume stuck threads + scout new questions                    |
+| `POST /api/sessions/{id}/messages` | Broadcast guidance to all running/waiting threads. Body accepts `as_new_thread: true` to instead spawn a **new thread** seeded with the message (existing threads untouched). |
 | `GET /api/threads/{id}`            | Get single thread with steps and events                       |
-| `POST /api/threads/{id}/messages`  | Reply to stuck thread, resuming it                            |
-| `GET /api/sessions/{id}/events`    | SSE event stream (llm_call, tool_call, step, complete)        |
+| `POST /api/threads/{id}/messages`  | Reply to or interrupt a thread                                |
+| `GET /api/sessions/{id}/events`    | SSE event stream (see event list below)                       |
+| `GET /api/patterns`                | List available agentic patterns                               |
+| `POST /api/sessions/{id}/patterns/{name}` | Run a named pattern (coordinator_worker, fan_out, human_in_the_loop) |
+| `GET /api/threads/{id}/graph-state` | Debug view — step count, move history, current status        |
 | `GET /api/system/stats`            | Session and thread counts                                     |
+
+
+### SSE events
+
+`GET /api/sessions/{id}/events` streams JSON events. Field names and
+semantics align with the REST snapshot (`StepEvent` / `StepResponse` /
+`ThreadResponse` / `SessionResponse`) so both sources can populate the same
+client-side view model.
+
+| Event                  | Scope    | Key fields                                                              |
+| ---------------------- | -------- | ----------------------------------------------------------------------- |
+| `schema_summary_ready` | session  | `schema_summary` (full profiler output)                                 |
+| `scout_done`           | session  | `question_count`, `questions[]`                                         |
+| `session_ready`        | session  | `question_source` (emitted only in `human` mode)                        |
+| `message_injected`     | session/thread | `content`, `target` (`thread` \| `session` \| `new_thread`), `injected_threads`, `resumed_threads`, `thread_id` (when `target=new_thread`) |
+| `thread_start`         | thread   | `seed_question`, `motivation`, `entry_point`, `step_number: 0`          |
+| `thread_resumed`       | thread   | `from_step`                                                             |
+| `step_start`           | thread   | `move`, `step_number`, `instruction`, `assessment`, `rationale`, `status`, `provisional: false` |
+| `llm_call`             | thread   | `agent`, `model`, `input_tokens`, `output_tokens`, `duration_ms`, `response`, `step_number`, `move` |
+| `tool_call`            | thread   | `agent`, `sql`, `tool_result`, `duration_ms`, `step_number`, `move`     |
+| `step_complete`        | thread   | `step_number`, `move`, `instruction`, `result`, `duration_ms`           |
+| `thread_complete`      | thread   | `summary`, `result` (alias of `summary`), `total_ms`, `total_seconds`, `step_count`, `is_terminal: true` |
+| `thread_waiting`       | thread   | `reason` (`coordinator_stuck` \| `repeated_moves` \| `retry_exhausted` \| `context_exhausted` \| `unexpected_error` \| `human_review`), `running_summary`, `step_number`, `is_terminal: true` — **the question/context live on the preceding `WAITING_FOR_HUMAN` step's `step_complete` event** |
+| `synthesis_start`      | thread   | `source_threads`, `synthesis_thread` (fan-out pattern only)             |
+
+All `duration_ms` and `total_ms` values are integer milliseconds.
+Session-scoped events use `thread_id: ""`.
+
+Every thread-scoped event carries `step_number` and `move` so each event is
+self-contained and the UI can group events into steps without maintaining
+cross-event state. Exceptions: `thread_start` (step_number is 0, move is absent)
+and `thread_complete` / `thread_waiting` (step-independent terminal events that
+carry `is_terminal: true`).
+
+**Human input and waiting states are full steps.** When a human posts a
+message, a `HUMAN_INPUT` step lands in the timeline — the UI sees a
+regular `step_start` + `step_complete` pair with `move=HUMAN_INPUT` and
+the message text on `result`. When a thread enters a waiting state, a
+`WAITING_FOR_HUMAN` step lands with the question on `result` and any
+accompanying context on `instruction`. The sibling `thread_waiting`
+terminal marker is then emitted without duplicating those fields.
+There is no `human_message` event type — it was replaced by the
+`HUMAN_INPUT` step in the move-based timeline.
 
 
 ### Per-session config
@@ -153,8 +238,13 @@ The coordinator picks moves freely based on data — no fixed order.
 ```bash
 curl -X POST http://localhost:8000/api/sessions \
   -F "file=@data/samples/cars.csv" \
-  -F 'config={"max_threads": 20, "num_scout_seed_questions": 12, "initial_questions": ["What is an interesting visual insight in this dataset?", "What factors most influence fuel efficiency?", "Are there regional differences in car specifications?"]}'
+  -F 'config={"seed_threads": 3, "initial_questions": ["What factors most influence fuel efficiency?", "Are there regional differences in car specifications?"]}'
 ```
+
+`seed_threads` is the simplest way to bound the analysis: it caps both the
+number of questions the scout generates and the total spawned thread count.
+For finer control, set `num_scout_seed_questions` and `max_threads`
+independently.
 
 Available config fields:
 
@@ -171,12 +261,17 @@ Available config fields:
 | `temp_coordinator`         | `float`    | Temperature for coordinator               |
 | `temp_worker`              | `float`    | Temperature for worker                    |
 | `max_threads`              | `int`      | Cap on total threads spawned              |
+| `seed_threads`             | `int`      | Shortcut: caps both `num_scout_seed_questions` and `max_threads` |
 | `max_worker_retries`       | `int`      | Worker retries before fallback model      |
 | `max_consecutive_errors`   | `int`      | SQL errors before forcing summary         |
 | `max_repeated_moves`       | `int`      | Repeated coordinator moves before abort   |
 | `llm_timeout`              | `float`    | LLM call timeout in seconds               |
 | `num_scout_seed_questions` | `int`      | Number of questions scout should discover |
 | `initial_questions`        | `string[]` | Seed questions to start alongside scout   |
+| `question_source`          | `string`   | `scout` (default), `human`, or `both`     |
+| `scout_context`            | `string`   | Free-text guidance to steer scout         |
+| `default_pattern`          | `string`   | `coordinator_worker` (default), `fan_out`, or `human_in_the_loop` |
+| `summarize_every_steps`    | `int`      | Interval (in steps) between history-summarizer runs; 0 disables |
 
 
 ## Publishing to PyPI
@@ -191,10 +286,3 @@ uv publish
 # Or test with TestPyPI first
 uv publish --publish-url https://test.pypi.org/legacy/
 ```
-
-## Docs
-
-- [docs/SPEC.md](docs/SPEC.md) — architecture spec
-- [docs/PROMPTS.md](docs/PROMPTS.md) — agent prompt designs
-- [docs/error-handling-changes.md](docs/error-handling-changes.md) — transient LLM retry, `thread_waiting.reason`, and interleaved `human_message` step events
-
