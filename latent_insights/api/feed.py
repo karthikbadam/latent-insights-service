@@ -348,6 +348,14 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
             for ev_idx, ev in enumerate(step.events):
                 if ev_idx == coord_idx:
                     continue
+                ev_dict = ev.model_dump() if hasattr(ev, "model_dump") else dict(ev)
+                if (
+                    ev_dict.get("type") == "llm_call"
+                    and ev_dict.get("agent") == "worker"
+                    and not (ev_dict.get("response") or "").strip()
+                    and not ev_dict.get("sql")
+                ):
+                    continue
                 entries.append(_event_to_entry(thread.id, step, ev_idx, ev))
 
             entries.append(_make(
