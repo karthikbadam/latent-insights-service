@@ -305,6 +305,34 @@ class TestSessionToFeed:
         with_text = [e for e in llm_calls if e.response_text]
         assert with_text, "expected at least one llm_call with parsed response_text"
 
+    @pytest.mark.parametrize("session_id", SAVED_SESSION_IDS)
+    def test_legacy_sql_events_become_tool_calls(self, session_id):
+        """Legacy saved sessions stamp ``type: "llm_call"`` on every event,
+        even ones carrying a ``sql`` field. Those must surface as
+        ``tool_call`` entries — otherwise the frontend's SQL panel never
+        renders and the feed becomes a wall of llm_call rows.
+        """
+        session = _load_session(session_id)
+        entries = session_to_feed(session)
+
+        # Count raw events with sql in the snapshot.
+        sql_events = 0
+        for thread in session.threads:
+            for step in thread.steps:
+                for ev in step.events:
+                    if ev.sql:
+                        sql_events += 1
+
+        tool_calls = [e for e in entries if e.event_type == "tool_call"]
+        assert sql_events > 0, "fixture must contain at least one sql event"
+        assert len(tool_calls) == sql_events, (
+            f"expected {sql_events} tool_call entries, got {len(tool_calls)}"
+        )
+        # Each tool_call carries the SQL and (where present) the tool_result.
+        for e in tool_calls:
+            assert e.sql, "tool_call must carry sql text"
+            assert e.full_message == e.sql
+
 
 # ---------------------------------------------------------------------------
 # FeedEntry serialization

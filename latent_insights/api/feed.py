@@ -417,7 +417,13 @@ def _event_to_entry(
     move = step.move or ""
     entry_id = f"ev:{thread_id}:{step_number}:{ev_idx}"
 
-    if ev_type == "tool_call":
+    # Legacy saved snapshots labeled every worker event as ``llm_call``
+    # even when the record carried ``sql``/``tool_result``. Discriminate
+    # on ``sql`` presence so those rows render as tool_call entries (the
+    # frontend's SQL panel keys off this type, not just the field set).
+    has_sql = bool(ev_dict.get("sql"))
+
+    if ev_type == "tool_call" or has_sql:
         sql = ev_dict.get("sql") or ""
         return _make(
             event_type="tool_call",
