@@ -294,12 +294,17 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
 
         for step in thread.steps:
             move = step.move or ""
+            event_ts_list = [_ev_ts(ev) for ev in step.events]
+            event_ts_list = [t for t in event_ts_list if t > 0]
+            step_start_ts = min(event_ts_list) if event_ts_list else thread_ts
+            step_complete_ts = max(event_ts_list) if event_ts_list else thread_ts
+
             if move == "HUMAN_INPUT":
                 entries.append(_make(
                     event_type="human_message",
                     id=f"human:{thread.id}:{step.step_number}",
                     thread_id=thread.id,
-                    timestamp=thread_ts,
+                    timestamp=step_start_ts,
                     message=step.result or "",
                     full_message=step.result or "",
                     content=step.result or "",
@@ -319,7 +324,7 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
                 event_type="step_start",
                 id=f"step:{thread.id}:{step.step_number}:start",
                 thread_id=thread.id,
-                timestamp=thread_ts,
+                timestamp=step_start_ts,
                 message=coord_assessment or "",
                 step_number=step.step_number,
                 move=move,
@@ -342,7 +347,7 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
                 event_type="step_complete",
                 id=f"step:{thread.id}:{step.step_number}:complete",
                 thread_id=thread.id,
-                timestamp=thread_ts,
+                timestamp=step_complete_ts,
                 message=step.result or "",
                 full_message=step.result or "",
                 step_number=step.step_number,
@@ -476,7 +481,7 @@ def _event_to_entry(
         id=entry_id,
         thread_id=thread_id,
         timestamp=ts,
-        message=_llm_message(agent, duration_ms),
+        message=step.instruction or "",
         full_message=response_text or response,
         step_number=step_number,
         move=move,
@@ -491,10 +496,9 @@ def _event_to_entry(
     )
 
 
-def _llm_message(agent: str, duration_ms: int | None) -> str:
-    ms = f" ({duration_ms}ms)" if duration_ms is not None else ""
-    label = agent.capitalize() if agent else "LLM"
-    return f"{label} deciding{ms}"
+def _ev_ts(ev) -> float:
+    ev_dict = ev.model_dump() if hasattr(ev, "model_dump") else dict(ev)
+    return float(ev_dict.get("timestamp") or 0.0)
 
 
 def _find_coordinator_event(events: list) -> tuple[dict | None, int]:

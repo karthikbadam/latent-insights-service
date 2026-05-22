@@ -292,12 +292,11 @@ produced. If the evidence is thin, say so.",
             response_text = _extract_tool_sql(response.tool_calls)
 
         response_text_parsed, response_tables = parse_llm_response(response_text)
-        label = f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)"
         self._emit_feed(
             event_type="llm_call",
             entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.attempts}:llm",
-            message=label,
-            full_message=response_text_parsed or response_text or label,
+            message=self.instruction,
+            full_message=response_text_parsed or response_text or "",
             agent=self.role,
             model=self.current_model,
             input_tokens=response.input_tokens,
