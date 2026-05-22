@@ -319,13 +319,16 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
             coord_ev, coord_idx = _find_coordinator_event(step.events)
             coord_assessment, coord_rationale = _extract_assessment_rationale(coord_ev)
 
+            # See Recorder.step_start for the message-is-assessment-only
+            # rationale. full_message is omitted so the frontend's
+            # generic textContent fallback doesn't pick up the long
+            # instruction as the row preview.
             entries.append(_make(
                 event_type="step_start",
                 id=f"step:{thread.id}:{step.step_number}:start",
                 thread_id=thread.id,
                 timestamp=thread_ts,
-                message=coord_assessment or step.instruction or "",
-                full_message=step.instruction or "",
+                message=coord_assessment or "",
                 step_number=step.step_number,
                 move=move,
                 agent="coordinator",
