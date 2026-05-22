@@ -11,6 +11,7 @@ import re
 import time
 
 from latent_insights.agents.base import Agent
+from latent_insights.api.feed import FeedEntry, parse_llm_response
 from latent_insights.core.llm import LLMClient
 from latent_insights.core.parsing import detect_degeneration, parse_worker_response
 from latent_insights.core.queue import Queue
@@ -178,6 +179,32 @@ produced. If the evidence is thin, say so.",
         # each event is self-contained and the UI can group by step without
         # tracking cross-event state.
         self.step_number: int = 0
+
+    def _emit_feed(self, *, event_type: str, entry_id: str, message: str, **fields):
+        """Build a FeedEntry and dispatch it as a StreamEvent.
+
+        The worker doesn't own ``store`` — its per-step ``llm_call`` /
+        ``tool_call`` records are batched on ``self.llm_calls`` and flushed
+        by the runner at step end. This helper handles SSE emission only,
+        pulling ``feed_index`` from the shared session counter.
+        """
+        entry = FeedEntry(
+            id=entry_id,
+            feed_index=self.queue.next_feed_index(self.session_id),
+            event_type=event_type,
+            thread_id=self.thread_id,
+            timestamp=time.time(),
+            message=message,
+            **fields,
+        )
+        self.queue.emit(StreamEvent(
+            session_id=self.session_id,
+            thread_id=self.thread_id,
+            event_type=event_type,
+            message=message,
+            data=entry.model_dump(exclude_none=True),
+            timestamp=entry.timestamp,
+        ))
         self.current_move: str = ""
 
     @property
@@ -264,23 +291,25 @@ produced. If the evidence is thin, say so.",
         if not response_text and has_tools:
             response_text = _extract_tool_sql(response.tool_calls)
 
-        self.queue.emit(StreamEvent(
-            session_id=self.session_id,
-            thread_id=self.thread_id,
+        response_text_parsed, response_tables = parse_llm_response(response_text)
+        label = f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)"
+        self._emit_feed(
             event_type="llm_call",
-            message=f"Worker {'executing SQL' if has_tools else 'summarizing'} ({call_ms}ms)",
-            data={
-                "agent": self.role,
-                "model": self.current_model,
-                "input_tokens": response.input_tokens,
-                "output_tokens": response.output_tokens,
-                "duration_ms": call_ms,
-                "has_tool_calls": has_tools,
-                "response": response_text,
-                "step_number": self.step_number,
-                "move": self.current_move,
-            },
-        ))
+            entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.attempts}:llm",
+            message=label,
+            full_message=response_text_parsed or response_text or label,
+            agent=self.role,
+            model=self.current_model,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            duration_ms=call_ms,
+            has_tool_calls=has_tools,
+            response=response_text,
+            response_text=response_text_parsed,
+            response_tables=response_tables,
+            step_number=self.step_number,
+            move=self.current_move,
+        )
 
         return response, call_ms
 
@@ -380,20 +409,18 @@ produced. If the evidence is thin, say so.",
         was an error.
         """
         logger.info(f"Worker executing SQL: {sql[:200]}")
-        self.queue.emit(StreamEvent(
-            session_id=self.session_id,
-            thread_id=self.thread_id,
+        self._emit_feed(
             event_type="tool_call",
+            entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.attempts}:tool:{tool_call_id}",
             message=sql,
-            data={
-                "agent": self.role,
-                "sql": sql,
-                "tool_result": tool_result,
-                "duration_ms": sql_ms,
-                "step_number": self.step_number,
-                "move": self.current_move,
-            },
-        ))
+            full_message=sql,
+            agent=self.role,
+            sql=sql,
+            tool_result=tool_result,
+            duration_ms=sql_ms,
+            step_number=self.step_number,
+            move=self.current_move,
+        )
         self.messages.append({
             "role": "tool",
             "tool_call_id": tool_call_id,
@@ -533,20 +560,18 @@ produced. If the evidence is thin, say so.",
                 result_text = self.execute_sql(self.session_db, sql)
                 sql_ms = round((time.monotonic() - t_sql) * 1000)
 
-                self.queue.emit(StreamEvent(
-                    session_id=self.session_id,
-                    thread_id=self.thread_id,
+                self._emit_feed(
                     event_type="tool_call",
+                    entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.attempts}:tool:{tool_call['id']}",
                     message=sql,
-                    data={
-                        "agent": self.role,
-                        "sql": sql,
-                        "tool_result": result_text,
-                        "duration_ms": sql_ms,
-                        "step_number": self.step_number,
-                        "move": self.current_move,
-                    },
-                ))
+                    full_message=sql,
+                    agent=self.role,
+                    sql=sql,
+                    tool_result=result_text,
+                    duration_ms=sql_ms,
+                    step_number=self.step_number,
+                    move=self.current_move,
+                )
                 self.messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],

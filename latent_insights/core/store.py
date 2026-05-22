@@ -169,6 +169,16 @@ class InvestigationStore:
             "timestamp": time.time(),
         })
 
+    def push_pivot_marker(self, thread_id: str):
+        """Push a sentinel that triggers a runner pivot without committing
+        a new HUMAN_INPUT step. Used when the route handler has already
+        committed the step inline and just needs the RUNNING thread to
+        flush its in-flight step at the next callback boundary.
+        """
+        self._pending_messages.setdefault(thread_id, []).append(
+            {"committed": True}
+        )
+
     def drain_pending_messages(self, thread_id: str) -> list[dict]:
         return self._pending_messages.pop(thread_id, [])
 

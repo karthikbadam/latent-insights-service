@@ -12,8 +12,8 @@ from typing import Any
 from latent_insights.config import AppConfig
 from latent_insights.core.llm import LLMClient
 from latent_insights.core.queue import Queue
+from latent_insights.core.recorder import Recorder
 from latent_insights.core.store import InvestigationStore
-from latent_insights.models import StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -90,16 +90,11 @@ def fan_out_with_synthesis(
         )
         synth_runner.start()
 
-        queue.emit(StreamEvent(
-            session_id=session_id,
-            thread_id=synth_thread.id,
-            event_type="synthesis_start",
-            message=f"Synthesizing {len(findings)} thread findings",
-            data={
-                "source_threads": list(thread_ids),
-                "synthesis_thread": synth_thread.id,
-            },
-        ))
+        Recorder(store, queue, session_id).synthesis_start(
+            synthesis_thread_id=synth_thread.id,
+            source_threads=list(thread_ids),
+            finding_count=len(findings),
+        )
 
     # Spawn analysis threads with the on_done hook wired up.
     for q in questions:

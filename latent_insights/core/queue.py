@@ -7,6 +7,7 @@ what's running, what's waiting, and what events are flowing.
 
 import logging
 import queue
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -44,6 +45,8 @@ class Queue:
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._tasks: dict[str, TaskInfo] = {}
         self._event_queues: dict[str, list[queue.Queue]] = {}
+        self._feed_index: dict[str, int] = {}
+        self._feed_index_lock = threading.Lock()
 
     # --- Task management ---
 
@@ -113,6 +116,18 @@ class Queue:
             self._event_queues[session_id] = [
                 existing for existing in self._event_queues[session_id] if existing is not q
             ]
+
+    def next_feed_index(self, session_id: str) -> int:
+        """Return the next monotonic feed index for a session.
+
+        Thread-safe — the per-session counter is incremented under a
+        single lock so concurrent recorders (multiple threads per session)
+        produce a strict total order over emissions.
+        """
+        with self._feed_index_lock:
+            current = self._feed_index.get(session_id, 0)
+            self._feed_index[session_id] = current + 1
+            return current
 
     def emit(self, event: StreamEvent):
         """Dispatch an event to all subscribers for the session."""

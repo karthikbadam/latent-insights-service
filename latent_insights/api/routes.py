@@ -27,7 +27,7 @@ from latent_insights.api.schemas import (
     ThreadResponse,
 )
 
-from latent_insights.models import StreamEvent, ThreadStatus
+from latent_insights.models import ThreadStatus
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +201,30 @@ def get_session(session_id: str, request: Request):
     )
 
 
+@router.get("/sessions/{session_id}/feed")
+def get_session_feed(
+    session_id: str,
+    request: Request,
+    since: int | None = Query(None, ge=0),
+):
+    """Return the session as a flat list of render-ready ``FeedEntry``
+    rows. Same shape the SSE stream emits — frontends can boot from
+    this snapshot and then append SSE events.
+
+    ``since``: optional cursor; only entries with ``feed_index > since``
+    are returned.
+    """
+    from latent_insights.api.feed import session_to_feed
+
+    snapshot = get_session(session_id, request)
+    if not isinstance(snapshot, SessionResponse):
+        snapshot = SessionResponse.model_validate(snapshot)
+    entries = session_to_feed(snapshot)
+    if since is not None:
+        entries = [e for e in entries if e.feed_index > since]
+    return entries
+
+
 @router.post("/sessions/{session_id}/threads")
 def create_thread(session_id: str, request: Request, body: CreateThreadRequest):
     """Create a user-initiated thread with a custom question."""
@@ -274,28 +298,29 @@ def continue_session(session_id: str, request: Request):
 def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     """Post a human message to a thread.
 
-    The message lands in the store's pending queue regardless of thread
-    status. For RUNNING threads the runner picks it up at its next
-    callback boundary via ``_flush_and_pivot`` and commits a HUMAN_INPUT
-    step. For WAITING/COMPLETE threads we construct a runner and
-    ``resume()`` it — the runner drains pending into a HUMAN_INPUT step
-    ahead of the first coordinator step.
+    The HUMAN_INPUT step is committed INLINE in this handler — the row
+    lands in the store and on the SSE stream before the response
+    returns, so worker events from the previous step can no longer be
+    misattributed to a not-yet-existent HUMAN_INPUT slot. For RUNNING
+    threads we then push a ``{"committed": True}`` sentinel into pending
+    so the runner's ``_flush_and_pivot`` still triggers at the next
+    callback boundary (the sentinel is filtered by
+    ``_drain_pending_as_steps``). For WAITING/COMPLETE threads we just
+    ``resume()`` — the HUMAN_INPUT step is already in history.
     """
+    from latent_insights.core.recorder import Recorder
+
     config, llm, db, queue, store = _get_state(request)
 
     thread = store.get_thread(thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
 
+    recorder = Recorder(store, queue, thread.session_id, thread_id)
+    recorder.human_input_step(body.content, target="thread")
+
     if thread.status == ThreadStatus.RUNNING:
-        store.push_pending_message(thread_id, body.content, target="thread")
-        queue.emit(StreamEvent(
-            session_id=thread.session_id,
-            thread_id=thread_id,
-            event_type="message_injected",
-            message=body.content,
-            data={"content": body.content, "target": "thread"},
-        ))
+        store.push_pivot_marker(thread_id)
         return {"status": "injected", "thread_id": thread_id}
 
     if thread.status.value not in ("waiting", "complete"):
@@ -306,9 +331,6 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
     session = store.get_session(thread.session_id)
     thread_db = db.open_session_connection(thread.session_id)
 
-    # Push before resume so the runner's _drain_pending_as_steps commits
-    # a HUMAN_INPUT step as the first row of this resumed run.
-    store.push_pending_message(thread_id, body.content, target="thread")
     runner = ThreadRunner(
         config=config,
         llm=llm,
@@ -327,14 +349,18 @@ def post_message(thread_id: str, request: Request, body: PostMessageRequest):
 def post_session_message(session_id: str, request: Request, body: PostMessageRequest):
     """Session-scoped message — broadcast or start-a-new-thread.
 
-    Default (``as_new_thread=False``): push the message to every
-    thread's pending queue and resume any WAITING threads. Each affected
-    thread's runner commits a HUMAN_INPUT step at its next boundary.
+    Default (``as_new_thread=False``): commit a HUMAN_INPUT step inline
+    on every affected thread (RUNNING or WAITING) so the row lands
+    immediately. RUNNING threads then receive a pivot marker so their
+    runner flushes its in-flight step at the next boundary; WAITING
+    threads are ``resume()``d.
 
-    With ``as_new_thread=True``: skip the broadcast entirely and spawn a
-    fresh thread using the message as its seed question. Existing
-    threads are untouched.
+    With ``as_new_thread=True``: spawn a fresh thread using the message
+    as its seed question. The new thread's ``thread_start`` row carries
+    the message — no separate ``message_injected`` event.
     """
+    from latent_insights.core.recorder import Recorder
+
     config, llm, db, queue, store = _get_state(request)
 
     session = store.get_session(session_id)
@@ -355,12 +381,6 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
             queue=queue, store=store, thread=new_thread,
             schema_summary=session.schema_summary,
         ).start()
-        queue.emit(StreamEvent(
-            session_id=session_id, thread_id="",
-            event_type="message_injected",
-            message=body.content,
-            data={"content": body.content, "target": "new_thread", "thread_id": new_thread.id},
-        ))
         return {"status": "thread_spawned", "session_id": session_id, "thread_id": new_thread.id}
 
     # --- Default broadcast branch ---
@@ -370,11 +390,16 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
 
     for t in threads:
         if t.status == ThreadStatus.RUNNING:
-            store.push_pending_message(t.id, body.content, target="session")
+            Recorder(store, queue, session_id, t.id).human_input_step(
+                body.content, target="session",
+            )
+            store.push_pivot_marker(t.id)
             injected_ids.append(t.id)
         elif t.status == ThreadStatus.WAITING:
             from latent_insights.orchestration.runner import ThreadRunner
-            store.push_pending_message(t.id, body.content, target="session")
+            Recorder(store, queue, session_id, t.id).human_input_step(
+                body.content, target="session",
+            )
             thread_db = db.open_session_connection(session_id)
             runner = ThreadRunner(
                 config=config, llm=llm, session_db=thread_db, queue=queue,
@@ -383,19 +408,6 @@ def post_session_message(session_id: str, request: Request, body: PostMessageReq
             )
             runner.resume()
             resumed_ids.append(t.id)
-
-    queue.emit(StreamEvent(
-        session_id=session_id,
-        thread_id="",
-        event_type="message_injected",
-        message=body.content,
-        data={
-            "content": body.content,
-            "target": "session",
-            "injected_threads": injected_ids,
-            "resumed_threads": resumed_ids,
-        },
-    ))
 
     return {
         "status": "delivered",
