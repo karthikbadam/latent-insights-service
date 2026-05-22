@@ -198,12 +198,14 @@ produced. If the evidence is thin, say so.",
             message=message,
             **fields,
         )
+        entry_data = entry.model_dump(exclude_none=True)
+        self.queue.append_feed(self.session_id, entry_data)
         self.queue.emit(StreamEvent(
             session_id=self.session_id,
             thread_id=self.thread_id,
             event_type=event_type,
             message=message,
-            data=entry.model_dump(exclude_none=True),
+            data=entry_data,
             timestamp=entry.timestamp,
         ))
 

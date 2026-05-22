@@ -47,6 +47,11 @@ class Queue:
         self._event_queues: dict[str, list[queue.Queue]] = {}
         self._feed_index: dict[str, int] = {}
         self._feed_index_lock = threading.Lock()
+        # Per-session canonical feed: every FeedEntry that was ever emitted
+        # via ``append_feed``, in emission order. The API serves this as-is
+        # so reload byte-matches what live SSE delivered.
+        self._session_feeds: dict[str, list[dict]] = {}
+        self._session_feeds_lock = threading.Lock()
 
     # --- Task management ---
 
@@ -138,3 +143,15 @@ class Queue:
             f"Event emitted: {event.event_type} thread={event.thread_id} "
             f"→ {len(queues)} subscribers"
         )
+
+    def append_feed(self, session_id: str, entry: dict):
+        with self._session_feeds_lock:
+            self._session_feeds.setdefault(session_id, []).append(entry)
+
+    def get_session_feed(self, session_id: str) -> list[dict]:
+        with self._session_feeds_lock:
+            return list(self._session_feeds.get(session_id, []))
+
+    def set_session_feed(self, session_id: str, entries: list[dict]):
+        with self._session_feeds_lock:
+            self._session_feeds[session_id] = list(entries)

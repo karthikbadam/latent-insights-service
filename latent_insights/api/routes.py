@@ -211,21 +211,20 @@ def get_session_feed(
     request: Request,
     since: int | None = Query(None, ge=0),
 ):
-    """Return the session as a flat list of render-ready ``FeedEntry``
-    rows. Same shape the SSE stream emits — frontends can boot from
-    this snapshot and then append SSE events.
+    """Return the session's canonical feed — the exact sequence of
+    ``FeedEntry`` rows that were ever emitted, in emission order.
+
+    Served straight from the per-session buffer that ``recorder._emit``
+    and ``worker._emit_feed`` append to. No derivation, no resorting —
+    reload byte-matches live SSE.
 
     ``since``: optional cursor; only entries with ``feed_index > since``
     are returned.
     """
-    from latent_insights.api.feed import session_to_feed
-
-    snapshot = get_session(session_id, request)
-    if not isinstance(snapshot, SessionResponse):
-        snapshot = SessionResponse.model_validate(snapshot)
-    entries = session_to_feed(snapshot)
+    queue = request.app.state.queue
+    entries = queue.get_session_feed(session_id)
     if since is not None:
-        entries = [e for e in entries if e.feed_index > since]
+        entries = [e for e in entries if int(e.get("feed_index", -1)) > since]
     return entries
 
 

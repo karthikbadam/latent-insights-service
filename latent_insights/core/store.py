@@ -70,13 +70,14 @@ def generate_id() -> str:
 class InvestigationStore:
     """Unified store for sessions, threads, steps, and pending messages."""
 
-    def __init__(self, data_dir: str = "data"):
+    def __init__(self, data_dir: str = "data", queue=None):
         self._sessions: dict[str, Session] = {}
         self._threads: dict[str, Thread] = {}
         self._session_threads: dict[str, list[str]] = {}
         self._steps: dict[str, list[Step]] = {}
         self._pending_messages: dict[str, list[dict]] = {}
         self._data_dir = data_dir
+        self._queue = queue
 
     # --- Sessions ---
 
@@ -399,6 +400,21 @@ class InvestigationStore:
             json.dump(data, f, indent=2, default=str)
         logger.info(f"State saved: {filepath} ({len(threads)} threads)")
 
+        # Persist the canonical feed buffer (every emitted FeedEntry) so
+        # the reload path is byte-identical to live SSE. The API serves
+        # this file as-is — no derivation, no timestamp synthesis.
+        if self._queue is not None:
+            feed_entries = self._queue.get_session_feed(session_id)
+            if feed_entries:
+                feeds_dir = os.path.join(self._data_dir, "feeds")
+                os.makedirs(feeds_dir, exist_ok=True)
+                feed_path = os.path.join(feeds_dir, f"{session_id}.feed.json")
+                with open(feed_path, "w") as f:
+                    json.dump(feed_entries, f, indent=2, default=str)
+                logger.info(
+                    f"Feed saved: {feed_path} ({len(feed_entries)} entries)"
+                )
+
     def save_all(self):
         for session_id in self._sessions:
             self.save_session(session_id)
@@ -498,6 +514,28 @@ class InvestigationStore:
                 self._steps[thread.id] = steps
 
         logger.info(f"State loaded: {filepath}")
+
+        # Restore the canonical feed buffer if it was saved alongside.
+        if self._queue is not None:
+            feed_path = os.path.join(
+                self._data_dir, "feeds", f"{session_id}.feed.json"
+            )
+            if os.path.exists(feed_path):
+                with open(feed_path) as f:
+                    feed_entries = json.load(f)
+                self._queue.set_session_feed(session_id, feed_entries)
+                # Resume the per-session feed_index counter past the
+                # highest persisted index so new live emissions don't
+                # collide with restored ones.
+                if feed_entries:
+                    max_idx = max(
+                        int(e.get("feed_index", -1)) for e in feed_entries
+                    )
+                    with self._queue._feed_index_lock:
+                        self._queue._feed_index[session_id] = max_idx + 1
+                logger.info(
+                    f"Feed loaded: {feed_path} ({len(feed_entries)} entries)"
+                )
         return session
 
     # --- Counts ---
