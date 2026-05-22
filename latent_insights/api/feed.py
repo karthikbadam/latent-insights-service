@@ -280,11 +280,18 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
 
     for thread in session.threads:
         thread_ts = _iso_to_ts(thread.updated_at) or session_ts
+        all_event_ts = [
+            _ev_ts(ev)
+            for step in thread.steps
+            for ev in step.events
+        ]
+        all_event_ts = [t for t in all_event_ts if t > 0]
+        thread_start_ts = min(all_event_ts) if all_event_ts else thread_ts
         entries.append(_make(
             event_type="thread_start",
             id=f"thread:{thread.id}:start",
             thread_id=thread.id,
-            timestamp=thread_ts,
+            timestamp=thread_start_ts,
             message=thread.seed_question,
             full_message=thread.seed_question,
             seed_question=thread.seed_question,
