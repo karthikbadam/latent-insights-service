@@ -261,10 +261,6 @@ class ThreadRunner:
         self._step.move = final_move
         self._step.instruction = decision.worker_instruction or ""
 
-        # step_start carries the coordinator's structured decision AND its
-        # LLM call metrics — no separate coordinator llm_call row is
-        # emitted (the raw response is already exposed structurally via
-        # assessment / rationale / instruction).
         self.recorder.step_start(
             self.step_number,
             final_move,

@@ -312,17 +312,9 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
                 # Trailing thread_waiting row covers this step.
                 continue
 
-            # Pull the coordinator's call out of step.events so it folds
-            # into the structured step_start row (assessment / rationale /
-            # metrics). The raw coordinator llm_call is not emitted as a
-            # separate row — its content is already exposed structurally.
             coord_ev, coord_idx = _find_coordinator_event(step.events)
             coord_assessment, coord_rationale = _extract_assessment_rationale(coord_ev)
 
-            # See Recorder.step_start for the message-is-assessment-only
-            # rationale. full_message is omitted so the frontend's
-            # generic textContent fallback doesn't pick up the long
-            # instruction as the row preview.
             entries.append(_make(
                 event_type="step_start",
                 id=f"step:{thread.id}:{step.step_number}:start",
@@ -506,12 +498,6 @@ def _llm_message(agent: str, duration_ms: int | None) -> str:
 
 
 def _find_coordinator_event(events: list) -> tuple[dict | None, int]:
-    """Return the first coordinator llm_call event from a step's events.
-
-    Returns ``(event_dict, index)`` or ``(None, -1)`` if absent. Used by
-    ``session_to_feed`` to fold the coordinator's call into ``step_start``
-    instead of emitting it as a separate row.
-    """
     for idx, ev in enumerate(events):
         ev_dict = ev.model_dump() if hasattr(ev, "model_dump") else dict(ev)
         if ev_dict.get("agent") == "coordinator":
@@ -522,10 +508,6 @@ def _find_coordinator_event(events: list) -> tuple[dict | None, int]:
 def _extract_assessment_rationale(
     ev_dict: dict | None,
 ) -> tuple[str | None, str | None]:
-    """Pull ``assessment`` and ``rationale`` strings from a coordinator's
-    LLM response JSON. Returns ``(None, None)`` if the response can't be
-    parsed or the keys are missing.
-    """
     if not ev_dict:
         return None, None
     raw = ev_dict.get("response") or ""

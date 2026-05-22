@@ -255,21 +255,7 @@ class Recorder:
         output_tokens: int | None = None,
         duration_ms: int | None = None,
     ):
-        """Emit ``step_start`` with the coordinator's full decision.
-
-        Carries the coordinator's LLM call metrics directly so a separate
-        ``llm_call`` row for the coordinator is unnecessary — the feed
-        shows the structured assessment/rationale/instruction as the
-        first row of the step, with SQL ``tool_call`` rows immediately
-        after.
-        """
-        # ``message`` is the collapsed-row preview. Only set it to the
-        # assessment — leaving it empty when no assessment is present
-        # keeps the row a labels-only line. The full instruction is
-        # served via the dedicated ``instruction`` field for the
-        # expanded view; ``full_message`` is intentionally unset so
-        # the frontend's generic preview-text fallback never lifts the
-        # long instruction into the row header.
+        """Emit ``step_start`` with the coordinator's full decision."""
         self._emit(
             event_type="step_start",
             entry_id=f"step:{self.thread_id}:{step_number}:start",
