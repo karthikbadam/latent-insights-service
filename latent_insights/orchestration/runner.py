@@ -260,6 +260,8 @@ class ThreadRunner:
         # the thread terminates mid-step) see the committed move.
         self._step.move = final_move
         self._step.instruction = decision.worker_instruction or ""
+        self._step.assessment = decision.assessment or ""
+        self._step.rationale = decision.rationale or ""
 
         self.recorder.step_start(
             self.step_number,

@@ -61,9 +61,13 @@ def _steps_from_store(store, thread) -> list[StepResponse]:
             step_number=step.step_number,
             move=step.move,
             instruction=step.instruction,
+            assessment=step.assessment,
+            rationale=step.rationale,
             result=step.result,
             view_created=step.view_created,
             duration_ms=step.duration_ms,
+            start_time=step.start_time,
+            end_time=step.end_time,
             events=[StepEvent(**e) for e in events],
         ))
     return responses

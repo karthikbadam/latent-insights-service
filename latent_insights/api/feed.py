@@ -321,8 +321,18 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
             move = step.move or ""
             event_ts_list = [_ev_ts(ev) for ev in step.events]
             event_ts_list = [t for t in event_ts_list if t > 0]
-            step_start_ts = min(event_ts_list) if event_ts_list else thread_ts
-            step_complete_ts = max(event_ts_list) if event_ts_list else thread_ts
+            # Prefer the persisted step times; fall back to event timestamps;
+            # finally to the thread's overall timestamp.
+            step_start_ts = (
+                step.start_time
+                or (min(event_ts_list) if event_ts_list else None)
+                or thread_ts
+            )
+            step_complete_ts = (
+                step.end_time
+                or (max(event_ts_list) if event_ts_list else None)
+                or thread_ts
+            )
 
             if move == "HUMAN_INPUT":
                 entries.append(_make(
@@ -343,20 +353,28 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
                 continue
 
             coord_ev, coord_idx = _find_coordinator_event(step.events)
-            coord_assessment, coord_rationale = _extract_assessment_rationale(coord_ev)
+            # Prefer the persisted decision fields on the step (live runs
+            # stamp them directly). Fall back to parsing the coordinator
+            # event's response for legacy snapshots that don't carry them.
+            assessment = step.assessment or ""
+            rationale = step.rationale or ""
+            if not assessment and not rationale:
+                assessment, rationale = _extract_assessment_rationale(coord_ev)
+                assessment = assessment or ""
+                rationale = rationale or ""
 
             entries.append(_make(
                 event_type="step_start",
                 id=f"step:{thread.id}:{step.step_number}:start",
                 thread_id=thread.id,
                 timestamp=step_start_ts,
-                message=coord_assessment or "",
+                message=assessment,
                 step_number=step.step_number,
                 move=move,
                 agent="coordinator",
                 instruction=step.instruction or "",
-                assessment=coord_assessment or "",
-                rationale=coord_rationale or "",
+                assessment=assessment,
+                rationale=rationale,
                 model=(coord_ev or {}).get("model"),
                 input_tokens=(coord_ev or {}).get("input_tokens"),
                 output_tokens=(coord_ev or {}).get("output_tokens"),

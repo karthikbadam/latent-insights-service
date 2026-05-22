@@ -39,6 +39,8 @@ class Step:
     step_number: int = 0
     move: str = ""
     instruction: str = ""
+    assessment: str = ""
+    rationale: str = ""
     result: str = ""
     view_created: str | None = None
     events: list[dict] = field(default_factory=list)
@@ -339,9 +341,13 @@ class InvestigationStore:
             "step_number": step.step_number,
             "move": step.move,
             "instruction": step.instruction,
+            "assessment": step.assessment,
+            "rationale": step.rationale,
             "result": step.result,
             "view_created": step.view_created,
             "duration_ms": step.duration_ms,
+            "start_time": step.start_time,
+            "end_time": step.end_time,
             "events": list(step.events),
         }
 
@@ -464,17 +470,23 @@ class InvestigationStore:
             step_records = td.get("steps") or []
             steps: list[Step] = []
             for sd in step_records:
-                # Reconstruct start/end times from duration_ms so downstream
-                # code that inspects step timing doesn't see zeros. Timestamps
-                # are synthetic but preserve the duration.
                 duration_ms = sd.get("duration_ms") or 0
-                end_time = time.time()
-                start_time = end_time - (duration_ms / 1000.0)
+                # Prefer persisted timestamps; fall back to deriving from
+                # duration_ms for legacy snapshots that didn't save them.
+                start_time = sd.get("start_time")
+                end_time = sd.get("end_time")
+                if start_time is None or end_time is None:
+                    end_time = end_time if end_time is not None else time.time()
+                    start_time = start_time if start_time is not None else (
+                        end_time - (duration_ms / 1000.0)
+                    )
                 steps.append(Step(
                     thread_id=thread.id,
                     step_number=sd.get("step_number", len(steps) + 1),
                     move=sd.get("move") or "",
                     instruction=sd.get("instruction") or "",
+                    assessment=sd.get("assessment") or "",
+                    rationale=sd.get("rationale") or "",
                     result=sd.get("result") or "",
                     view_created=sd.get("view_created"),
                     events=list(sd.get("events") or []),
