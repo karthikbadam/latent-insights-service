@@ -250,19 +250,35 @@ class Recorder:
         assessment: str = "",
         rationale: str = "",
         status: str = "",
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        duration_ms: int | None = None,
     ):
-        """Emit ``step_start`` with the coordinator's full decision."""
+        """Emit ``step_start`` with the coordinator's full decision.
+
+        Carries the coordinator's LLM call metrics directly so a separate
+        ``llm_call`` row for the coordinator is unnecessary — the feed
+        shows the structured assessment/rationale/instruction as the
+        first row of the step, with SQL ``tool_call`` rows immediately
+        after.
+        """
         self._emit(
             event_type="step_start",
             entry_id=f"step:{self.thread_id}:{step_number}:start",
-            message=instruction,
+            message=assessment or instruction,
             full_message=instruction,
             move=move,
+            agent="coordinator",
             step_number=step_number,
             instruction=instruction,
             assessment=assessment,
             rationale=rationale,
             status=status,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            duration_ms=duration_ms,
         )
 
     def step_complete(

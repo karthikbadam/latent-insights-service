@@ -261,9 +261,10 @@ class ThreadRunner:
         self._step.move = final_move
         self._step.instruction = decision.worker_instruction or ""
 
-        # step_start MUST precede the llm_call for the same step so the
-        # frontend's "attach to last started step" reducer puts the
-        # coordinator's planning call on the right row.
+        # step_start carries the coordinator's structured decision AND its
+        # LLM call metrics — no separate coordinator llm_call row is
+        # emitted (the raw response is already exposed structurally via
+        # assessment / rationale / instruction).
         self.recorder.step_start(
             self.step_number,
             final_move,
@@ -271,17 +272,10 @@ class ThreadRunner:
             assessment=decision.assessment or "",
             rationale=decision.rationale or "",
             status=decision.status.value,
-        )
-        self.recorder.llm_call(
-            self._step,
-            step_number=self.step_number,
-            move=final_move,
-            agent="coordinator",
             model=coord_log["model"],
             input_tokens=coord_log.get("input_tokens"),
             output_tokens=coord_log.get("output_tokens"),
             duration_ms=coordinator_ms,
-            response=coord_log.get("response", ""),
         )
 
         # Genuinely STUCK (post step 2)

@@ -312,19 +312,35 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
                 # Trailing thread_waiting row covers this step.
                 continue
 
+            # Pull the coordinator's call out of step.events so it folds
+            # into the structured step_start row (assessment / rationale /
+            # metrics). The raw coordinator llm_call is not emitted as a
+            # separate row — its content is already exposed structurally.
+            coord_ev, coord_idx = _find_coordinator_event(step.events)
+            coord_assessment, coord_rationale = _extract_assessment_rationale(coord_ev)
+
             entries.append(_make(
                 event_type="step_start",
                 id=f"step:{thread.id}:{step.step_number}:start",
                 thread_id=thread.id,
                 timestamp=thread_ts,
-                message=step.instruction or "",
+                message=coord_assessment or step.instruction or "",
                 full_message=step.instruction or "",
                 step_number=step.step_number,
                 move=move,
+                agent="coordinator",
                 instruction=step.instruction or "",
+                assessment=coord_assessment or "",
+                rationale=coord_rationale or "",
+                model=(coord_ev or {}).get("model"),
+                input_tokens=(coord_ev or {}).get("input_tokens"),
+                output_tokens=(coord_ev or {}).get("output_tokens"),
+                duration_ms=(coord_ev or {}).get("duration_ms"),
             ))
 
             for ev_idx, ev in enumerate(step.events):
+                if ev_idx == coord_idx:
+                    continue
                 entries.append(_event_to_entry(thread.id, step, ev_idx, ev))
 
             entries.append(_make(
@@ -484,3 +500,43 @@ def _llm_message(agent: str, duration_ms: int | None) -> str:
     ms = f" ({duration_ms}ms)" if duration_ms is not None else ""
     label = agent.capitalize() if agent else "LLM"
     return f"{label} deciding{ms}"
+
+
+def _find_coordinator_event(events: list) -> tuple[dict | None, int]:
+    """Return the first coordinator llm_call event from a step's events.
+
+    Returns ``(event_dict, index)`` or ``(None, -1)`` if absent. Used by
+    ``session_to_feed`` to fold the coordinator's call into ``step_start``
+    instead of emitting it as a separate row.
+    """
+    for idx, ev in enumerate(events):
+        ev_dict = ev.model_dump() if hasattr(ev, "model_dump") else dict(ev)
+        if ev_dict.get("agent") == "coordinator":
+            return ev_dict, idx
+    return None, -1
+
+
+def _extract_assessment_rationale(
+    ev_dict: dict | None,
+) -> tuple[str | None, str | None]:
+    """Pull ``assessment`` and ``rationale`` strings from a coordinator's
+    LLM response JSON. Returns ``(None, None)`` if the response can't be
+    parsed or the keys are missing.
+    """
+    if not ev_dict:
+        return None, None
+    raw = ev_dict.get("response") or ""
+    if not raw:
+        return None, None
+    try:
+        parsed = extract_json(raw)
+    except (ValueError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(parsed, dict):
+        return None, None
+    assessment = parsed.get("assessment")
+    rationale = parsed.get("rationale")
+    return (
+        assessment if isinstance(assessment, str) else None,
+        rationale if isinstance(rationale, str) else None,
+    )
