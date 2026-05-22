@@ -299,13 +299,17 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
 
     for thread in session.threads:
         thread_ts = _iso_to_ts(thread.updated_at) or session_ts
-        all_event_ts = [
-            _ev_ts(ev)
-            for step in thread.steps
-            for ev in step.events
-        ]
-        all_event_ts = [t for t in all_event_ts if t > 0]
-        thread_start_ts = min(all_event_ts) if all_event_ts else thread_ts
+        thread_times: list[float] = []
+        for step in thread.steps:
+            if step.start_time:
+                thread_times.append(float(step.start_time))
+            if step.end_time:
+                thread_times.append(float(step.end_time))
+            for ev in step.events:
+                ts = _ev_ts(ev)
+                if ts > 0:
+                    thread_times.append(ts)
+        thread_start_ts = min(thread_times) if thread_times else thread_ts
         entries.append(_make(
             event_type="thread_start",
             id=f"thread:{thread.id}:start",
