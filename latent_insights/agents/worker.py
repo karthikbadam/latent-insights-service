@@ -296,6 +296,11 @@ produced. If the evidence is thin, say so.",
 
         response_text_parsed, response_tables = parse_llm_response(response_text)
         preview = (response_text_parsed or response_text or "").strip()
+        # Skip rows that would render as just labels — the following
+        # tool_call rows show the SQL and the next worker turn's response
+        # carries the actual decision text. No content = no row.
+        if not preview:
+            return response, call_ms
         self.event_counter += 1
         self._emit_feed(
             event_type="llm_call",
