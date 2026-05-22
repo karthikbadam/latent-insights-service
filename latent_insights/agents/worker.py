@@ -174,6 +174,7 @@ produced. If the evidence is thin, say so.",
         self.current_model: str = model
         self.consecutive_errors: int = 0
         self.attempts: int = 0
+        self.event_counter: int = 0
         self.llm_calls: list[dict] = []
         # Step context — stamped onto every SSE event this worker emits so
         # each event is self-contained and the UI can group by step without
@@ -205,7 +206,6 @@ produced. If the evidence is thin, say so.",
             data=entry.model_dump(exclude_none=True),
             timestamp=entry.timestamp,
         ))
-        self.current_move: str = ""
 
     @property
     def role(self) -> str:
@@ -230,6 +230,7 @@ produced. If the evidence is thin, say so.",
         self.current_model = self.model
         self.consecutive_errors = 0
         self.attempts = 0
+        self.event_counter = 0
         self.llm_calls = []
         self.step_number = step_number
         self.current_move = move
@@ -293,9 +294,10 @@ produced. If the evidence is thin, say so.",
 
         response_text_parsed, response_tables = parse_llm_response(response_text)
         preview = (response_text_parsed or response_text or "").strip()
+        self.event_counter += 1
         self._emit_feed(
             event_type="llm_call",
-            entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.attempts}:llm",
+            entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.event_counter}",
             message=preview,
             full_message=response_text_parsed or response_text or "",
             agent=self.role,
@@ -409,9 +411,10 @@ produced. If the evidence is thin, say so.",
         was an error.
         """
         logger.info(f"Worker executing SQL: {sql[:200]}")
+        self.event_counter += 1
         self._emit_feed(
             event_type="tool_call",
-            entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.attempts}:tool:{tool_call_id}",
+            entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.event_counter}",
             message=sql,
             full_message=sql,
             agent=self.role,
@@ -560,9 +563,10 @@ produced. If the evidence is thin, say so.",
                 result_text = self.execute_sql(self.session_db, sql)
                 sql_ms = round((time.monotonic() - t_sql) * 1000)
 
+                self.event_counter += 1
                 self._emit_feed(
                     event_type="tool_call",
-                    entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.attempts}:tool:{tool_call['id']}",
+                    entry_id=f"ev:{self.thread_id}:{self.step_number}:{self.event_counter}",
                     message=sql,
                     full_message=sql,
                     agent=self.role,
