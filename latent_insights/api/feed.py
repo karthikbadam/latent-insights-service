@@ -488,7 +488,7 @@ def _event_to_entry(
         id=entry_id,
         thread_id=thread_id,
         timestamp=ts,
-        message=step.instruction or "",
+        message=(response_text or response or "").strip(),
         full_message=response_text or response,
         step_number=step_number,
         move=move,
