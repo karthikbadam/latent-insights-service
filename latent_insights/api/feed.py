@@ -242,7 +242,25 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
     thread.updated_at), falling back to ``session.created_at`` for
     rows we have to synthesize.
     """
-    session_ts = _iso_to_ts(session.created_at)
+    earliest_ev = min(
+        (
+            float(
+                (ev.model_dump() if hasattr(ev, "model_dump") else dict(ev)).get(
+                    "timestamp"
+                ) or 0.0
+            )
+            for thread in session.threads
+            for step in thread.steps
+            for ev in step.events
+        ),
+        default=0.0,
+    )
+    raw_session_ts = _iso_to_ts(session.created_at)
+    session_ts = (
+        min(raw_session_ts, earliest_ev)
+        if raw_session_ts and earliest_ev
+        else raw_session_ts or earliest_ev
+    )
     entries: list[FeedEntry] = []
 
     if session.schema_summary:
@@ -410,6 +428,7 @@ def session_to_feed(session: SessionResponse) -> list[FeedEntry]:
                 thread_status="waiting",
             ))
 
+    entries.sort(key=lambda e: (e.timestamp, e.feed_index))
     for index, entry in enumerate(entries):
         entry.feed_index = index
     return entries
