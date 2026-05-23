@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
 
     db = Database(data_dir=config.data_dir)
     queue_instance = Queue()
-    store = InvestigationStore(data_dir=config.data_dir)
+    store = InvestigationStore(data_dir=config.data_dir, queue=queue_instance)
 
     # Store on app.state for access in route handlers
     app.state.config = config

@@ -82,9 +82,13 @@ class StepResponse(BaseModel):
     step_number: int
     move: str
     instruction: str
+    assessment: str = ""
+    rationale: str = ""
     result: str
     view_created: str | None = None
     duration_ms: int | None = None
+    start_time: float | None = None
+    end_time: float | None = None
     events: list[StepEvent] = []
 
 

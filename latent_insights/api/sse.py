@@ -1,5 +1,10 @@
 """
 SSE — Server-Sent Events for real-time thread updates.
+
+Each ``data:`` line is a complete ``FeedEntry`` (see ``api/feed.py``)
+serialized as JSON, so subscribers can append straight to their feed
+without reshaping. The ``event:`` header carries the entry's
+``event_type``.
 """
 
 import asyncio
@@ -14,17 +19,7 @@ router = APIRouter()
 
 @router.get("/sessions/{session_id}/events")
 async def session_events(session_id: str, request: Request):
-    """
-    SSE endpoint — streams thread events as human-readable messages.
-
-    Events:
-    - step: analytical step progress/completion
-    - thinking: coordinator is reasoning
-    - waiting: thread needs human input
-    - complete: thread finished with a finding
-    - error: thread encountered an error
-    - scout_done: scout finished, questions available
-    """
+    """Stream the session's FeedEntries as SSE."""
 
     queue = request.app.state.queue
 
@@ -33,23 +28,16 @@ async def session_events(session_id: str, request: Request):
         try:
             loop = asyncio.get_running_loop()
             while True:
-                # Bridge sync Queue to async: poll with timeout in executor
                 try:
                     event = await loop.run_in_executor(
                         None, q.get, True, 30.0,
                     )
                 except stdlib_queue.Empty:
-                    # Send keepalive comment to detect disconnected clients
                     yield {"comment": "keepalive"}
                     continue
                 yield {
                     "event": event.event_type,
-                    "data": json.dumps({
-                        "thread_id": event.thread_id,
-                        "message": event.message,
-                        "timestamp": event.timestamp,
-                        **event.data,
-                    }),
+                    "data": json.dumps(event.data),
                 }
         except asyncio.CancelledError:
             queue.unsubscribe(session_id, q)

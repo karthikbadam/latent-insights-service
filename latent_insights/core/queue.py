@@ -7,6 +7,7 @@ what's running, what's waiting, and what events are flowing.
 
 import logging
 import queue
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -44,6 +45,13 @@ class Queue:
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._tasks: dict[str, TaskInfo] = {}
         self._event_queues: dict[str, list[queue.Queue]] = {}
+        self._feed_index: dict[str, int] = {}
+        self._feed_index_lock = threading.Lock()
+        # Per-session canonical feed: every FeedEntry that was ever emitted
+        # via ``append_feed``, in emission order. The API serves this as-is
+        # so reload byte-matches what live SSE delivered.
+        self._session_feeds: dict[str, list[dict]] = {}
+        self._session_feeds_lock = threading.Lock()
 
     # --- Task management ---
 
@@ -114,6 +122,18 @@ class Queue:
                 existing for existing in self._event_queues[session_id] if existing is not q
             ]
 
+    def next_feed_index(self, session_id: str) -> int:
+        """Return the next monotonic feed index for a session.
+
+        Thread-safe — the per-session counter is incremented under a
+        single lock so concurrent recorders (multiple threads per session)
+        produce a strict total order over emissions.
+        """
+        with self._feed_index_lock:
+            current = self._feed_index.get(session_id, 0)
+            self._feed_index[session_id] = current + 1
+            return current
+
     def emit(self, event: StreamEvent):
         """Dispatch an event to all subscribers for the session."""
         queues = self._event_queues.get(event.session_id, [])
@@ -123,3 +143,15 @@ class Queue:
             f"Event emitted: {event.event_type} thread={event.thread_id} "
             f"→ {len(queues)} subscribers"
         )
+
+    def append_feed(self, session_id: str, entry: dict):
+        with self._session_feeds_lock:
+            self._session_feeds.setdefault(session_id, []).append(entry)
+
+    def get_session_feed(self, session_id: str) -> list[dict]:
+        with self._session_feeds_lock:
+            return list(self._session_feeds.get(session_id, []))
+
+    def set_session_feed(self, session_id: str, entries: list[dict]):
+        with self._session_feeds_lock:
+            self._session_feeds[session_id] = list(entries)

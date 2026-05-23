@@ -9,9 +9,10 @@ from latent_insights.agents.scout import Scout
 from latent_insights.config import AppConfig
 from latent_insights.core.llm import LLMClient
 from latent_insights.core.queue import Queue
+from latent_insights.core.recorder import Recorder
 from latent_insights.core.store import InvestigationStore
 from latent_insights.db.connection import Database
-from latent_insights.models import ScoutQuestion, StreamEvent, ThreadStatus
+from latent_insights.models import ScoutQuestion, ThreadStatus
 from latent_insights.orchestration.runner import RunnerMode, ThreadRunner
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class SessionFlow:
 
         session_db, table_name = self.db.create_session_db(session_id, dataset_path)
         self.store.update_session_table_name(session_id, table_name)
+        recorder = Recorder(self.store, self.queue, session_id)
 
         # Run profiler
         t0 = time.monotonic()
@@ -63,13 +65,7 @@ class SessionFlow:
         self.store.update_session_schema(session_id, schema_summary)
         logger.info(f"Session {session_id} profiled ({profiler_ms}ms)")
 
-        self.queue.emit(StreamEvent(
-            session_id=session_id,
-            thread_id="",
-            event_type="schema_summary_ready",
-            message="Dataset profiled.",
-            data={"schema_summary": schema_summary},
-        ))
+        recorder.schema_summary_ready(schema_summary, dataset_path=dataset_path)
 
         # Close read-write connection — all further access is read-only
         session_db.close()
@@ -91,15 +87,9 @@ class SessionFlow:
                 f"Session {session_id} ready for human questions "
                 f"(profiler={profiler_ms}ms setup={setup_elapsed}s)"
             )
-            self.queue.emit(StreamEvent(
-                session_id=session_id,
-                thread_id="",
-                event_type="session_ready",
-                message="Session profiled. Waiting for human questions.",
-                data={
-                    "question_source": "human",
-                },
-            ))
+            recorder.session_ready(
+                question_source="human", dataset_path=dataset_path,
+            )
             self.store.save_session(session_id)
             return session_id
 
@@ -133,24 +123,21 @@ class SessionFlow:
             remaining = max(0, max_threads - len(initial_questions))
             scout_questions = scout_questions[:remaining]
 
-        self.queue.emit(StreamEvent(
-            session_id=session_id,
-            thread_id="",
-            event_type="scout_done",
-            message=f"Scout found {len(scout_output.questions)} questions, spawning {len(scout_questions)}",
-            data={
-                "question_count": len(scout_questions),
-                "questions": [
-                    {
-                        "question": q.question,
-                        "motivation": q.motivation,
-                        "entry_point": q.entry_point,
-                        "difficulty": q.difficulty,
-                    }
-                    for q in scout_questions
-                ],
-            },
-        ))
+        recorder.scout_done(
+            scout_questions=[
+                {
+                    "question": q.question,
+                    "motivation": q.motivation,
+                    "entry_point": q.entry_point,
+                    "difficulty": q.difficulty,
+                }
+                for q in scout_questions
+            ],
+            message=(
+                f"Scout found {len(scout_output.questions)} questions, "
+                f"spawning {len(scout_questions)}"
+            ),
+        )
 
         setup_elapsed = round(time.monotonic() - session_start, 2)
         logger.info(
@@ -256,25 +243,18 @@ class SessionFlow:
             f"{len(new_questions)} new ({scout_ms}ms)"
         )
 
-        self.queue.emit(StreamEvent(
-            session_id=session_id,
-            thread_id="",
-            event_type="scout_done",
+        Recorder(self.store, self.queue, session_id).scout_done(
+            scout_questions=[
+                {
+                    "question": q.question,
+                    "motivation": q.motivation,
+                    "entry_point": q.entry_point,
+                    "difficulty": q.difficulty,
+                }
+                for q in new_questions
+            ],
             message=f"Scout found {len(new_questions)} new questions",
-            data={
-                "question_count": len(new_questions),
-                "questions": [
-                    {
-                        "question": q.question,
-                        "motivation": q.motivation,
-                        "entry_point": q.entry_point,
-                        "difficulty": q.difficulty,
-                    }
-                    for q in new_questions
-                ],
-                "resumed_threads": len(resumable),
-            },
-        ))
+        )
 
         self._spawn_threads(session_id, new_questions, schema_summary)
 

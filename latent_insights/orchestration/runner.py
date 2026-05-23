@@ -260,18 +260,9 @@ class ThreadRunner:
         # the thread terminates mid-step) see the committed move.
         self._step.move = final_move
         self._step.instruction = decision.worker_instruction or ""
+        self._step.assessment = decision.assessment or ""
+        self._step.rationale = decision.rationale or ""
 
-        self.recorder.llm_call(
-            self._step,
-            step_number=self.step_number,
-            move=final_move,
-            agent="coordinator",
-            model=coord_log["model"],
-            input_tokens=coord_log.get("input_tokens"),
-            output_tokens=coord_log.get("output_tokens"),
-            duration_ms=coordinator_ms,
-            response=coord_log.get("response", ""),
-        )
         self.recorder.step_start(
             self.step_number,
             final_move,
@@ -279,6 +270,10 @@ class ThreadRunner:
             assessment=decision.assessment or "",
             rationale=decision.rationale or "",
             status=decision.status.value,
+            model=coord_log["model"],
+            input_tokens=coord_log.get("input_tokens"),
+            output_tokens=coord_log.get("output_tokens"),
+            duration_ms=coordinator_ms,
         )
 
         # Genuinely STUCK (post step 2)
@@ -544,11 +539,27 @@ class ThreadRunner:
     # ------------------------------------------------------------------
 
     def _drain_pending_as_steps(self) -> bool:
-        """Drain pending messages into HUMAN_INPUT steps. Returns True if any were committed."""
+        """Drain pending messages into HUMAN_INPUT steps.
+
+        Under the inline-commit flow (route handler commits the
+        HUMAN_INPUT step before pushing), pending entries are almost
+        always ``{"committed": True}`` sentinels — they exist solely to
+        wake ``_flush_and_pivot`` for RUNNING threads. Real content
+        messages can still appear here on the resume path of a
+        WAITING/COMPLETE thread for backwards compatibility. Returns
+        True if at least one real message was committed.
+        """
         injected = self.store.drain_pending_messages(self.thread.id)
         if not injected:
             return False
+        real: list[dict | str] = []
+        markers = 0
         for msg in injected:
+            if isinstance(msg, dict) and msg.get("committed") is True:
+                markers += 1
+                continue
+            real.append(msg)
+        for msg in real:
             if isinstance(msg, dict):
                 self.recorder.human_input_step(
                     msg.get("content", ""),
@@ -557,8 +568,11 @@ class ThreadRunner:
                 )
             else:
                 self.recorder.human_input_step(str(msg))
-        logger.info(f"Thread {self.tid} committed {len(injected)} HUMAN_INPUT step(s)")
-        return True
+        if real:
+            logger.info(f"Thread {self.tid} committed {len(real)} HUMAN_INPUT step(s)")
+        if markers:
+            logger.debug(f"Thread {self.tid} drained {markers} pivot marker(s)")
+        return bool(real)
 
     def _flush_and_pivot(self) -> bool:
         """If pending human input exists, close the in-flight step,

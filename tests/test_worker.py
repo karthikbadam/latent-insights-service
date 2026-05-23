@@ -57,8 +57,10 @@ def _make_config():
 
 
 def _make_worker(mock_llm, session_db, schema_summary="test schema"):
-    queue = MagicMock()
-    queue.emit = MagicMock()
+    # Use a real Queue so next_feed_index returns an int the FeedEntry
+    # payload can consume; emissions still go to no subscribers.
+    from latent_insights.core.queue import Queue
+
     return Worker(
         llm=mock_llm,
         model="m",
@@ -66,7 +68,7 @@ def _make_worker(mock_llm, session_db, schema_summary="test schema"):
         schema_summary=schema_summary,
         session_db=session_db,
         config=_make_config(),
-        queue=queue,
+        queue=Queue(),
         session_id="s1",
         thread_id="t1",
     )
